@@ -3,6 +3,7 @@ module iicpc-sandbox
 go 1.26.3
 
 require (
+	github.com/goccy/go-json v0.10.6
 	github.com/gofiber/fiber/v3 v3.2.0
 	github.com/moby/moby/api v1.54.2
 	github.com/moby/moby/client v0.4.1
