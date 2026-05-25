@@ -6,10 +6,65 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
-// FleetConfig is what the orchestrator POSTs to /run
+// ─────────────────────────────────────────────────────────────────────────────
+// Job store
+// ─────────────────────────────────────────────────────────────────────────────
+
+type JobStatus string
+
+const (
+	JobPending   JobStatus = "pending"
+	JobRunning   JobStatus = "running"
+	JobCompleted JobStatus = "completed"
+	JobAborted   JobStatus = "aborted"
+)
+
+// Job is immutable once written — fields are never mutated in place.
+// Fix 2: we never write to job.Status or job.Report directly.
+// Instead we build a new Job value and replace the pointer in the store.
+// This means any reader holding the old pointer sees a consistent snapshot.
+type Job struct {
+	ID        string       `json:"job_id"`
+	Status    JobStatus    `json:"status"`
+	StartedAt time.Time    `json:"started_at"`
+	EndedAt   *time.Time   `json:"ended_at,omitempty"`
+	Report    *FleetReport `json:"report,omitempty"`
+	Error     string       `json:"error,omitempty"`
+	cancel    context.CancelFunc // not exported — never serialised
+}
+
+var (
+	jobStore   = map[string]*Job{}
+	jobStoreMu sync.RWMutex
+)
+
+// getJob returns the current Job pointer — caller gets a stable snapshot
+func getJob(id string) (*Job, bool) {
+	jobStoreMu.RLock()
+	defer jobStoreMu.RUnlock()
+	j, ok := jobStore[id]
+	return j, ok
+}
+
+// replaceJob atomically replaces the job pointer in the store.
+// Fix 2: never mutate fields on an existing *Job — always replace the pointer.
+// Readers holding the old pointer continue to see a consistent snapshot.
+func replaceJob(newJob *Job) {
+	jobStoreMu.Lock()
+	defer jobStoreMu.Unlock()
+	jobStore[newJob.ID] = newJob
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Config & Report types
+// ─────────────────────────────────────────────────────────────────────────────
+
 type FleetConfig struct {
 	Endpoint     string      `json:"endpoint"`
 	NumBots      int         `json:"num_bots"`
@@ -26,7 +81,9 @@ type StrategyMix struct {
 	NoiseTrader    float64 `json:"noise_trader"`
 }
 
-// FleetReport is returned after the entire fleet finishes
+// FleetReport contains only aggregated scalar values — no raw latency slice.
+// Fix 1: allLatencies []int64 removed entirely.
+// Step 5 (HDR Histogram) will compute p50/p90/p99 per-bot and merge here.
 type FleetReport struct {
 	Status            string         `json:"status"`
 	NumBots           int            `json:"num_bots"`
@@ -35,29 +92,37 @@ type FleetReport struct {
 	OrdersFailed      int            `json:"orders_failed"`
 	DurationMs        int64          `json:"duration_ms"`
 	StrategyBreakdown map[string]int `json:"strategy_breakdown"`
-	// Step 5 will add latency histogram here
+	// Step 5 adds: P50Us, P90Us, P99Us, MaxUs float64
 }
 
-func main() {
+// ─────────────────────────────────────────────────────────────────────────────
+// HTTP server
+// ─────────────────────────────────────────────────────────────────────────────
 
-	mux:= http.NewServeMux()
-	mux.HandleFunc("/run", handleRun)
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+func main() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/run",     handleRun)
+	mux.HandleFunc("/status/", handleStatus)
+	mux.HandleFunc("/cancel/", handleCancel)
+	mux.HandleFunc("/health",  func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
 
 	server := &http.Server{
-		Addr:    ":4000",
-		Handler: mux,
-		// No ReadTimeout — long-lived POST body
-		WriteTimeout: 10 * time.Minute,
-		IdleTimeout:  15 * time.Minute,
+		Addr:         ":4000",
+		Handler:      mux,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 
 	log.Println("Bot fleet service running on :4000")
 	log.Fatal(server.ListenAndServe())
-
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /run
+// ─────────────────────────────────────────────────────────────────────────────
 
 func handleRun(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -71,12 +136,11 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// --- Defaults ---
-	if cfg.NumBots <= 0      { cfg.NumBots = 50 }
-	if cfg.OrdersPerBot <= 0 { cfg.OrdersPerBot = 100 }
-	if cfg.MidPrice <= 0     { cfg.MidPrice = 100.0 }
-	if cfg.Spread <= 0       { cfg.Spread = 0.10 }
-	if cfg.RatePerSec <= 0   { cfg.RatePerSec = 10.0 }
+	if cfg.NumBots <= 0        { cfg.NumBots = 50 }
+	if cfg.OrdersPerBot <= 0   { cfg.OrdersPerBot = 100 }
+	if cfg.MidPrice <= 0       { cfg.MidPrice = 100.0 }
+	if cfg.Spread <= 0         { cfg.Spread = 0.10 }
+	if cfg.RatePerSec <= 0     { cfg.RatePerSec = 10.0 }
 	if cfg.StrategyMix.MarketMaker+cfg.StrategyMix.MomentumTrader+cfg.StrategyMix.NoiseTrader == 0 {
 		cfg.StrategyMix = StrategyMix{0.4, 0.3, 0.3}
 	}
@@ -85,55 +149,184 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// --- Build bots ---
-	bots := buildBots(cfg)
+	// Fix 2: context.Background() — fleet outlives the HTTP request
+	jobCtx, jobCancel := context.WithTimeout(context.Background(), 15*time.Minute)
 
-	log.Printf("Starting fleet: %d bots × %d orders → %s\n",
-		len(bots), cfg.OrdersPerBot, cfg.Endpoint)
-	log.Printf("Strategy split: %d makers | %d momentum | %d noise\n",
-		countStrategy(bots, MarketMaker),
-		countStrategy(bots, MomentumTrader),
-		countStrategy(bots, NoiseTrader),
-	)
-
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
-	defer cancel()
-
-	start := time.Now()
-	results := runFleet(ctx, bots, cfg)
-	elapsed := time.Since(start)
-
-	// --- Aggregate results ---
-	allLatencies := make([]int64, 0, cfg.NumBots*cfg.OrdersPerBot)
-	var totalSent, totalFailed int
-	for _, res := range results {
-		totalSent += res.OrdersSent
-		totalFailed += res.OrdersFailed
-		allLatencies = append(allLatencies, res.Latencies...)
+	job := &Job{
+		ID:        uuid.New().String(),
+		Status:    JobPending,
+		StartedAt: time.Now(),
+		cancel:    jobCancel,
 	}
+	replaceJob(job)
 
-	report := FleetReport{
-		Status:      "completed",
-		NumBots:     len(bots),
-		TotalOrders: cfg.NumBots * cfg.OrdersPerBot,
-		OrdersSent:  totalSent,
-		OrdersFailed: totalFailed,
-		DurationMs:  elapsed.Milliseconds(),
-		StrategyBreakdown: map[string]int{
-			"market_maker":    countStrategy(bots, MarketMaker),
-			"momentum_trader": countStrategy(bots, MomentumTrader),
-			"noise_trader":    countStrategy(bots, NoiseTrader),
-		},
-	}
+	go func() {
+		
+		defer func() {
+        if r := recover(); r != nil {
+            now := time.Now()
+            log.Printf("[job:%s] PANIC: %v\n", job.ID[:8], r)
+            replaceJob(&Job{
+                ID:        job.ID,
+                Status:    JobAborted,
+                StartedAt: job.StartedAt,
+                EndedAt:   &now,
+                Error:     fmt.Sprintf("internal panic: %v", r),
+                cancel:    jobCancel,
+            })
+            jobCancel()
+        }
+    }()
 
-	log.Printf("Fleet done: %d/%d orders sent in %s\n",
-		totalSent, cfg.NumBots*cfg.OrdersPerBot, elapsed.Round(time.Millisecond))
+		// Fix 2: build a new Job struct for each state transition
+		// never mutate fields on the existing pointer
+		replaceJob(&Job{
+			ID:        job.ID,
+			Status:    JobRunning,
+			StartedAt: job.StartedAt,
+			cancel:    jobCancel,
+		})
+
+		bots := buildBots(cfg)
+		log.Printf("[job:%s] Starting: %d bots × %d orders → %s\n",
+			job.ID[:8], len(bots), cfg.OrdersPerBot, cfg.Endpoint)
+
+		start := time.Now()
+		results := runFleet(jobCtx, bots, cfg)
+		elapsed := time.Since(start)
+
+		// Fix 1: aggregate only scalar counters — no giant latency slice
+		// Step 5 will merge per-bot HDR histograms here instead
+		var totalSent, totalFailed int
+		for _, res := range results {
+			totalSent += res.OrdersSent
+			totalFailed += res.OrdersFailed
+			// res.Latencies is owned by each BotResult
+			// Step 5: merge res into a global hdrhistogram here
+		}
+
+		report := &FleetReport{
+			Status:       "completed",
+			NumBots:      len(bots),
+			TotalOrders:  cfg.NumBots * cfg.OrdersPerBot,
+			OrdersSent:   totalSent,
+			OrdersFailed: totalFailed,
+			DurationMs:   elapsed.Milliseconds(),
+			StrategyBreakdown: map[string]int{
+				"market_maker":    countStrategy(bots, MarketMaker),
+				"momentum_trader": countStrategy(bots, MomentumTrader),
+				"noise_trader":    countStrategy(bots, NoiseTrader),
+			},
+		}
+
+		now := time.Now()
+
+		// Fix 2: replace with a new Job struct — old pointer untouched
+		replaceJob(&Job{
+			ID:        job.ID,
+			Status:    JobCompleted,
+			StartedAt: job.StartedAt,
+			EndedAt:   &now,
+			Report:    report,
+			cancel:    jobCancel,
+		})
+
+		log.Printf("[job:%s] Done: %d/%d orders in %s\n",
+			job.ID[:8], totalSent, cfg.NumBots*cfg.OrdersPerBot,
+			elapsed.Round(time.Millisecond))
+
+		jobCancel()
+	}()
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(report)
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]string{
+		"job_id":  job.ID,
+		"status":  string(JobPending),
+		"poll":    fmt.Sprintf("/status/%s", job.ID),
+		"cancel":  fmt.Sprintf("/cancel/%s", job.ID),
+		"message": "Fleet started. Poll /status/:job_id for results.",
+	})
 }
 
-// buildBots creates all bots with the correct strategy distribution.
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /status/:jobID
+// ─────────────────────────────────────────────────────────────────────────────
+
+func handleStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+
+	jobID := r.URL.Path[len("/status/"):]
+	if jobID == "" {
+		http.Error(w, "missing job ID", http.StatusBadRequest)
+		return
+	}
+
+	// Fix 2: getJob returns a pointer snapshot — safe to read without lock
+	// because we never mutate fields on existing Job structs
+	job, ok := getJob(jobID)
+	if !ok {
+		http.Error(w, "job not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(job)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DELETE /cancel/:jobID
+// ─────────────────────────────────────────────────────────────────────────────
+
+func handleCancel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "DELETE only", http.StatusMethodNotAllowed)
+		return
+	}
+
+	jobID := r.URL.Path[len("/cancel/"):]
+	if jobID == "" {
+		http.Error(w, "missing job ID", http.StatusBadRequest)
+		return
+	}
+
+	job, ok := getJob(jobID)
+	if !ok {
+		http.Error(w, "job not found", http.StatusNotFound)
+		return
+	}
+
+	if job.Status != JobRunning {
+		http.Error(w, "job is not running", http.StatusConflict)
+		return
+	}
+
+	job.cancel()
+
+	now := time.Now()
+	// Fix 2: new struct — don't mutate the existing job pointer
+	replaceJob(&Job{
+		ID:        job.ID,
+		Status:    JobAborted,
+		StartedAt: job.StartedAt,
+		EndedAt:   &now,
+		cancel:    job.cancel,
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"job_id": jobID,
+		"status": "aborted",
+	})
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bot building helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
 func buildBots(cfg FleetConfig) []*Bot {
 	bots := make([]*Bot, cfg.NumBots)
 
