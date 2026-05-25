@@ -8,6 +8,7 @@ require (
 	github.com/gofiber/fiber/v3 v3.2.0
 	github.com/moby/moby/api v1.54.2
 	github.com/moby/moby/client v0.4.1
+	golang.org/x/sync v0.20.0
 	golang.org/x/time v0.11.0
 )
 

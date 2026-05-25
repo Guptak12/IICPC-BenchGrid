@@ -6,13 +6,15 @@ import (
 	"io"
 	"log"
 	"net"
-	"sync"
+	"fmt"
 	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
 	gojson "github.com/goccy/go-json"
 	"golang.org/x/time/rate"
+	"golang.org/x/sync/errgroup"
 	
 )
 
@@ -24,18 +26,47 @@ const (
 	debugLogs  = true
 )
 
+// Strategy interface 
+
+type Strategy interface {
+		Wait(ctx context.Context) error
+		Name() string
+}
+
+type DefaultStrategy struct {
+	limiter *rate.Limiter
+	name    string
+}
+
+func NewDefaultStrategy(ratePerSec float64, strategyType StrategyType) *DefaultStrategy {
+	return &DefaultStrategy{
+		limiter: rate.NewLimiter(rate.Limit(ratePerSec), 1),
+		name:    string(strategyType),
+	}
+}
+
+func (s *DefaultStrategy) Wait(ctx context.Context) error {
+	return s.limiter.Wait(ctx)
+}
+
+func (s *DefaultStrategy) Name() string {
+	return s.name
+}
+
 // runFleet spawns all bots concurrently with a semaphore bound.
-// Returns results only after every bot has finished or context is cancelled.
+// Change :- Using errgroup instead of WaitGroup to capture any unexpected panics in bot goroutines.
 func runFleet(ctx context.Context, bots []*Bot, cfg FleetConfig) []BotResult {
 	results := make([]BotResult, len(bots))
 
 	// Semaphore: bufferred channel limits concurrent bots
 	sem := make(chan struct{}, maxConcurrentBots)
 
-	var wg sync.WaitGroup
-
+	
 	// Progress counter — incremented atomically by each bot per order sent
 	var totalSent atomic.Int64
+	
+
+	g, gctx := errgroup.WithContext(ctx)
 
 	// Progress reporter — logs TPS every second until all bots finish
 	progressDone := make(chan struct{})
@@ -57,28 +88,42 @@ func runFleet(ctx context.Context, bots []*Bot, cfg FleetConfig) []BotResult {
 	}()
 
 	for i, bot := range bots {
-		wg.Add(1)
+		idx,b := i, bot // capture loop variables for closure
 
 		// Acquire semaphore slot before launching goroutine
 		// Blocks here if maxConcurrentBots goroutines are already running
 		sem <- struct{}{}
 
-		go func(idx int, b *Bot) {
-			defer wg.Done()
+		g.Go(func() error {
 			defer func() { <-sem }() // release slot when done
 
-			results[idx] = runBot(ctx, b, cfg.Endpoint, &totalSent)
-		}(i, bot)
+			// Build the strategy for this bot
+			// Step 4 will switch on b.config.Strategy and return
+			// MarketMakerStrategy, MomentumStrategy, or NoiseStrategy
+			strategy := NewDefaultStrategy(b.config.RatePerSec, b.config.Strategy)
+
+			results[idx] = runBot(gctx, b, cfg.Endpoint,strategy, &totalSent)
+			// All orders failed = fatal — cancel the fleet
+			if results[idx].OrdersFailed == b.config.OrdersToSend &&
+				b.config.OrdersToSend > 0 {
+				return fmt.Errorf("[%s] all %d orders failed — aborting fleet",
+					b.config.StringID, b.config.OrdersToSend)
+			}
+			return nil
+		})
 	}
 
-	wg.Wait()
+	if err := g.Wait(); err != nil {
+		debugLog("Fleet aborted: %v\n", err)
+	}
+
 	close(progressDone)
 
 	return results
 }
 
 // runBot is the single-bot execution loop with the real WebSocket send/receive loop.
-func runBot(ctx context.Context, b *Bot, endpoint string, totalSent *atomic.Int64) BotResult {
+func runBot(ctx context.Context, b *Bot, endpoint string,strategy Strategy, totalSent *atomic.Int64) BotResult {
 	result := BotResult{
 		BotID:    b.config.StringID,
 		Strategy: b.config.Strategy,
@@ -88,7 +133,12 @@ func runBot(ctx context.Context, b *Bot, endpoint string, totalSent *atomic.Int6
 	// -----------------------------------------------------------------
 	// Phase 1 — Pre-compute all orders before touching the network
 	// -----------------------------------------------------------------
-	orders := make([][]byte, b.config.OrdersToSend)
+	type precomputedOrder struct {
+    payload []byte
+    seq     int64
+}
+precomputed := make([]precomputedOrder, 0, b.config.OrdersToSend)
+
 	for i := 0; i < b.config.OrdersToSend; i++ {
 		msg := b.NextOrder()
 		payload, err := b.MarshalOrder(msg)
@@ -96,12 +146,14 @@ func runBot(ctx context.Context, b *Bot, endpoint string, totalSent *atomic.Int6
 			result.OrdersFailed++
 			continue
 		}
-		orders[i] = payload
+		precomputed = append(precomputed, precomputedOrder{
+        payload: payload,
+        seq:     msg.OrderID & 0xFFFFFFFF,
+    })
 	}
 
 	// -----------------------------------------------------------------
 	// Phase 2 — Dial with a fail-fast timeout
-	// Fix 3.1: 5s sub-context so a dead server fails in 5s not 10min
 	// -----------------------------------------------------------------
 	dialCtx, dialCancel := context.WithTimeout(ctx, dialTimeout)
 	conn, _, err := websocket.Dial(dialCtx, endpoint, &websocket.DialOptions{
@@ -110,85 +162,124 @@ func runBot(ctx context.Context, b *Bot, endpoint string, totalSent *atomic.Int6
 	dialCancel() // always release immediately after dial attempt
 
 	if err != nil {
-		// Fix 3.2: single log line per bot failure, not per-order
 		log.Printf("[%s] dial failed: %v\n", b.config.StringID, err)
-		result.OrdersFailed += b.config.OrdersToSend
+		result.OrdersFailed += len(precomputed)
 		return result
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "bot done")
 
 
 	// -----------------------------------------------------------------
-	// Phase 3 — Blast phase: send + receive
+	// Phase 3 — Parallel sender + receiver
 	//
-	// NOTE: This is currently synchronous ping-pong (send → wait for ack).
-	// Known limitation documented in analysis point 1 — at high TPS the
-	// conn.Read() blocks and skews the rate limiter.
-	// Step 3 will decouple into parallel sender + receiver goroutines.
+	// sentSignal: sender → receiver, carries seq for latency lookup
+	// Buffered to OrdersToSend so sender never blocks waiting for receiver
+	//
+	// latencyResult: receiver → collector
+	// Buffered to OrdersToSend so receiver never blocks
 	// -----------------------------------------------------------------
-	limiter := rate.NewLimiter(rate.Limit(b.config.RatePerSec), 1)
+	sentSignal := make(chan int64, len(precomputed))
+	type latResult struct {
+		latencyNs int64
+		failed    bool
+	}
+	latencyCh := make(chan latResult, len(precomputed))
 
-	for i, payload := range orders {
-		if payload == nil {
+	var sentCount atomic.Int64  // orders successfully written to socket
+	var ackedCount atomic.Int64 // orders acked by server
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// --- Sender goroutine ---
+	go func() {
+		   defer wg.Done()
+    defer close(sentSignal)
+	for i, order := range precomputed {
+		if err := strategy.Wait(ctx); err != nil {
+            remaining := len(precomputed) - i
+            for j := 0; j < remaining; j++ {
+                latencyCh <- latResult{failed: true}
+            }
+            return
+        }
+		b.RecordSendTime(order.seq)
+
+		if err := conn.Write(ctx, websocket.MessageText, order.payload); err != nil {
+	
+			if isTerminalError(err) || isContextError(err) {
+				remaining := len(precomputed) - i
+					for j := 0; j < remaining; j++ {
+						latencyCh <- latResult{failed: true}
+					}
+					return
+			}
+			latencyCh <- latResult{failed: true}
 			continue
 		}
+		// Order successfully written to socket
+			sentCount.Add(1)
+			sentSignal <- order.seq
+	}
+}()
 
-		// Fix 2.2: account for unexecuted orders on context cancel
-		if err := limiter.Wait(ctx); err != nil {
-			result.OrdersFailed += b.config.OrdersToSend - i
-			return result
-		}
+// --- Receiver goroutine ---
+	go func() {
+		defer wg.Done()
 
-		seq := int64(i + 1)
-		b.RecordSendTime(seq)
-
-		if err := conn.Write(ctx, websocket.MessageText, payload); err != nil {
-			if isContextError(err) {
-				result.OrdersFailed += b.config.OrdersToSend - i
-				return result
-			}
-			// Fix 2.1: terminal write error — stop immediately
-			if isTerminalError(err) {
-				result.OrdersFailed += b.config.OrdersToSend - i
-				debugLog("[%s] terminal write error: %v — stopping bot\n", b.config.StringID, err)
-				return result
-			}
-			result.OrdersFailed++
-			continue
-		}
+		for seq := range sentSignal {
+			_ = seq // seq available for future per-order timeout logic
 
 		_, ackBytes, err := conn.Read(ctx)
 		if err != nil {
-			if isContextError(err) {
-				result.OrdersFailed += b.config.OrdersToSend - i
-				return result
+			if isContextError(err) || isTerminalError(err) {
+				return
 			}
-			// Fix 2.1: terminal read error — stop immediately
-			if isTerminalError(err) {
-				result.OrdersFailed += b.config.OrdersToSend - i
-				debugLog("[%s] terminal read error: %v — stopping bot\n", b.config.StringID, err)
-				return result
-			}
-			result.OrdersFailed++
+			latencyCh <- latResult{failed: true}
+			ackedCount.Add(1) // counted as processed (failed)
 			continue
 		}
 
 		var ack OrderAck
 		if err := gojson.Unmarshal(ackBytes, &ack); err != nil {
-			result.OrdersFailed++
+			latencyCh <- latResult{failed: true}
+			ackedCount.Add(1)
 			continue
 		}
 
 		latency := b.CalculateLatency(ack.OrderID)
 		if latency < 0 {
-			result.OrdersFailed++
+			latencyCh <- latResult{failed: true}
+			ackedCount.Add(1)
 			continue
 		}
 
-		result.Latencies = append(result.Latencies, latency)
+		latencyCh <- latResult{latencyNs: latency}
+		ackedCount.Add(1)
+	}
+}()
+
+go func() {
+		wg.Wait()
+		unacked := sentCount.Load() - ackedCount.Load()
+		for i := int64(0); i < unacked; i++ {
+			latencyCh <- latResult{failed: true}
+		}
+
+		close(latencyCh) // now safe to close — all results are in
+	}()
+	
+	// --- Collector — runs in the main bot goroutine ---
+	for lr := range latencyCh {
+		if lr.failed {
+			result.OrdersFailed++
+		} else {
+
+		result.Latencies = append(result.Latencies, lr.latencyNs)
 		result.OrdersSent++
 		totalSent.Add(1)
 	}
+}
 
 	return result
 }
