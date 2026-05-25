@@ -104,10 +104,12 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
 	elapsed := time.Since(start)
 
 	// --- Aggregate results ---
+	allLatencies := make([]int64, 0, cfg.NumBots*cfg.OrdersPerBot)
 	var totalSent, totalFailed int
 	for _, res := range results {
 		totalSent += res.OrdersSent
 		totalFailed += res.OrdersFailed
+		allLatencies = append(allLatencies, res.Latencies...)
 	}
 
 	report := FleetReport{

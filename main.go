@@ -214,7 +214,7 @@ func createContainer(ctx context.Context, cmd []string, hostSubmitDir string, po
 func compileCode(ctx context.Context, hostSubmitDir string) error {
 	containerID, err := createContainer(
 		ctx,
-		[]string{"g++", "/usr/src/main.cpp", "-o", "/usr/src/app"},
+		[]string{"g++", "/usr/src/main.cpp", "-o", "/usr/src/app", "-lssl", "-lcrypto","-lpthread", "-std=c++17"},
 		hostSubmitDir,
 		nil, // no port bindings needed for compilation
 	)
