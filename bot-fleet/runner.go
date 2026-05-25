@@ -13,7 +13,6 @@ import (
 
 	"github.com/coder/websocket"
 	gojson "github.com/goccy/go-json"
-	"golang.org/x/time/rate"
 	"golang.org/x/sync/errgroup"
 	
 )
@@ -26,32 +25,6 @@ const (
 	debugLogs  = true
 )
 
-// Strategy interface 
-
-type Strategy interface {
-		Wait(ctx context.Context) error
-		Name() string
-}
-
-type DefaultStrategy struct {
-	limiter *rate.Limiter
-	name    string
-}
-
-func NewDefaultStrategy(ratePerSec float64, strategyType StrategyType) *DefaultStrategy {
-	return &DefaultStrategy{
-		limiter: rate.NewLimiter(rate.Limit(ratePerSec), 1),
-		name:    string(strategyType),
-	}
-}
-
-func (s *DefaultStrategy) Wait(ctx context.Context) error {
-	return s.limiter.Wait(ctx)
-}
-
-func (s *DefaultStrategy) Name() string {
-	return s.name
-}
 
 // runFleet spawns all bots concurrently with a semaphore bound.
 // Change :- Using errgroup instead of WaitGroup to capture any unexpected panics in bot goroutines.
@@ -100,7 +73,7 @@ func runFleet(ctx context.Context, bots []*Bot, cfg FleetConfig) []BotResult {
 			// Build the strategy for this bot
 			// Step 4 will switch on b.config.Strategy and return
 			// MarketMakerStrategy, MomentumStrategy, or NoiseStrategy
-			strategy := NewDefaultStrategy(b.config.RatePerSec, b.config.Strategy)
+			strategy := newStrategy(b)
 
 			results[idx] = runBot(gctx, b, cfg.Endpoint,strategy, &totalSent)
 			// All orders failed = fatal — cancel the fleet
