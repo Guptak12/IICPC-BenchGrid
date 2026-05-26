@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/HdrHistogram/hdrhistogram-go"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -91,8 +92,13 @@ type FleetReport struct {
 	OrdersSent        int            `json:"orders_sent"`
 	OrdersFailed      int            `json:"orders_failed"`
 	DurationMs        int64          `json:"duration_ms"`
+	TPS			   float64        `json:"tps"`
 	StrategyBreakdown map[string]int `json:"strategy_breakdown"`
-	// Step 5 adds: P50Us, P90Us, P99Us, MaxUs float64
+	// Step 5 Additions: Microsecond percentile representations
+	P50Us             float64        `json:"p50_us"`
+	P90Us             float64        `json:"p90_us"`
+	P99Us             float64        `json:"p99_us"`
+	MaxUs             float64        `json:"max_us"`
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -195,14 +201,17 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
 		results := runFleet(jobCtx, bots, cfg)
 		elapsed := time.Since(start)
 
-		// Fix 1: aggregate only scalar counters — no giant latency slice
-		// Step 5 will merge per-bot HDR histograms here instead
+		// Step 5: Initialize global aggregator matrix (1ns to 1hr tracking bounds)
+		globalHist := hdrhistogram.New(1, 3600000000000, 3)
+
+		
+
 		var totalSent, totalFailed int
 		for _, res := range results {
 			totalSent += res.OrdersSent
 			totalFailed += res.OrdersFailed
-			// res.Latencies is owned by each BotResult
-			// Step 5: merge res into a global hdrhistogram here
+			globalHist.Merge(res.Histogram)
+			
 		}
 
 		report := &FleetReport{
@@ -212,11 +221,16 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
 			OrdersSent:   totalSent,
 			OrdersFailed: totalFailed,
 			DurationMs:   elapsed.Milliseconds(),
+			TPS: float64(totalSent) / (float64(elapsed.Milliseconds()) / 1000.0),
 			StrategyBreakdown: map[string]int{
 				"market_maker":    countStrategy(bots, MarketMaker),
 				"momentum_trader": countStrategy(bots, MomentumTrader),
 				"noise_trader":    countStrategy(bots, NoiseTrader),
 			},
+			P50Us: float64(globalHist.ValueAtQuantile(50.0)) / 1000.0,
+			P90Us: float64(globalHist.ValueAtQuantile(90.0)) / 1000.0,
+			P99Us: float64(globalHist.ValueAtQuantile(99.0)) / 1000.0,
+			MaxUs: float64(globalHist.Max()) / 1000.0,
 		}
 
 		now := time.Now()

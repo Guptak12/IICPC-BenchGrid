@@ -11,9 +11,11 @@ import (
 	"sync"
 	"time"
 
+	
 	"github.com/coder/websocket"
 	gojson "github.com/goccy/go-json"
 	"golang.org/x/sync/errgroup"
+	"github.com/HdrHistogram/hdrhistogram-go"
 	
 )
 
@@ -23,6 +25,7 @@ const (
 	maxConcurrentBots = 500
 	dialTimeout	  = 5 * time.Second
 	debugLogs  = true
+	channelBufferSize = 1024
 )
 
 
@@ -71,7 +74,6 @@ func runFleet(ctx context.Context, bots []*Bot, cfg FleetConfig) []BotResult {
 			defer func() { <-sem }() // release slot when done
 
 			// Build the strategy for this bot
-			// Step 4 will switch on b.config.Strategy and return
 			// MarketMakerStrategy, MomentumStrategy, or NoiseStrategy
 			strategy := newStrategy(b)
 
@@ -100,29 +102,8 @@ func runBot(ctx context.Context, b *Bot, endpoint string,strategy Strategy, tota
 	result := BotResult{
 		BotID:    b.config.StringID,
 		Strategy: b.config.Strategy,
-		Latencies: make([]int64, 0, b.config.OrdersToSend),
-	}
-
-	// -----------------------------------------------------------------
-	// Phase 1 — Pre-compute all orders before touching the network
-	// -----------------------------------------------------------------
-	type precomputedOrder struct {
-    payload []byte
-    seq     int64
-}
-precomputed := make([]precomputedOrder, 0, b.config.OrdersToSend)
-
-	for i := 0; i < b.config.OrdersToSend; i++ {
-		msg := b.NextOrder()
-		payload, err := b.MarshalOrder(msg)
-		if err != nil {
-			result.OrdersFailed++
-			continue
-		}
-		precomputed = append(precomputed, precomputedOrder{
-        payload: payload,
-        seq:     msg.OrderID & 0xFFFFFFFF,
-    })
+		//  Allocate dynamic range bounds (1ns min up to 1hr max) with 3 significant digits
+		Histogram: hdrhistogram.New(1, 3600000000000, 3),
 	}
 
 	// -----------------------------------------------------------------
@@ -136,7 +117,7 @@ precomputed := make([]precomputedOrder, 0, b.config.OrdersToSend)
 
 	if err != nil {
 		log.Printf("[%s] dial failed: %v\n", b.config.StringID, err)
-		result.OrdersFailed += len(precomputed)
+		result.OrdersFailed += b.config.OrdersToSend
 		return result
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "bot done")
@@ -151,12 +132,12 @@ precomputed := make([]precomputedOrder, 0, b.config.OrdersToSend)
 	// latencyResult: receiver → collector
 	// Buffered to OrdersToSend so receiver never blocks
 	// -----------------------------------------------------------------
-	sentSignal := make(chan int64, len(precomputed))
+	sentSignal := make(chan int64, b.config.OrdersToSend) // seq numbers of sent orders, for latency correlation
 	type latResult struct {
 		latencyNs int64
 		failed    bool
 	}
-	latencyCh := make(chan latResult, len(precomputed))
+	latencyCh := make(chan latResult, b.config.OrdersToSend)
 
 	var sentCount atomic.Int64  // orders successfully written to socket
 	var ackedCount atomic.Int64 // orders acked by server
@@ -166,33 +147,43 @@ precomputed := make([]precomputedOrder, 0, b.config.OrdersToSend)
 
 	// --- Sender goroutine ---
 	go func() {
-		   defer wg.Done()
-    defer close(sentSignal)
-	for i, order := range precomputed {
-		if err := strategy.Wait(ctx); err != nil {
-            remaining := len(precomputed) - i
-            for j := 0; j < remaining; j++ {
-                latencyCh <- latResult{failed: true}
-            }
-            return
-        }
-		b.RecordSendTime(order.seq)
+		defer wg.Done()
+		defer close(sentSignal)
 
-		if err := conn.Write(ctx, websocket.MessageText, order.payload); err != nil {
-	
-			if isTerminalError(err) || isContextError(err) {
-				remaining := len(precomputed) - i
-					for j := 0; j < remaining; j++ {
-						latencyCh <- latResult{failed: true}
-					}
-					return
+		for i := 0; i < b.config.OrdersToSend; i++ {
+			if err := strategy.Wait(ctx); err != nil {
+				remaining := b.config.OrdersToSend - i
+				for j := 0; j < remaining; j++ {
+					latencyCh <- latResult{failed: true}
+				}
+				return
 			}
-			latencyCh <- latResult{failed: true}
-			continue
-		}
+
+			// Pain Point 2 Fix: Generate and Marshal JSON right here on the hot path
+			msg := b.NextOrder()
+			payload, err := b.MarshalOrder(msg)
+			if err != nil {
+				latencyCh <- latResult{failed: true}
+				continue
+			}
+		seq := msg.OrderID & 0xFFFFFFFF
+		b.RecordSendTime(seq)
+
+		if err := conn.Write(ctx, websocket.MessageText, payload); err != nil {
+				remaining := b.config.OrdersToSend - i
+				for j := 0; j < remaining; j++ {
+					latencyCh <- latResult{failed: true}
+				}
+				return
+			}
 		// Order successfully written to socket
 			sentCount.Add(1)
-			sentSignal <- order.seq
+			// Select over channel send to respect context closure if consumer bottlenecks
+			select {
+			case <-ctx.Done():
+				return
+			case sentSignal <- seq:
+			}
 	}
 }()
 
@@ -205,13 +196,13 @@ precomputed := make([]precomputedOrder, 0, b.config.OrdersToSend)
 
 		_, ackBytes, err := conn.Read(ctx)
 		if err != nil {
-			if isContextError(err) || isTerminalError(err) {
-				return
-			}
-			latencyCh <- latResult{failed: true}
-			ackedCount.Add(1) // counted as processed (failed)
-			continue
-		}
+				latencyCh <- latResult{failed: true}
+				ackedCount.Add(1)
+				if isTerminalError(err) || isContextError(err) {
+					return
+				}
+				continue
+			}	
 
 		var ack OrderAck
 		if err := gojson.Unmarshal(ackBytes, &ack); err != nil {
@@ -248,9 +239,9 @@ go func() {
 			result.OrdersFailed++
 		} else {
 
-		result.Latencies = append(result.Latencies, lr.latencyNs)
-		result.OrdersSent++
-		totalSent.Add(1)
+		_ = result.Histogram.RecordValue(lr.latencyNs)
+			result.OrdersSent++
+			totalSent.Add(1)
 	}
 }
 

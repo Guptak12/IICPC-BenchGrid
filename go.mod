@@ -14,6 +14,7 @@ require (
 )
 
 require (
+	github.com/HdrHistogram/hdrhistogram-go v1.2.0 // indirect
 	github.com/andybalholm/brotli v1.2.1 // indirect
 	github.com/gofiber/schema v1.7.1 // indirect
 	github.com/gofiber/utils/v2 v2.0.4 // indirect

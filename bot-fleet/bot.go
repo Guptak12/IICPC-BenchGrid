@@ -5,6 +5,8 @@ import (
 	"sync/atomic"
 	"time"
 	gojson "github.com/goccy/go-json"
+	"github.com/HdrHistogram/hdrhistogram-go"
+	
 
 )
 
@@ -66,7 +68,7 @@ type BotConfig struct {
 type BotResult struct {
 	BotID        string
 	Strategy     StrategyType
-	Latencies    []int64 // nanoseconds, one entry per successful order
+	Histogram    *hdrhistogram.Histogram
 	OrdersSent   int
 	OrdersFailed int
 	Reconnects   int
