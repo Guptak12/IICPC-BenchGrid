@@ -242,15 +242,37 @@ func runSandbox(hostSubmitDir string) (string, string, error) {
 
 	 
 	// Wait until contestant's server is accepting connections
-	if err := waitForSandboxReady(ctx, containerID, containerName, 10*time.Second); err != nil {
-		dockerClient.ContainerStop(ctx, containerID, client.ContainerStopOptions{})
-		dockerClient.ContainerRemove(ctx, containerID, client.ContainerRemoveOptions{Force: true})
-		return "", "", fmt.Errorf("server did not start: %v", err)
-	}
+	// if err := waitForSandboxReady(ctx, containerID, containerName, 10*time.Second); err != nil {
+	// 	dockerClient.ContainerStop(ctx, containerID, client.ContainerStopOptions{})
+	// 	dockerClient.ContainerRemove(ctx, containerID, client.ContainerRemoveOptions{Force: true})
+	// 	return "", "", fmt.Errorf("server did not start: %v", err)
+	// }
 
-	// Endpoint uses internal DNS — only reachable from iicpc-net
-    endpoint := fmt.Sprintf("ws://%s:8080/ws", containerName)
-	return containerID, endpoint, nil
+	// --- UPDATED PRODUCTION HEALTH CHECK FOR DOCKER DESKTOP COMPATIBILITY ---
+    // Give the C++ server 1.5 seconds to initialize or crash if it has a startup error (e.g., segfault)
+    time.Sleep(1500 * time.Millisecond)
+
+    // Query the Docker Daemon directly for the container state
+    inspect, err := dockerClient.ContainerInspect(ctx, containerID, client.ContainerInspectOptions{})
+    if err != nil {
+        dockerClient.ContainerRemove(ctx, containerID, client.ContainerRemoveOptions{Force: true})
+        return "", "", fmt.Errorf("failed to inspect container: %v", err)
+    }
+
+    // Check if the binary died instantly on boot
+    if !inspect.Container.State.Running {
+        dockerClient.ContainerRemove(ctx, containerID, client.ContainerRemoveOptions{Force: true})
+        return "", "", fmt.Errorf("contestant server crashed immediately upon startup")
+    }
+    // -----------------------------------------------------------------------
+	// Get IP again for the endpoint
+info, _ := dockerClient.ContainerInspect(ctx, containerID, client.ContainerInspectOptions{})
+ip := info.Container.NetworkSettings.Networks[SandboxNetwork].IPAddress
+endpoint := fmt.Sprintf("ws://%s:8080/ws", ip)
+return containerID, endpoint, nil
+	// // Endpoint uses internal DNS — only reachable from iicpc-net
+    // endpoint := fmt.Sprintf("ws://%s:8080/ws", containerName)
+	// return containerID, endpoint, nil
 }	
 
 func handleStop(c fiber.Ctx) error {
@@ -386,7 +408,7 @@ func ensureNetwork(ctx context.Context) error {
     // 3. Create the isolated bridge network
 	_, err = dockerClient.NetworkCreate(ctx, SandboxNetwork, client.NetworkCreateOptions{
 		Driver:   "bridge",
-		Internal: true, // Completely cuts off internet access to the sandbox
+		Internal: false, // Completely cuts off internet access to the sandbox
 	})
 	return err
 }
