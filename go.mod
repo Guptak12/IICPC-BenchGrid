@@ -3,18 +3,13 @@ module iicpc-sandbox
 go 1.26.3
 
 require (
-	github.com/coder/websocket v1.8.14
-	github.com/goccy/go-json v0.10.6
 	github.com/gofiber/fiber/v3 v3.2.0
 	github.com/google/uuid v1.6.0
 	github.com/moby/moby/api v1.54.2
 	github.com/moby/moby/client v0.4.1
-	golang.org/x/sync v0.20.0
-	golang.org/x/time v0.11.0
 )
 
 require (
-	github.com/HdrHistogram/hdrhistogram-go v1.2.0 // indirect
 	github.com/andybalholm/brotli v1.2.1 // indirect
 	github.com/gofiber/schema v1.7.1 // indirect
 	github.com/gofiber/utils/v2 v2.0.4 // indirect

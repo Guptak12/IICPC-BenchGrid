@@ -9,13 +9,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
-	"google.golang.org/grpc"
-pb "github.com/guptak12/bot-fleet/gen/fleet"// replace with actual import path
+	"flag"
 	"net"
 	"os"
 	"strings"
-	"flag"
+
+	"github.com/google/uuid"
+	pb "github.com/guptak12/bot-fleet/gen/fleet" // replace with actual import path
+	"github.com/guptak12/bot-fleet/telemetry"
+	"google.golang.org/grpc"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -104,6 +106,7 @@ type FleetReport struct {
 	P90Us             float64        `json:"p90_us"`
 	P99Us             float64        `json:"p99_us"`
 	MaxUs             float64        `json:"max_us"`
+	CorrectnessScore  float64        `json:"correctness_score"`
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -111,6 +114,7 @@ type FleetReport struct {
 // ─────────────────────────────────────────────────────────────────────────────
 var mode = flag.String("mode", "master", "master or worker")
 var workerPort = flag.Int("port", 5001, "worker gRPC port")
+
 
 func main() {
 	 flag.Parse()
@@ -232,9 +236,49 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[job:%s] Starting: %d bots × %d orders → %s\n",
 			job.ID[:8], len(bots), cfg.OrdersPerBot, cfg.Endpoint)
 
+		brokers := []string{"redpanda:9092"} // inside iicpc-net
+		consumer, err := telemetry.NewConsumer(brokers, job.ID, len(masterCfg.WorkerAddresses))
+		if err != nil {
+			log.Printf("[job:%s] Kafka consumer init failed: %v — running without telemetry\n",
+				job.ID[:8], err)
+			consumer = nil
+		}
+
+		// Run Consumer concurrently in background
+		var telResult *telemetry.TelemetryResult
+		var telErr error
+		var wg sync.WaitGroup
+		if consumer != nil {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				telResult, telErr = consumer.Consume(jobCtx)
+				consumer.Close()
+			}()
+		}
+
 		start := time.Now()
 		report, err := runDistributed(jobCtx, cfg, job.ID)
 		elapsed := time.Since(start)
+
+        if err != nil {
+            jobCancel() // Stop the consumer immediately
+        }
+
+		if consumer != nil {
+			wg.Wait()
+			if telErr == nil && telResult != nil {
+				// Override histogram with streaming data (more accurate)
+				report.P50Us = float64(telResult.Histogram.ValueAtQuantile(50)) / 1000.0
+				report.P90Us = float64(telResult.Histogram.ValueAtQuantile(90)) / 1000.0
+				report.P99Us = float64(telResult.Histogram.ValueAtQuantile(99)) / 1000.0
+				report.MaxUs = float64(telResult.Histogram.Max()) / 1000.0
+				report.CorrectnessScore = telResult.Correctness
+
+				log.Printf("[job:%s] Kafka: %d orders, %d fills processed, Correctness: %.2f%%\n",
+					job.ID[:8], telResult.OrdersProcessed, telResult.FillsProcessed, telResult.Correctness)
+			}
+		}
 
 		// Step 5: Initialize global aggregator matrix (1ns to 1hr tracking bounds)
 		if err != nil {

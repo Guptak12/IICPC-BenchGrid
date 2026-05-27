@@ -1,0 +1,23 @@
+services:
+  redpanda:
+    image: redpandadata/redpanda:v23.3.11
+    container_name: redpanda
+    command:
+      - redpanda
+      - start
+      - --smp 1                          # Point E: pin to 1 CPU
+      - --memory 400M
+      - --reserve-memory 0M                 # Point E: hard memory cap
+      - --overprovisioned
+      - --kafka-addr PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr PLAINTEXT://redpanda:9092
+    ports:
+      - "9092:9092"
+    networks:
+      - iicpc-net
+    mem_limit: 512m                       # Point E: Docker-level enforcement
+    cpus: 1.0
+
+networks:
+  iicpc-net:
+    external: true

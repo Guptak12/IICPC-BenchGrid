@@ -3,24 +3,24 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
-	"fmt"
-	"sync/atomic"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	
+	"github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/coder/websocket"
 	gojson "github.com/goccy/go-json"
 	"golang.org/x/sync/errgroup"
-	"github.com/HdrHistogram/hdrhistogram-go"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	
-	pb "github.com/guptak12/bot-fleet/gen/fleet"
 
+	pb "github.com/guptak12/bot-fleet/gen/fleet"
+	"github.com/guptak12/bot-fleet/telemetry"
 )
 
 const (
@@ -48,11 +48,12 @@ var masterCfg = MasterConfig{
 
 // runFleet spawns all bots concurrently with a semaphore bound.
 // Change :- Using errgroup instead of WaitGroup to capture any unexpected panics in bot goroutines.
-func runFleet(ctx context.Context, bots []*Bot, cfg FleetConfig) []BotResult {
+func runFleet(ctx context.Context, bots []*Bot, cfg FleetConfig, producer *telemetry.Producer, jobID string, workerID string) []BotResult {
 	results := make([]BotResult, len(bots))
 
 	// Semaphore: bufferred channel limits concurrent bots
 	sem := make(chan struct{}, maxConcurrentBots)
+
 
 	
 	// Progress counter — incremented atomically by each bot per order sent
@@ -94,7 +95,7 @@ func runFleet(ctx context.Context, bots []*Bot, cfg FleetConfig) []BotResult {
 			// MarketMakerStrategy, MomentumStrategy, or NoiseStrategy
 			strategy := newStrategy(b)
 
-			results[idx] = runBot(gctx, b, cfg.Endpoint,strategy, &totalSent)
+			results[idx] = runBot(gctx, b, cfg.Endpoint,strategy, &totalSent, producer, jobID, workerID)
 			// All orders failed = fatal — cancel the fleet
 			if results[idx].OrdersFailed == b.config.OrdersToSend &&
 				b.config.OrdersToSend > 0 {
@@ -105,11 +106,22 @@ func runFleet(ctx context.Context, bots []*Bot, cfg FleetConfig) []BotResult {
 		})
 	}
 
+
 	if err := g.Wait(); err != nil {
 		debugLog("Fleet aborted: %v\n", err)
 	}
 
 	close(progressDone)
+
+	if producer != nil {
+		producer.PublishWorkerDone(telemetry.WorkerDoneEvent{
+			Type:        telemetry.EventWorkerDone,
+			JobID:       jobID,
+			WorkerID:    workerID,
+			TotalSent:   int64(totalSent.Load()),
+		})
+		producer.Close() // Flush the final buffers cleanly
+	}
 
 	return results
 }
@@ -237,6 +249,10 @@ func runDistributed(ctx context.Context, cfg FleetConfig, jobID string) (*FleetR
         }
     }
 
+    if len(errs) > 0 {
+        return nil, fmt.Errorf("shard failures: %v", strings.Join(errs, ", "))
+    }
+
     return &FleetReport{
         Status:       "completed",
         NumBots:      cfg.NumBots,
@@ -251,7 +267,7 @@ func runDistributed(ctx context.Context, cfg FleetConfig, jobID string) (*FleetR
 }
 
 // runBot is the single-bot execution loop with the real WebSocket send/receive loop.
-func runBot(ctx context.Context, b *Bot, endpoint string,strategy Strategy, totalSent *atomic.Int64) BotResult {
+func runBot(ctx context.Context, b *Bot, endpoint string,strategy Strategy, totalSent *atomic.Int64,producer *telemetry.Producer, jobID string,workerID string) BotResult {
 	result := BotResult{
 		BotID:    b.config.StringID,
 		Strategy: b.config.Strategy,
@@ -331,6 +347,23 @@ func runBot(ctx context.Context, b *Bot, endpoint string,strategy Strategy, tota
 			}
 		// Order successfully written to socket
 			sentCount.Add(1)
+
+			// Point A: non-blocking publish — bot never waits for Kafka
+			if producer != nil {
+				producer.PublishOrderAsync(telemetry.OrderEvent{
+					Type:      telemetry.EventOrderSent,
+					JobID:     jobID,
+					WorkerID:  workerID,
+					BotID:     b.config.StringID,
+					OrderID:   msg.OrderID,
+					OrderType: string(msg.Type),
+					Side:      string(msg.Side),
+					Price:     msg.Price,
+					Quantity:  msg.Quantity,
+					SentAtNs:  b.SendTimes[seq],
+				})
+			}
+
 			// Select over channel send to respect context closure if consumer bottlenecks
 			select {
 			case <-ctx.Done():
@@ -373,6 +406,29 @@ func runBot(ctx context.Context, b *Bot, endpoint string,strategy Strategy, tota
 
 		latencyCh <- latResult{latencyNs: latency}
 		ackedCount.Add(1)
+
+		if producer != nil {
+			if ack.Status == "filled" {
+				producer.PublishFillAsync(telemetry.FillEvent{
+					Type:        telemetry.EventFill,
+					JobID:       jobID,
+					WorkerID:    workerID,
+					OrderID:     ack.OrderID,
+					FilledQty:   ack.FilledQty,
+					FilledPrice: ack.FilledPrice,
+				})
+			} else {
+				producer.PublishAckAsync(telemetry.AckEvent{
+					Type:       telemetry.EventOrderAck,
+					JobID:      jobID,
+					WorkerID:   workerID,
+					BotID:      b.config.StringID,
+					OrderID:    ack.OrderID,
+					Status:     ack.Status,
+					LatencyNs:  latency,
+				})
+			}
+		}
 	}
 }()
 

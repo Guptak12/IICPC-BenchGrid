@@ -4,8 +4,11 @@ import (
 	"fmt"
 	"log"
 	"time"
+	
 
 	pb "github.com/guptak12/bot-fleet/gen/fleet"
+	"github.com/guptak12/bot-fleet/telemetry"
+
 )
 
 // workerServer implements the gRPC WorkerService interface
@@ -53,8 +56,17 @@ func (w *workerServer) RunShard(req *pb.ShardRequest, stream pb.WorkerService_Ru
 		}
 	}()
 
+	// 1. Initialize the Kafka Producer for this specific worker
+	producer, err := telemetry.NewProducer([]string{"redpanda:9092"}, req.JobId)
+	if err != nil {
+		log.Printf("[worker] Failed to init Kafka producer: %v", err)
+	}
+
+	// 2. Generate a unique Worker ID (e.g., using the port it's running on)
+	workerID := fmt.Sprintf("worker-%d", *workerPort)
+
 	// Run the load test (this blocks until all bots finish)
-	results := runFleet(stream.Context(), bots, cfg)
+	results := runFleet(stream.Context(), bots, cfg,producer, req.JobId, workerID)
 	
 	// Stop the heartbeat ping
 	done <- true 

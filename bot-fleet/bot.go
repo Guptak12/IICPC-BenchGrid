@@ -51,6 +51,8 @@ type OrderMessage struct {
 type OrderAck struct {
 	OrderID int64 `json:"order_id"`
 	Status  string `json:"status"` // "accepted", "rejected", "filled"
+	FilledQty   int64  `json:"filled_qty,omitempty"`
+	FilledPrice int64  `json:"filled_price,omitempty"`
 }
 
 // BotConfig -> holds everything a bot needs to know before it starts

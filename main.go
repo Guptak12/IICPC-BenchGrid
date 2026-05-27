@@ -5,20 +5,20 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
-	"time"
-	"net"
 	"sync"
+	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 	"github.com/moby/docker/pkg/stdcopy"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/client"
-	"github.com/google/uuid"
-    
 )
+
 // Global Docker client instance
 var dockerClient *client.Client
 
@@ -302,7 +302,7 @@ func handleStop(c fiber.Ctx) error {
 }
 
 func createContainer(ctx context.Context, cmd []string, hostSubmitDir string, containerName string) (string, error) {
-	pidsLimit := int64(100)
+	pidsLimit := int64(2048) // Increased to support high concurrency testing
 
 	config := &container.Config{
 		Image: SandboxImage,
