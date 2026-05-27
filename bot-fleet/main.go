@@ -10,7 +10,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/HdrHistogram/hdrhistogram-go"
+	"google.golang.org/grpc"
+pb "github.com/guptak12/bot-fleet/gen/fleet"// replace with actual import path
+	"net"
+	"os"
+	"strings"
+	"flag"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -104,8 +109,38 @@ type FleetReport struct {
 // ─────────────────────────────────────────────────────────────────────────────
 // HTTP server
 // ─────────────────────────────────────────────────────────────────────────────
+var mode = flag.String("mode", "master", "master or worker")
+var workerPort = flag.Int("port", 5001, "worker gRPC port")
 
 func main() {
+	 flag.Parse()
+
+    switch *mode {
+    case "worker":
+        runWorkerMode(*workerPort)
+    case "master":
+        runMasterMode()
+    default:
+        log.Fatalf("unknown mode: %s", *mode)
+    }
+}
+func runWorkerMode(port int) {
+    lis, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+    if err != nil {
+        log.Fatalf("listen failed: %v", err)
+    }
+    grpcServer := grpc.NewServer()
+    pb.RegisterWorkerServiceServer(grpcServer, &workerServer{})
+    log.Printf("Worker running on :%d\n", port)
+    log.Fatal(grpcServer.Serve(lis))
+}
+
+func runMasterMode() {
+    // Read worker addresses from env
+    if w := os.Getenv("WORKERS"); w != "" {
+        masterCfg.WorkerAddresses = strings.Split(w, ",")
+    }
+    // existing HTTP server setup
 	mux := http.NewServeMux()
 	mux.HandleFunc("/run",     handleRun)
 	mux.HandleFunc("/status/", handleStatus)
@@ -198,40 +233,34 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
 			job.ID[:8], len(bots), cfg.OrdersPerBot, cfg.Endpoint)
 
 		start := time.Now()
-		results := runFleet(jobCtx, bots, cfg)
+		report, err := runDistributed(jobCtx, cfg, job.ID)
 		elapsed := time.Since(start)
 
 		// Step 5: Initialize global aggregator matrix (1ns to 1hr tracking bounds)
-		globalHist := hdrhistogram.New(1, 3600000000000, 3)
+		if err != nil {
+    now := time.Now()
+    replaceJob(&Job{
+        ID:        job.ID,
+        Status:    JobAborted,
+        StartedAt: job.StartedAt,
+        EndedAt:   &now,
+        Error:     err.Error(),
+        cancel:    jobCancel,
+    })
+    jobCancel()
+    return
+}
 
-		
+// Fill in fields runDistributed doesn't set
+report.DurationMs = elapsed.Milliseconds()
+report.TPS = float64(report.OrdersSent) / (float64(elapsed.Milliseconds()) / 1000.0)
+report.StrategyBreakdown = map[string]int{
+    "market_maker":    countStrategy(bots, MarketMaker),
+    "momentum_trader": countStrategy(bots, MomentumTrader),
+    "noise_trader":    countStrategy(bots, NoiseTrader),
+}
 
-		var totalSent, totalFailed int
-		for _, res := range results {
-			totalSent += res.OrdersSent
-			totalFailed += res.OrdersFailed
-			globalHist.Merge(res.Histogram)
-			
-		}
-
-		report := &FleetReport{
-			Status:       "completed",
-			NumBots:      len(bots),
-			TotalOrders:  cfg.NumBots * cfg.OrdersPerBot,
-			OrdersSent:   totalSent,
-			OrdersFailed: totalFailed,
-			DurationMs:   elapsed.Milliseconds(),
-			TPS: float64(totalSent) / (float64(elapsed.Milliseconds()) / 1000.0),
-			StrategyBreakdown: map[string]int{
-				"market_maker":    countStrategy(bots, MarketMaker),
-				"momentum_trader": countStrategy(bots, MomentumTrader),
-				"noise_trader":    countStrategy(bots, NoiseTrader),
-			},
-			P50Us: float64(globalHist.ValueAtQuantile(50.0)) / 1000.0,
-			P90Us: float64(globalHist.ValueAtQuantile(90.0)) / 1000.0,
-			P99Us: float64(globalHist.ValueAtQuantile(99.0)) / 1000.0,
-			MaxUs: float64(globalHist.Max()) / 1000.0,
-		}
+report.Status = "completed"
 
 		now := time.Now()
 
@@ -246,7 +275,7 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
 		})
 
 		log.Printf("[job:%s] Done: %d/%d orders in %s\n",
-			job.ID[:8], totalSent, cfg.NumBots*cfg.OrdersPerBot,
+			job.ID[:8], report.OrdersSent, cfg.NumBots*cfg.OrdersPerBot,
 			elapsed.Round(time.Millisecond))
 
 		jobCancel()

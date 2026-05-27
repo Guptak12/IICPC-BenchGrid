@@ -16,7 +16,11 @@ import (
 	gojson "github.com/goccy/go-json"
 	"golang.org/x/sync/errgroup"
 	"github.com/HdrHistogram/hdrhistogram-go"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	
+	pb "github.com/guptak12/bot-fleet/gen/fleet"
+
 )
 
 const (
@@ -25,8 +29,21 @@ const (
 	maxConcurrentBots = 500
 	dialTimeout	  = 5 * time.Second
 	debugLogs  = true
-	channelBufferSize = 1024
 )
+
+// Add worker addresses to config
+type MasterConfig struct {
+    WorkerAddresses []string // e.g. ["worker1:5001", "worker2:5002"]
+}
+
+var masterCfg = MasterConfig{
+    WorkerAddresses: []string{
+        "localhost:5001",
+        "localhost:5002",
+        "localhost:5003",
+    },
+}
+
 
 
 // runFleet spawns all bots concurrently with a semaphore bound.
@@ -95,6 +112,142 @@ func runFleet(ctx context.Context, bots []*Bot, cfg FleetConfig) []BotResult {
 	close(progressDone)
 
 	return results
+}
+
+func runDistributed(ctx context.Context, cfg FleetConfig, jobID string) (*FleetReport, error) {
+	 workers := masterCfg.WorkerAddresses
+    numWorkers := len(workers)
+
+    if numWorkers == 0 {
+        return nil, fmt.Errorf("no workers configured")
+    }
+
+    // Shard bots evenly across workers
+    botsPerWorker := cfg.NumBots / numWorkers
+    remainder := cfg.NumBots % numWorkers
+
+    type shardResponse struct {
+        result *pb.ShardResult
+        err    error
+    }
+
+    resultCh := make(chan shardResponse, numWorkers)
+
+    for i, addr := range workers {
+        workerIdx := i
+        workerAddr := addr
+
+        // Calculate shard size — last worker gets remainder
+        shardSize := botsPerWorker
+        if workerIdx == numWorkers-1 {
+            shardSize += remainder
+        }
+
+        // Bot ID offset ensures globally unique OrderIDs across workers
+        botIDOffset := int64(workerIdx * botsPerWorker)
+
+       go func() {
+			conn, err := grpc.NewClient(workerAddr,
+				grpc.WithTransportCredentials(insecure.NewCredentials()),
+			)
+			if err != nil {
+				resultCh <- shardResponse{err: fmt.Errorf("worker %s connect failed: %v", workerAddr, err)}
+				return
+			}
+			defer conn.Close()
+
+			client := pb.NewWorkerServiceClient(conn)
+
+			// Give each shard a generous timeout
+			shardCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+			defer cancel()
+
+			// 1. Call the method, which now returns a STREAM, not a single result
+			stream, err := client.RunShard(shardCtx, &pb.ShardRequest{
+				JobId:          jobID,
+				Endpoint:       cfg.Endpoint,
+				NumBots:        int32(shardSize),
+				OrdersPerBot:   int32(cfg.OrdersPerBot),
+				MidPrice:       cfg.MidPrice,
+				Spread:         cfg.Spread,
+				RatePerSec:     cfg.RatePerSec,
+				MarketMakerPct: cfg.StrategyMix.MarketMaker,
+				MomentumPct:    cfg.StrategyMix.MomentumTrader,
+				NoisePct:       cfg.StrategyMix.NoiseTrader,
+				BotIdOffset:    botIDOffset,
+			})
+
+			if err != nil {
+				resultCh <- shardResponse{err: fmt.Errorf("worker %s shard start failed: %v", workerAddr, err)}
+				return
+			}
+
+			// 2. Loop and listen to the stream heartbeats
+			var finalResult *pb.ShardResult
+			for {
+				res, err := stream.Recv()
+				if err == io.EOF {
+					// The worker closed the stream successfully
+					break
+				}
+				if err != nil {
+					resultCh <- shardResponse{err: fmt.Errorf("worker %s stream read error: %v", workerAddr, err)}
+					return
+				}
+
+				// If you want to see live TPS from the workers, uncomment this:
+				// log.Printf("[Master] Worker %s alive | TPS: %.2f", workerAddr, res.CurrentTps)
+
+				// 3. Catch the final payload containing the heavy histogram bytes
+				if res.IsFinal {
+					finalResult = res
+				}
+			}
+
+			if finalResult == nil {
+				resultCh <- shardResponse{err: fmt.Errorf("worker %s closed stream without sending final result", workerAddr)}
+				return
+			}
+
+			// Send the final result back to the Master aggregation channel
+			resultCh <- shardResponse{result: finalResult, err: nil}
+		}()
+    }
+
+    // Collect all shard results
+    globalHist := newHistogram()
+    var totalSent, totalFailed int
+    var errs []string
+
+    for i := 0; i < numWorkers; i++ {
+        resp := <-resultCh
+        if resp.err != nil {
+            errs = append(errs, resp.err.Error())
+            continue
+        }
+
+        totalSent += int(resp.result.OrdersSent)
+        totalFailed += int(resp.result.OrdersFailed)
+
+        if len(resp.result.Histogram) > 0 {
+            h, err := deserialiseHistogram(resp.result.Histogram)
+            if err == nil {
+                globalHist.Merge(h)
+            }
+        }
+    }
+
+    return &FleetReport{
+        Status:       "completed",
+        NumBots:      cfg.NumBots,
+        TotalOrders:  cfg.NumBots * cfg.OrdersPerBot,
+        OrdersSent:   totalSent,
+        OrdersFailed: totalFailed,
+        P50Us:        float64(globalHist.ValueAtQuantile(50)) / 1000.0,
+        P90Us:        float64(globalHist.ValueAtQuantile(90)) / 1000.0,
+        P99Us:        float64(globalHist.ValueAtQuantile(99)) / 1000.0,
+        MaxUs:        float64(globalHist.Max()) / 1000.0,
+    }, nil
 }
 
 // runBot is the single-bot execution loop with the real WebSocket send/receive loop.

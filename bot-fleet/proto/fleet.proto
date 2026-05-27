@@ -1,0 +1,40 @@
+syntax = "proto3";
+
+package fleet;
+option go_package = "github.com/yourname/bot-fleet/gen/fleet";
+
+// Master → Worker: shard assignment
+message ShardRequest {
+    string job_id          = 1;
+    string endpoint        = 2;  // ws://sandbox-ip:8080/ws
+    int32  num_bots        = 3;  // bots this worker handles
+    int32  orders_per_bot  = 4;
+    double mid_price       = 5;
+    double spread          = 6;
+    double rate_per_sec    = 7;
+    double market_maker_pct = 8;
+    double momentum_pct     = 9;
+    double noise_pct        = 10;
+    int64  bot_id_offset    = 11; // Worker 2 starts at bot 1001
+}
+
+// Worker → Master: live telemetry AND final result
+message ShardResult {
+    string job_id         = 1;
+    int64  orders_sent    = 2;  // Upgraded to int64 to prevent HFT overflow
+    int64  orders_failed  = 3;  // Upgraded to int64
+    double current_tps    = 4;  // Real-time TPS for the Master's UI
+    
+    // Only populated on the very last message the worker sends
+    bytes  histogram      = 5;  // Serialised HDR histogram
+    bool   is_final       = 6;  // Flag indicating the worker is completely done
+    
+    string error          = 7;  // Empty if success
+}
+
+// Worker service — Master calls this on each Worker
+service WorkerService {
+    // Note the "stream" keyword. The worker will stream status updates 
+    // every second, then send the final histogram, then close the stream.
+    rpc RunShard(ShardRequest) returns (stream ShardResult);
+}

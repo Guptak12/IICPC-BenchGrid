@@ -1,0 +1,38 @@
+services:
+  worker-1:
+    image: bot-fleet:v1
+    command: ["-mode=worker", "-port=5001"]
+    ports:
+      - "5001:5001"
+    networks:
+      - iicpc-net
+
+  worker-2:
+    image: bot-fleet:v1
+    command: ["-mode=worker", "-port=5002"]
+    ports:
+      - "5002:5002"
+    networks:
+      - iicpc-net
+
+  worker-3:
+    image: bot-fleet:v1
+    command: ["-mode=worker", "-port=5003"]
+    ports:
+      - "5003:5003"
+    networks:
+      - iicpc-net
+
+  master:
+    image: bot-fleet:v1
+    command: ["-mode=master"]
+    ports:
+      - "4000:4000"
+    networks:
+      - iicpc-net
+    environment:
+      - WORKERS=worker-1:5001,worker-2:5002,worker-3:5003
+
+networks:
+  iicpc-net:
+    external: true
