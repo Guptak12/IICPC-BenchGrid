@@ -408,7 +408,7 @@ func ensureNetwork(ctx context.Context) error {
     // 3. Create the isolated bridge network
 	_, err = dockerClient.NetworkCreate(ctx, SandboxNetwork, client.NetworkCreateOptions{
 		Driver:   "bridge",
-		Internal: false, // Completely cuts off internet access to the sandbox
+		Internal: true, // Completely cuts off internet access to the sandbox
 	})
 	return err
 }
