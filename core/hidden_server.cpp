@@ -38,7 +38,7 @@ void IICPCEngine::emit_ack(int64_t order_id) {
     sendFrame(current_client_fd, json);
 }
 
-void IICPCEngine::emit_fill(int64_t order_id, int64_t filled_qty, double filled_price, int64_t matched_with) {
+void IICPCEngine::emit_fill(int64_t order_id, int64_t filled_qty, int64_t filled_price, int64_t matched_with) {
     if (current_client_fd == -1) return;
     
     uint64_t seq_id = global_engine_seq_id++;
@@ -196,15 +196,6 @@ static int64_t extractIntField(const std::string& json, const std::string& key) 
     try { return std::stoll(json.substr(pos, end - pos)); } catch (...) { return 0; }
 }
 
-static double extractDoubleField(const std::string& json, const std::string& key) {
-    size_t pos = json.find(key);
-    if (pos == std::string::npos) return 0.0;
-    pos += key.size();
-    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\"')) pos++;
-    size_t end = json.find_first_of(",}", pos);
-    try { return std::stod(json.substr(pos, end - pos)); } catch (...) { return 0.0; }
-}
-
 // --- Worker Thread ---
 static void handleClient(int clientFd) {
     if (!doHandshake(clientFd)) {
@@ -223,7 +214,7 @@ static void handleClient(int clientFd) {
         new_order.order_id = extractIntField(raw_json, "\"order_id\":");
         new_order.type = extractStringField(raw_json, "\"type\":");
         new_order.side = extractStringField(raw_json, "\"side\":");
-        new_order.price = extractDoubleField(raw_json, "\"price\":");
+        new_order.price = extractIntField(raw_json, "\"price\":");
         new_order.quantity = extractIntField(raw_json, "\"quantity\":");
 
         if (global_engine_instance) {

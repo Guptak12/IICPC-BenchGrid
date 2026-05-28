@@ -7,7 +7,7 @@ struct Order {
     int64_t order_id;
     std::string type; // "LIMIT", "MARKET"
     std::string side; // "BUY", "SELL"
-    double price;
+    int64_t price;
     int64_t quantity;
 };
 
@@ -21,7 +21,7 @@ public:
 
     // The functions the contestant calls to output data
     void emit_ack(int64_t order_id);
-    void emit_fill(int64_t order_id, int64_t filled_qty, double filled_price, int64_t matched_with);
+    void emit_fill(int64_t order_id, int64_t filled_qty, int64_t filled_price, int64_t matched_with);
 };
 
 // Global pointer that will hold the contestant's engine instance

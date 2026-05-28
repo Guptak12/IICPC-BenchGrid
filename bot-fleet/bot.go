@@ -13,11 +13,10 @@ import (
 type StrategyType string
 
 const (
-	MarketMaker     StrategyType = "MARKET_MAKER"
-	MomentumTrader  StrategyType = "MOMENTUM_TRADER"
-	NoiseTrader     StrategyType = "NOISE_TRADER"
+	MarketMaker    StrategyType = "MARKET_MAKER"
+	MomentumTrader StrategyType = "MOMENTUM_TRADER"
+	NoiseTrader    StrategyType = "NOISE_TRADER"
 )
-
 
 // OrderType mirrors real exchange order types
 type OrderType string
@@ -38,32 +37,33 @@ const (
 
 // OrderMessage -> what gets sent over WebSocket to the contestant's server
 type OrderMessage struct {
-	BotID      string    `json:"bot_id"`
-	OrderID    int64    `json:"order_id"`
-	Type       OrderType `json:"type"`
-	Side       Side      `json:"side"`
-	Price      int64   `json:"price"`      // 0 for MARKET orders
-	Quantity   int64   `json:"quantity"`
+	BotID    string    `json:"bot_id"`
+	OrderID  int64     `json:"order_id"`
+	Type     OrderType `json:"type"`
+	Side     Side      `json:"side"`
+	Price    int64     `json:"price"` // 0 for MARKET orders
+	Quantity int64     `json:"quantity"`
 }
 
 // OrderAck -> what the contestant's server sends back
 type OrderAck struct {
-	OrderID int64 `json:"order_id"`
-	Status  string `json:"status"` // "accepted", "rejected", "filled"
+	OrderID     int64  `json:"order_id"`
+	Status      string `json:"status"` // "accepted", "rejected", "filled"
 	FilledQty   int64  `json:"filled_qty,omitempty"`
-	FilledPrice float64  `json:"filled_price,omitempty"`
+	FilledPrice int64  `json:"filled_price,omitempty"`
+	MatchedWith int64  `json:"matched_with,omitempty"`
 	EngineSeqID int64  `json:"engine_seq_id,omitempty"`
 }
 
 // BotConfig -> holds everything a bot needs to know before it starts
 type BotConfig struct {
-	NumericID   int64
-	StringID	string
-	Strategy    StrategyType
-	MidPrice     int64        // scaled: $100.50 = 10050
-	Spread       int64        // scaled: $0.10 = 10
-	OrdersToSend int          // how many orders this bot will send total
-	RatePerSec  float64       // target orders per second
+	NumericID    int64
+	StringID     string
+	Strategy     StrategyType
+	MidPrice     int64   // scaled: $100.50 = 10050
+	Spread       int64   // scaled: $0.10 = 10
+	OrdersToSend int     // how many orders this bot will send total
+	RatePerSec   float64 // target orders per second
 }
 
 // BotResult is returned after a bot finishes its run
@@ -78,22 +78,21 @@ type BotResult struct {
 
 // Bot is a single simulated market participant
 type Bot struct {
-	config  BotConfig
-	rng     *rand.Rand   // per-bot RNG — not shared, so no mutex needed
-	seqNum  atomic.Int64 // order sequence number, unique per bot
-	SendTimes []int64 
+	config    BotConfig
+	rng       *rand.Rand   // per-bot RNG — not shared, so no mutex needed
+	seqNum    atomic.Int64 // order sequence number, unique per bot
+	SendTimes []int64
 }
 
 func NewBot(cfg BotConfig) *Bot {
 	return &Bot{
 		config: cfg,
-		rng: rand.New(rand.NewSource(time.Now().UnixNano() + cfg.NumericID)),
+		rng:    rand.New(rand.NewSource(time.Now().UnixNano() + cfg.NumericID)),
 		// Pre-allocate SendTimes for all orders this bot will send
 		// Index = seq & 0xFFFFFFFF — safe because OrdersToSend << 2^32
 		SendTimes: make([]int64, cfg.OrdersToSend+1),
 	}
 }
-	
 
 func (b *Bot) NextOrder() OrderMessage {
 	seq := b.seqNum.Add(1)
@@ -126,7 +125,6 @@ func (b *Bot) CalculateLatency(orderID int64) int64 {
 func (b *Bot) MarshalOrder(msg OrderMessage) ([]byte, error) {
 	return gojson.Marshal(msg)
 }
-
 
 func (b *Bot) marketMakerOrder(orderID, seq int64) OrderMessage {
 	var side Side

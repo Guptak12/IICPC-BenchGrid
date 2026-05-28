@@ -3,8 +3,9 @@ package shadow
 import (
 	"container/list"
 	"fmt"
-	"sync"
 	"strings"
+	"sync"
+
 	"github.com/emirpasic/gods/trees/redblacktree"
 	"github.com/emirpasic/gods/utils"
 )
@@ -23,6 +24,7 @@ type Fill struct {
 	OrderID     int64
 	FilledQty   int64
 	FilledPrice int64
+	MatchedWith int64
 }
 
 // PriceLevel represents a single price level in the order book containing multiple orders (FIFO)
@@ -31,10 +33,9 @@ type PriceLevel struct {
 	Orders *list.List // List of *Order
 }
 
-
 // Validator verifies that the C++ engine matched orders correctly
 type Validator struct {
-	mu sync.Mutex
+	mu            sync.Mutex
 	pendingOrders map[int64]*Order // Cache orders until the C++ engine ACKs them
 	// O(1) Order Map: orderID -> list.Element inside a PriceLevel's Orders list
 	orderMap map[int64]*list.Element
@@ -49,9 +50,12 @@ type Validator struct {
 	totalExpectedFills int64
 	totalActualFills   int64
 
-	missedFills       int64
-	phantomFills      int64
+	missedFills        int64
+	phantomFills       int64
 	priorityViolations int64
+	ackViolations      int64
+	duplicateOrders    int64
+	unknownAcks        int64
 }
 
 func int64DescComparator(a, b interface{}) int {
@@ -75,6 +79,13 @@ func (v *Validator) ProcessOrder(orderID int64, orderType string, side string, p
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
+	if _, exists := v.pendingOrders[orderID]; exists {
+		v.duplicateOrders++
+	}
+	if _, exists := v.orderMap[orderID]; exists && strings.ToLower(orderType) != "cancel" {
+		v.duplicateOrders++
+	}
+
 	v.pendingOrders[orderID] = &Order{
 		ID:       orderID,
 		Type:     orderType,
@@ -89,27 +100,71 @@ func (v *Validator) ProcessAck(orderID int64, status string) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
+	order, ok := v.pendingOrders[orderID]
+	if !ok {
+		v.unknownAcks++
+		return
+	}
+	delete(v.pendingOrders, orderID)
+
 	cleanStatus := strings.ToLower(status)
-	if cleanStatus != "accepted" {
+	cleanType := strings.ToLower(order.Type)
+
+	switch cleanType {
+	case "limit":
+		if cleanStatus != "accepted" {
+			v.ackViolations++
+			return
+		}
+		v.matchLimitOrder(order)
+	case "market":
+		if cleanStatus != "accepted" {
+			v.ackViolations++
+			return
+		}
+		v.matchMarketOrder(order)
+	case "cancel":
+		found := v.hasRestingOrder(order.ID)
+		expectedStatus := "rejected"
+		if found {
+			expectedStatus = "cancelled"
+		}
+		if cleanStatus != expectedStatus {
+			v.ackViolations++
+			return
+		}
+		if found {
+			v.removeRestingOrder(order.ID)
+		}
+	default:
+		if cleanStatus != "rejected" {
+			v.ackViolations++
+		}
+	}
+}
+
+func (v *Validator) matchLimitOrder(order *Order) {
+	remainingQty := v.matchIncoming(order, true)
+	if remainingQty <= 0 {
 		return
 	}
 
-	order, ok := v.pendingOrders[orderID]
-	if !ok {
-		// If this happens, Kafka ordering fundamentally failed (Ack arrived before Sent)
-		// But because they share a Partition Key, this should never happen.
-		return 
-	}
+	cleanSide := strings.ToLower(order.Side)
+	order.Quantity = remainingQty
 
-	// Now that it is officially the "next" order in the C++ engine's timeline, match it!
-	// 2. Force lowercase check
-	cleanType := strings.ToLower(order.Type)
-	if cleanType == "limit" {
-		v.matchLimitOrder(order)
+	if cleanSide == "buy" {
+		v.addOrderToBook(order, v.bids)
+	} else if cleanSide == "sell" {
+		v.addOrderToBook(order, v.asks)
 	}
 }
-func (v *Validator) matchLimitOrder(order *Order) {
-	var remainingQty = order.Quantity
+
+func (v *Validator) matchMarketOrder(order *Order) {
+	v.matchIncoming(order, false)
+}
+
+func (v *Validator) matchIncoming(order *Order, useLimitPrice bool) int64 {
+	remainingQty := order.Quantity
 	cleanSide := strings.ToLower(order.Side)
 
 	if cleanSide == "buy" {
@@ -119,9 +174,9 @@ func (v *Validator) matchLimitOrder(order *Order) {
 			if bestAskNode == nil {
 				break
 			}
-			
+
 			bestAskPrice := bestAskNode.Key.(int64)
-			if order.Price < bestAskPrice {
+			if useLimitPrice && order.Price < bestAskPrice {
 				break // No cross
 			}
 
@@ -135,8 +190,8 @@ func (v *Validator) matchLimitOrder(order *Order) {
 					tradeQty = restingOrder.Quantity
 				}
 
-				v.recordExpectedFill(order.ID, tradeQty, bestAskPrice)
-				v.recordExpectedFill(restingOrder.ID, tradeQty, bestAskPrice)
+				v.recordExpectedFill(order.ID, tradeQty, bestAskPrice, restingOrder.ID)
+				v.recordExpectedFill(restingOrder.ID, tradeQty, bestAskPrice, order.ID)
 
 				remainingQty -= tradeQty
 				restingOrder.Quantity -= tradeQty
@@ -153,12 +208,7 @@ func (v *Validator) matchLimitOrder(order *Order) {
 			}
 		}
 
-		if remainingQty > 0 {
-			order.Quantity = remainingQty
-			v.addOrderToBook(order, v.bids)
-		}
-
-	} else if order.Side == "sell" {
+	} else if cleanSide == "sell" {
 		// Match against bids
 		for remainingQty > 0 {
 			bestBidNode := v.bids.Left()
@@ -167,7 +217,7 @@ func (v *Validator) matchLimitOrder(order *Order) {
 			}
 
 			bestBidPrice := bestBidNode.Key.(int64)
-			if order.Price > bestBidPrice {
+			if useLimitPrice && order.Price > bestBidPrice {
 				break // No cross
 			}
 
@@ -181,8 +231,8 @@ func (v *Validator) matchLimitOrder(order *Order) {
 					tradeQty = restingOrder.Quantity
 				}
 
-				v.recordExpectedFill(order.ID, tradeQty, bestBidPrice)
-				v.recordExpectedFill(restingOrder.ID, tradeQty, bestBidPrice)
+				v.recordExpectedFill(order.ID, tradeQty, bestBidPrice, restingOrder.ID)
+				v.recordExpectedFill(restingOrder.ID, tradeQty, bestBidPrice, order.ID)
 
 				remainingQty -= tradeQty
 				restingOrder.Quantity -= tradeQty
@@ -198,12 +248,9 @@ func (v *Validator) matchLimitOrder(order *Order) {
 				v.bids.Remove(bestBidPrice)
 			}
 		}
-
-		if remainingQty > 0 {
-			order.Quantity = remainingQty
-			v.addOrderToBook(order, v.asks)
-		}
 	}
+
+	return remainingQty
 }
 
 func (v *Validator) addOrderToBook(order *Order, tree *redblacktree.Tree) {
@@ -215,22 +262,69 @@ func (v *Validator) addOrderToBook(order *Order, tree *redblacktree.Tree) {
 		level = &PriceLevel{Price: order.Price, Orders: list.New()}
 		tree.Put(order.Price, level)
 	}
-	
+
 	elem := level.Orders.PushBack(order)
 	v.orderMap[order.ID] = elem
 }
 
-func (v *Validator) recordExpectedFill(orderID int64, qty int64, price int64) {
-	v.expectedFills[orderID] = append(v.expectedFills[orderID], Fill{OrderID: orderID, FilledQty: qty, FilledPrice: price})
+func (v *Validator) hasRestingOrder(orderID int64) bool {
+	_, ok := v.orderMap[orderID]
+	return ok
+}
+
+func (v *Validator) removeRestingOrder(orderID int64) bool {
+	elem, ok := v.orderMap[orderID]
+	if !ok {
+		return false
+	}
+
+	order := elem.Value.(*Order)
+	tree := v.asks
+	if strings.ToLower(order.Side) == "buy" {
+		tree = v.bids
+	}
+
+	node, found := tree.Get(order.Price)
+	if !found {
+		delete(v.orderMap, orderID)
+		return false
+	}
+
+	level := node.(*PriceLevel)
+	level.Orders.Remove(elem)
+	if level.Orders.Len() == 0 {
+		tree.Remove(order.Price)
+	}
+	delete(v.orderMap, orderID)
+	return true
+}
+
+func (v *Validator) recordExpectedFill(orderID int64, qty int64, price int64, matchedWith int64) {
+	v.expectedFills[orderID] = append(v.expectedFills[orderID], Fill{
+		OrderID:     orderID,
+		FilledQty:   qty,
+		FilledPrice: price,
+		MatchedWith: matchedWith,
+	})
 	v.totalExpectedFills++
 }
 
 // ProcessFill processes a fill event from the sandbox
-func (v *Validator) ProcessFill(orderID int64, filledQty int64, filledPrice int64) {
+func (v *Validator) ProcessFill(orderID int64, filledQty int64, filledPrice int64, matchedWith ...int64) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	actualFill := Fill{OrderID: orderID, FilledQty: filledQty, FilledPrice: filledPrice}
+	var counterparty int64
+	if len(matchedWith) > 0 {
+		counterparty = matchedWith[0]
+	}
+
+	actualFill := Fill{
+		OrderID:     orderID,
+		FilledQty:   filledQty,
+		FilledPrice: filledPrice,
+		MatchedWith: counterparty,
+	}
 	v.actualFills[orderID] = append(v.actualFills[orderID], actualFill)
 	v.totalActualFills++
 }
@@ -240,23 +334,23 @@ func (v *Validator) GetCorrectnessScore() float64 {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	if v.totalExpectedFills == 0 && v.totalActualFills == 0 {
-		return 100.0
-	}
+	var expectedQty int64
+	var actualQty int64
+	var priceCorrectQty int64
+	var priorityCorrectQty int64
+	var phantomQty int64
+	var expectedValue int64
+	var valueDiff int64
 
-	var correctOrders int64
-	var totalOrdersEvaluated int64
-	
 	v.missedFills = 0
 	v.phantomFills = 0
+	v.priorityViolations = 0
 
 	for orderID, expectedList := range v.expectedFills {
-		totalOrdersEvaluated++
 		actualList, actOk := v.actualFills[orderID]
 
 		if !actOk {
 			v.missedFills++
-			continue 
 		}
 
 		var totalExpQty, totalActQty int64
@@ -272,15 +366,22 @@ func (v *Validator) GetCorrectnessScore() float64 {
 			actValue += f.FilledQty * f.FilledPrice
 		}
 
-		if totalExpQty == totalActQty && expValue == actValue {
-			correctOrders++
-		} else {
-			if totalActQty < totalExpQty {
-				v.missedFills++ // Partially missed
-			} else if totalActQty > totalExpQty {
-				v.phantomFills++
-			}
-			// Value mismatch could indicate price violation
+		expectedQty += totalExpQty
+		actualQty += totalActQty
+		expectedValue += expValue
+		valueDiff += absInt64(expValue - actValue)
+
+		if totalActQty < totalExpQty {
+			v.missedFills++
+		} else if totalActQty > totalExpQty {
+			v.phantomFills++
+			phantomQty += totalActQty - totalExpQty
+		}
+
+		priceCorrectQty += matchingQtyByPrice(expectedList, actualList)
+		priorityCorrectQty += v.priorityMatchedQty(expectedList, actualList)
+
+		if totalExpQty != totalActQty || expValue != actValue {
 			fmt.Printf("[Validator] Mismatch Order %d: Expected Qty=%d Value=%d, Actual Qty=%d Value=%d\n",
 				orderID, totalExpQty, expValue, totalActQty, actValue)
 		}
@@ -290,30 +391,111 @@ func (v *Validator) GetCorrectnessScore() float64 {
 	for orderID := range v.actualFills {
 		if _, expOk := v.expectedFills[orderID]; !expOk {
 			v.phantomFills++
+			for _, f := range v.actualFills[orderID] {
+				actualQty += f.FilledQty
+				phantomQty += f.FilledQty
+			}
 		}
 	}
 
-	if totalOrdersEvaluated == 0 {
-		if v.phantomFills > 0 {
+	if expectedQty == 0 {
+		if actualQty > 0 || v.ackViolations > 0 || v.duplicateOrders > 0 || v.unknownAcks > 0 {
 			return 0.0
 		}
 		return 100.0
 	}
 
-	// Deduct heavily for missed and phantom fills
-	score := 100.0 - (float64(v.missedFills)*5.0 + float64(v.phantomFills)*10.0)
-	
-	// Basic correctness percentage if score wasn't heavily penalized
-	baseScore := (float64(correctOrders) / float64(totalOrdersEvaluated)) * 100.0
-	
+	quantityScore := (float64(minInt64(priceCorrectQty, expectedQty)) / float64(expectedQty)) * 70.0
+	priorityScore := (float64(minInt64(priorityCorrectQty, expectedQty)) / float64(expectedQty)) * 20.0
+	valueScore := 10.0
+	if expectedValue > 0 {
+		valueScore = maxFloat64(0, 10.0*(1.0-(float64(valueDiff)/float64(expectedValue))))
+	}
+
+	score := quantityScore + priorityScore + valueScore
+
+	if phantomQty > 0 {
+		score -= minFloat64(25.0, 25.0*(float64(phantomQty)/float64(expectedQty)))
+	}
+	score -= float64(v.ackViolations) * 2.0
+	score -= float64(v.duplicateOrders) * 2.0
+	score -= float64(v.unknownAcks) * 2.0
+
 	if score < 0 {
 		score = 0
 	}
-	
-	// Return the lower of the two to be strict
-	if score > baseScore {
-		return baseScore
+	if score > 100 {
+		score = 100
 	}
-	
+
 	return score
+}
+
+func (v *Validator) priorityMatchedQty(expectedList []Fill, actualList []Fill) int64 {
+	var matched int64
+	for i, expected := range expectedList {
+		if i >= len(actualList) {
+			v.priorityViolations++
+			continue
+		}
+		actual := actualList[i]
+		if actual.FilledQty != expected.FilledQty || actual.FilledPrice != expected.FilledPrice {
+			v.priorityViolations++
+			continue
+		}
+		if actual.MatchedWith != 0 && actual.MatchedWith != expected.MatchedWith {
+			v.priorityViolations++
+			continue
+		}
+		matched += expected.FilledQty
+	}
+	if len(actualList) > len(expectedList) {
+		v.priorityViolations += int64(len(actualList) - len(expectedList))
+	}
+	return matched
+}
+
+func matchingQtyByPrice(expectedList []Fill, actualList []Fill) int64 {
+	expectedByPrice := make(map[int64]int64)
+	actualByPrice := make(map[int64]int64)
+	for _, f := range expectedList {
+		expectedByPrice[f.FilledPrice] += f.FilledQty
+	}
+	for _, f := range actualList {
+		actualByPrice[f.FilledPrice] += f.FilledQty
+	}
+
+	var matched int64
+	for price, expQty := range expectedByPrice {
+		matched += minInt64(expQty, actualByPrice[price])
+	}
+	return matched
+}
+
+func minInt64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func absInt64(v int64) int64 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+func minFloat64(a, b float64) float64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxFloat64(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
 }
