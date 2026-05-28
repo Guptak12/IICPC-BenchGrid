@@ -28,6 +28,9 @@ const (
 	// Prevents exhausting file descriptors on a single machine
 	maxConcurrentBots = 500
 	dialTimeout       = 5 * time.Second
+	ackTimeout        = 5 * time.Second
+	readPollInterval  = 100 * time.Millisecond
+	fillDrainGrace    = 250 * time.Millisecond
 	debugLogs         = true
 )
 
@@ -288,29 +291,74 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 	// -----------------------------------------------------------------
 	// Phase 3 — Parallel sender + receiver
 	//
-	// sentSignal: sender → receiver, carries seq for latency lookup
-	// Buffered to OrdersToSend so sender never blocks waiting for receiver
-	//
-	// latencyResult: receiver → collector
-	// Buffered to OrdersToSend so receiver never blocks
+	// The receiver reads the WebSocket independently of sends. Execution
+	// reports are not one-response-per-order: fills may arrive between acks.
 	// -----------------------------------------------------------------
-	sentSignal := make(chan int64, b.config.OrdersToSend) // seq numbers of sent orders, for latency correlation
 	type latResult struct {
 		latencyNs int64
 		failed    bool
 	}
 	latencyCh := make(chan latResult, b.config.OrdersToSend)
 
-	var sentCount atomic.Int64  // orders successfully written to socket
-	var ackedCount atomic.Int64 // orders acked by server
+	var senderDone atomic.Bool
+	var lastReportNs atomic.Int64
+	lastReportNs.Store(time.Now().UnixNano())
+
+	pendingMu := sync.Mutex{}
+	pendingAcks := make(map[int64]int64, b.config.OrdersToSend) // orderID -> send time ns
+
+	removePending := func(orderID int64) (int64, bool) {
+		pendingMu.Lock()
+		defer pendingMu.Unlock()
+		sendTime, ok := pendingAcks[orderID]
+		if ok {
+			delete(pendingAcks, orderID)
+		}
+		return sendTime, ok
+	}
+
+	pendingLen := func() int {
+		pendingMu.Lock()
+		defer pendingMu.Unlock()
+		return len(pendingAcks)
+	}
+
+	failExpiredPending := func(now time.Time) {
+		deadlineNs := now.Add(-ackTimeout).UnixNano()
+		var expired int
+
+		pendingMu.Lock()
+		for orderID, sentAt := range pendingAcks {
+			if sentAt <= deadlineNs {
+				delete(pendingAcks, orderID)
+				expired++
+			}
+		}
+		pendingMu.Unlock()
+
+		for i := 0; i < expired; i++ {
+			latencyCh <- latResult{failed: true}
+		}
+	}
+
+	failAllPending := func() {
+		pendingMu.Lock()
+		n := len(pendingAcks)
+		pendingAcks = make(map[int64]int64)
+		pendingMu.Unlock()
+
+		for i := 0; i < n; i++ {
+			latencyCh <- latResult{failed: true}
+		}
+	}
 
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(3)
 
 	// --- Sender goroutine ---
 	go func() {
 		defer wg.Done()
-		defer close(sentSignal)
+		defer senderDone.Store(true)
 
 		for i := 0; i < b.config.OrdersToSend; i++ {
 			if err := strategy.Wait(ctx); err != nil {
@@ -331,7 +379,12 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 			seq := msg.OrderID & 0xFFFFFFFF
 			b.RecordSendTime(seq)
 
+			pendingMu.Lock()
+			pendingAcks[msg.OrderID] = b.SendTimes[seq]
+			pendingMu.Unlock()
+
 			if err := conn.Write(ctx, websocket.MessageText, payload); err != nil {
+				removePending(msg.OrderID)
 				remaining := b.config.OrdersToSend - i
 				for j := 0; j < remaining; j++ {
 					latencyCh <- latResult{failed: true}
@@ -339,7 +392,6 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 				return
 			}
 			// Order successfully written to socket
-			sentCount.Add(1)
 
 			// Point A: non-blocking publish — bot never waits for Kafka
 			if producer != nil {
@@ -356,13 +408,6 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 					SentAtNs:  b.SendTimes[seq],
 				})
 			}
-
-			// Select over channel send to respect context closure if consumer bottlenecks
-			select {
-			case <-ctx.Done():
-				return
-			case sentSignal <- seq:
-			}
 		}
 	}()
 
@@ -370,38 +415,25 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 	go func() {
 		defer wg.Done()
 
-		for seq := range sentSignal {
-			_ = seq // seq available for future per-order timeout logic
-
+		for {
 			_, ackBytes, err := conn.Read(ctx)
 			if err != nil {
-				latencyCh <- latResult{failed: true}
-				ackedCount.Add(1)
+				failAllPending()
 				if isTerminalError(err) || isContextError(err) {
 					return
 				}
 				continue
 			}
+			lastReportNs.Store(time.Now().UnixNano())
 
 			var ack OrderAck
 			if err := gojson.Unmarshal(ackBytes, &ack); err != nil {
-				latencyCh <- latResult{failed: true}
-				ackedCount.Add(1)
 				continue
 			}
 
-			latency := b.CalculateLatency(ack.OrderID)
-			if latency < 0 {
-				latencyCh <- latResult{failed: true}
-				ackedCount.Add(1)
-				continue
-			}
-
-			latencyCh <- latResult{latencyNs: latency}
-			ackedCount.Add(1)
-
-			if producer != nil {
-				if ack.Status == "filled" {
+			status := strings.ToLower(ack.Status)
+			if isFillStatus(status) {
+				if producer != nil {
 					producer.PublishFillAsync(telemetry.FillEvent{
 						Type:        telemetry.EventFill,
 						JobID:       jobID,
@@ -412,17 +444,55 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 						MatchedWith: ack.MatchedWith,
 						EngineSeqID: ack.EngineSeqID,
 					})
-				} else {
-					producer.PublishAckAsync(telemetry.AckEvent{
-						Type:        telemetry.EventOrderAck,
-						JobID:       jobID,
-						WorkerID:    workerID,
-						BotID:       b.config.StringID,
-						OrderID:     ack.OrderID,
-						Status:      ack.Status,
-						LatencyNs:   latency,
-						EngineSeqID: ack.EngineSeqID,
-					})
+				}
+				continue
+			}
+
+			if !isAckStatus(status) {
+				continue
+			}
+
+			sendTime, ok := removePending(ack.OrderID)
+			if !ok {
+				continue
+			}
+
+			latency := time.Now().UnixNano() - sendTime
+			latencyCh <- latResult{latencyNs: latency}
+
+			if producer != nil {
+				producer.PublishAckAsync(telemetry.AckEvent{
+					Type:        telemetry.EventOrderAck,
+					JobID:       jobID,
+					WorkerID:    workerID,
+					BotID:       b.config.StringID,
+					OrderID:     ack.OrderID,
+					Status:      ack.Status,
+					LatencyNs:   latency,
+					EngineSeqID: ack.EngineSeqID,
+				})
+			}
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+
+		ticker := time.NewTicker(readPollInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				failAllPending()
+				_ = conn.Close(websocket.StatusGoingAway, "bot context done")
+				return
+			case <-ticker.C:
+				failExpiredPending(time.Now())
+				lastReport := time.Unix(0, lastReportNs.Load())
+				if senderDone.Load() && pendingLen() == 0 && time.Since(lastReport) >= fillDrainGrace {
+					_ = conn.Close(websocket.StatusNormalClosure, "bot ack stream complete")
+					return
 				}
 			}
 		}
@@ -430,11 +500,6 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 
 	go func() {
 		wg.Wait()
-		unacked := sentCount.Load() - ackedCount.Load()
-		for i := int64(0); i < unacked; i++ {
-			latencyCh <- latResult{failed: true}
-		}
-
 		close(latencyCh) // now safe to close — all results are in
 	}()
 
@@ -451,6 +516,24 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 	}
 
 	return result
+}
+
+func isAckStatus(status string) bool {
+	switch status {
+	case "accepted", "rejected", "cancelled":
+		return true
+	default:
+		return false
+	}
+}
+
+func isFillStatus(status string) bool {
+	switch status {
+	case "filled", "partial":
+		return true
+	default:
+		return false
+	}
 }
 
 // isTerminalError returns true for errors that mean the connection is dead.
