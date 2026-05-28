@@ -1,11 +1,14 @@
 FROM debian:bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    g++ \
-    build-essential \
-    libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
+g++ \
+build-essential \
+libssl-dev \
+&& rm -rf /var/lib/apt/lists/*
 
+RUN mkdir /core
+COPY core/iicpc_engine.hpp /core/
+COPY core/hidden_server.cpp /core/
 WORKDIR /usr/src
 
 EXPOSE 8080

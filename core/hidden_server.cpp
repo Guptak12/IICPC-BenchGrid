@@ -2,6 +2,8 @@
 #include <string>
 #include <vector>
 #include <thread>
+#include <mutex>
+#include <atomic>
 #include <cstring>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -12,6 +14,45 @@
 #include <openssl/evp.h>
 #include <openssl/buffer.h>
 
+#include "iicpc_engine.hpp"
+
+// --- Global State ---
+std::atomic<uint64_t> global_engine_seq_id(1);
+std::mutex engine_mutex; // Protects the contestant's orderbook from race conditions
+
+// We use thread_local so the SDK knows exactly which WebSocket to reply to
+// without the contestant ever needing to touch socket file descriptors.
+thread_local int current_client_fd = -1; 
+
+// --- Forward Declarations ---
+static void sendFrame(int fd, const std::string& msg);
+
+// --- SDK Implementations ---
+void IICPCEngine::emit_ack(int64_t order_id) {
+    if (current_client_fd == -1) return;
+    
+    uint64_t seq_id = global_engine_seq_id++;
+    std::string json = "{\"status\":\"accepted\", \"order_id\":" + std::to_string(order_id) + 
+                       ", \"engine_seq_id\":" + std::to_string(seq_id) + "}";
+                       
+    sendFrame(current_client_fd, json);
+}
+
+void IICPCEngine::emit_fill(int64_t order_id, int64_t filled_qty, double filled_price, int64_t matched_with) {
+    if (current_client_fd == -1) return;
+    
+    uint64_t seq_id = global_engine_seq_id++;
+    std::string json = "{\"status\":\"filled\", \"order_id\":" + std::to_string(order_id) + 
+                       ", \"filled_qty\":" + std::to_string(filled_qty) + 
+                       ", \"filled_price\":" + std::to_string(filled_price) + 
+                       ", \"matched_with\":" + std::to_string(matched_with) +
+                       ", \"engine_seq_id\":" + std::to_string(seq_id) + "}";
+                       
+    sendFrame(current_client_fd, json);
+}
+
+
+// --- Your Original WebSocket Networking Code ---
 static std::string base64Encode(const unsigned char* data, size_t len) {
     BIO* b64 = BIO_new(BIO_f_base64());
     BIO* mem = BIO_new(BIO_s_mem());
@@ -39,8 +80,7 @@ static std::string readHTTPRequest(int fd) {
         last[1] = last[2];
         last[2] = last[3];
         last[3] = buf[0];
-        if (last[0]=='\r' && last[1]=='\n' &&
-            last[2]=='\r' && last[3]=='\n') break;
+        if (last[0]=='\r' && last[1]=='\n' && last[2]=='\r' && last[3]=='\n') break;
     }
     return req;
 }
@@ -59,7 +99,6 @@ static bool doHandshake(int fd) {
     if (req.empty()) return false;
 
     std::string key = getHeader(req, "Sec-WebSocket-Key");
-    // Also try lowercase version — Go sends Sec-Websocket-Key
     if (key.empty()) key = getHeader(req, "Sec-Websocket-Key");
     if (key.empty()) {
         std::string resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
@@ -69,8 +108,7 @@ static bool doHandshake(int fd) {
 
     std::string magic = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     unsigned char hash[SHA_DIGEST_LENGTH];
-    SHA1(reinterpret_cast<const unsigned char*>(magic.c_str()),
-         magic.size(), hash);
+    SHA1(reinterpret_cast<const unsigned char*>(magic.c_str()), magic.size(), hash);
     std::string accept = base64Encode(hash, SHA_DIGEST_LENGTH);
 
     std::string resp =
@@ -101,27 +139,22 @@ static std::string readFrame(int fd) {
         uint8_t ext[8];
         if (recv(fd, ext, 8, MSG_WAITALL) != 8) return "";
         payloadLen = 0;
-        for (int i = 0; i < 8; i++)
-            payloadLen = (payloadLen << 8) | ext[i];
+        for (int i = 0; i < 8; i++) payloadLen = (payloadLen << 8) | ext[i];
     }
 
     uint8_t maskKey[4] = {};
-    if (masked) {
-        if (recv(fd, maskKey, 4, MSG_WAITALL) != 4) return "";
-    }
+    if (masked && recv(fd, maskKey, 4, MSG_WAITALL) != 4) return "";
 
     std::vector<uint8_t> payload(payloadLen);
     size_t received = 0;
     while (received < payloadLen) {
-        int n = recv(fd, payload.data() + received,
-                     payloadLen - received, 0);
+        int n = recv(fd, payload.data() + received, payloadLen - received, 0);
         if (n <= 0) return "";
         received += n;
     }
 
     if (masked)
-        for (size_t i = 0; i < payloadLen; i++)
-            payload[i] ^= maskKey[i % 4];
+        for (size_t i = 0; i < payloadLen; i++) payload[i] ^= maskKey[i % 4];
 
     return std::string(payload.begin(), payload.end());
 }
@@ -138,37 +171,66 @@ static void sendFrame(int fd, const std::string& msg) {
         frame.push_back(len & 0xFF);
     } else {
         frame.push_back(127);
-        for (int i = 7; i >= 0; i--)
-            frame.push_back((len >> (8*i)) & 0xFF);
+        for (int i = 7; i >= 0; i--) frame.push_back((len >> (8*i)) & 0xFF);
     }
     frame.insert(frame.end(), msg.begin(), msg.end());
     send(fd, frame.data(), frame.size(), MSG_NOSIGNAL);
 }
 
-static std::string extractOrderID(const std::string& json) {
-    const std::string key = "\"order_id\":";
+// --- JSON Parsers ---
+static std::string extractStringField(const std::string& json, const std::string& key) {
     size_t pos = json.find(key);
-    if (pos == std::string::npos) return "0";
+    if (pos == std::string::npos) return "";
     pos += key.size();
-    while (pos < json.size() && json[pos] == ' ') pos++;
-    size_t end = json.find_first_of(",}", pos);
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\"')) pos++;
+    size_t end = json.find_first_of("\"", pos);
     return json.substr(pos, end - pos);
 }
 
-// Handle one client in its own thread — no fork() needed
+static int64_t extractIntField(const std::string& json, const std::string& key) {
+    size_t pos = json.find(key);
+    if (pos == std::string::npos) return 0;
+    pos += key.size();
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\"')) pos++;
+    size_t end = json.find_first_of(",}", pos);
+    try { return std::stoll(json.substr(pos, end - pos)); } catch (...) { return 0; }
+}
+
+static double extractDoubleField(const std::string& json, const std::string& key) {
+    size_t pos = json.find(key);
+    if (pos == std::string::npos) return 0.0;
+    pos += key.size();
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\"')) pos++;
+    size_t end = json.find_first_of(",}", pos);
+    try { return std::stod(json.substr(pos, end - pos)); } catch (...) { return 0.0; }
+}
+
+// --- Worker Thread ---
 static void handleClient(int clientFd) {
     if (!doHandshake(clientFd)) {
         close(clientFd);
         return;
     }
+    
+    // Set the thread-local FD so emit_ack and emit_fill know where to send data
+    current_client_fd = clientFd;
 
     while (true) {
-        std::string msg = readFrame(clientFd);
-        if (msg.empty()) break;
+        std::string raw_json = readFrame(clientFd);
+        if (raw_json.empty()) break;
 
-        std::string orderID = extractOrderID(msg);
-        std::string ack = "{\"order_id\":" + orderID + ",\"status\":\"accepted\"}";
-        sendFrame(clientFd, ack);
+        Order new_order;
+        new_order.order_id = extractIntField(raw_json, "\"order_id\":");
+        new_order.type = extractStringField(raw_json, "\"type\":");
+        new_order.side = extractStringField(raw_json, "\"side\":");
+        new_order.price = extractDoubleField(raw_json, "\"price\":");
+        new_order.quantity = extractIntField(raw_json, "\"quantity\":");
+
+        if (global_engine_instance) {
+            // Lock the mutex so the contestant's engine only processes one order at a time
+            std::lock_guard<std::mutex> lock(engine_mutex);
+            global_engine_instance->on_order(new_order);
+        }
     }
 
     close(clientFd);
@@ -189,16 +251,15 @@ int main() {
     bind(serverFd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
     listen(serverFd, 128);
 
-    std::cout << "[ENGINE] WebSocket order engine on port 8080\n";
+    std::cout << "[WRAPPER] Secure WebSocket engine wrapper listening on port 8080\n";
     std::cout.flush();
 
     while (true) {
         int clientFd = accept(serverFd, nullptr, nullptr);
         if (clientFd < 0) continue;
 
-        // std::thread instead of fork() — works inside --cap-drop ALL
         std::thread t(handleClient, clientFd);
-        t.detach(); // fire and forget — thread cleans up itself
+        t.detach(); 
     }
 
     return 0;

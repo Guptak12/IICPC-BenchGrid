@@ -34,6 +34,9 @@ type Consumer struct {
     fillCount   int64
     workersDone int
     validator   *shadow.Validator
+
+    nextSeqID    int64
+	jitterBuffer map[int64]interface{}
 }
 
 func NewConsumer(brokers []string, jobID string, numWorkers int) (*Consumer, error) {
@@ -54,6 +57,8 @@ func NewConsumer(brokers []string, jobID string, numWorkers int) (*Consumer, err
         numWorkers: numWorkers,
         hist:       hdr.New(1, 3_600_000_000_000, 3),
         validator:  shadow.NewValidator(),
+        nextSeqID:    1, // C++ Engine sequence starts at 1
+		jitterBuffer: make(map[int64]interface{}),
     }, nil
 }
 
@@ -125,39 +130,58 @@ func (c *Consumer) processRecord(r *kgo.Record) {
     case EventOrderSent:
         var event OrderEvent
         if err := json.Unmarshal(r.Value, &event); err != nil {
-            return
+            c.mu.Lock()
+            c.validator.ProcessOrder(event.OrderID, event.OrderType, event.Side, event.Price, event.Quantity)
+            c.mu.Unlock()
         }
-        c.mu.Lock()
-        c.validator.ProcessOrder(event.OrderID, event.OrderType, event.Side, event.Price, event.Quantity)
-        c.mu.Unlock()
         
     case EventOrderAck:
-        var event AckEvent
-        if err := json.Unmarshal(r.Value, &event); err != nil {
-            return
-        }
-        c.mu.Lock()
-        c.hist.RecordValue(event.LatencyNs)
-        c.orderCount++
-        c.validator.ProcessAck(event.OrderID, event.Status)
-        c.mu.Unlock()
+		var event AckEvent
+		if err := json.Unmarshal(r.Value, &event); err == nil {
+			c.mu.Lock()
+			c.jitterBuffer[event.EngineSeqID] = event
+			c.drainJitterBuffer()
+			c.mu.Unlock()
+		}
 
     case EventFill:
         var event FillEvent
-        if err := json.Unmarshal(r.Value, &event); err != nil {
-            return
-        }
-        c.mu.Lock()
-        c.fillCount++
-        c.validator.ProcessFill(event.OrderID, event.FilledQty, event.FilledPrice)
-        c.mu.Unlock()
+        if err := json.Unmarshal(r.Value, &event); err == nil {
+			c.mu.Lock()
+			c.jitterBuffer[event.EngineSeqID] = event
+			c.drainJitterBuffer()
+			c.mu.Unlock()
+		}
 
     case EventWorkerDone:
         c.mu.Lock()
-        c.workersDone++
-        log.Printf("[telemetry] worker done (%d/%d)\n", c.workersDone, c.numWorkers)
+        c.workersDone++ 
         c.mu.Unlock()
     }
+}
+
+// drainJitterBuffer ensures the Validator only processes events in the EXACT 
+// sequence the C++ engine handled them, regardless of Kafka partition lag.
+func (c *Consumer) drainJitterBuffer() {
+	for {
+		event, ok := c.jitterBuffer[c.nextSeqID]
+		if !ok {
+			break // Missing the next sequence ID, wait for it to arrive
+		}
+		delete(c.jitterBuffer, c.nextSeqID)
+
+		switch e := event.(type) {
+		case AckEvent:
+			c.hist.RecordValue(e.LatencyNs)
+			c.orderCount++
+			c.validator.ProcessAck(e.OrderID, e.Status) // Validator runs matching here!
+		case FillEvent:
+			c.fillCount++
+			c.validator.ProcessFill(e.OrderID, e.FilledQty, int64(e.FilledPrice))
+		}
+		
+		c.nextSeqID++
+	}
 }
 
 func (c *Consumer) Close() {

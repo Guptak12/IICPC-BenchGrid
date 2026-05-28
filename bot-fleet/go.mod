@@ -5,6 +5,7 @@ go 1.26.3
 require (
 	github.com/HdrHistogram/hdrhistogram-go v1.2.0
 	github.com/coder/websocket v1.8.14
+	github.com/emirpasic/gods v1.18.1
 	github.com/goccy/go-json v0.10.6
 	github.com/google/uuid v1.6.0
 	github.com/twmb/franz-go v1.21.2

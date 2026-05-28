@@ -4,10 +4,9 @@ import (
 	"math/rand"
 	"sync/atomic"
 	"time"
-	gojson "github.com/goccy/go-json"
-	"github.com/HdrHistogram/hdrhistogram-go"
-	
 
+	"github.com/HdrHistogram/hdrhistogram-go"
+	gojson "github.com/goccy/go-json"
 )
 
 // StrategyType defines what kind of market participant this bot simulates
@@ -52,7 +51,8 @@ type OrderAck struct {
 	OrderID int64 `json:"order_id"`
 	Status  string `json:"status"` // "accepted", "rejected", "filled"
 	FilledQty   int64  `json:"filled_qty,omitempty"`
-	FilledPrice int64  `json:"filled_price,omitempty"`
+	FilledPrice float64  `json:"filled_price,omitempty"`
+	EngineSeqID int64  `json:"engine_seq_id,omitempty"`
 }
 
 // BotConfig -> holds everything a bot needs to know before it starts

@@ -416,6 +416,7 @@ func runBot(ctx context.Context, b *Bot, endpoint string,strategy Strategy, tota
 					OrderID:     ack.OrderID,
 					FilledQty:   ack.FilledQty,
 					FilledPrice: ack.FilledPrice,
+					EngineSeqID: ack.EngineSeqID,
 				})
 			} else {
 				producer.PublishAckAsync(telemetry.AckEvent{
@@ -426,6 +427,7 @@ func runBot(ctx context.Context, b *Bot, endpoint string,strategy Strategy, tota
 					OrderID:    ack.OrderID,
 					Status:     ack.Status,
 					LatencyNs:  latency,
+					EngineSeqID: ack.EngineSeqID,
 				})
 			}
 		}

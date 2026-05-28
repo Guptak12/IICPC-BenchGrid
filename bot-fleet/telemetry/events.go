@@ -42,6 +42,7 @@ type AckEvent struct {
     Status     string    `json:"status"`
     LatencyNs  int64     `json:"latency_ns"`
     ReceivedNs int64     `json:"received_at_ns"`
+    EngineSeqID int64     `json:"engine_seq_id"`
 }
 
 // FillEvent published by worker when contestant reports a fill
@@ -51,8 +52,9 @@ type FillEvent struct {
     WorkerID    string    `json:"worker_id"`
     OrderID     int64     `json:"order_id"`
     FilledQty   int64     `json:"filled_qty"`
-    FilledPrice int64     `json:"filled_price"`
+    FilledPrice float64     `json:"filled_price"`
     MatchedWith int64     `json:"matched_with"`
+    EngineSeqID int64     `json:"engine_seq_id"`
 }
 
 // WorkerDoneEvent signals that a worker finished all its orders

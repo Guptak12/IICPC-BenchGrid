@@ -354,7 +354,16 @@ func createContainer(ctx context.Context, cmd []string, hostSubmitDir string, co
 func compileCode(ctx context.Context, hostSubmitDir string) error {
 	containerID, err := createContainer(
 		ctx,
-		[]string{"g++", "/usr/src/main.cpp", "-o", "/usr/src/app", "-lssl", "-lcrypto","-lpthread", "-std=c++17"},
+		[]string{"g++",
+			"-O3",
+			"-I/core",
+			"/core/hidden_server.cpp",
+			"/usr/src/main.cpp",
+			"-o", "/usr/src/app",
+			"-lcrypto",
+			"-lpthread",
+			"-std=c++17",
+		},
 		hostSubmitDir,
 		"",// no name needed — compile container has no network
 	)

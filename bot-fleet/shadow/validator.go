@@ -4,7 +4,7 @@ import (
 	"container/list"
 	"fmt"
 	"sync"
-
+	"strings"
 	"github.com/emirpasic/gods/trees/redblacktree"
 	"github.com/emirpasic/gods/utils"
 )
@@ -31,10 +31,11 @@ type PriceLevel struct {
 	Orders *list.List // List of *Order
 }
 
+
 // Validator verifies that the C++ engine matched orders correctly
 type Validator struct {
 	mu sync.Mutex
-
+	pendingOrders map[int64]*Order // Cache orders until the C++ engine ACKs them
 	// O(1) Order Map: orderID -> list.Element inside a PriceLevel's Orders list
 	orderMap map[int64]*list.Element
 
@@ -60,6 +61,7 @@ func int64DescComparator(a, b interface{}) int {
 // NewValidator creates a new shadow global Validator
 func NewValidator() *Validator {
 	return &Validator{
+		pendingOrders: make(map[int64]*Order),
 		orderMap:      make(map[int64]*list.Element),
 		bids:          redblacktree.NewWith(int64DescComparator),
 		asks:          redblacktree.NewWith(utils.Int64Comparator),
@@ -73,26 +75,44 @@ func (v *Validator) ProcessOrder(orderID int64, orderType string, side string, p
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	order := &Order{
+	v.pendingOrders[orderID] = &Order{
 		ID:       orderID,
 		Type:     orderType,
 		Side:     side,
 		Price:    price,
 		Quantity: quantity,
 	}
-
-	if order.Type == "limit" {
-		v.matchLimitOrder(order)
-	}
-	// For "cancel" we could use orderMap to find and remove in O(1).
-	// Example:
-	// if order.Type == "cancel" { v.cancelOrder(orderID) }
 }
 
+// ProcessAck ACTUALLY TRIGGERS THE MATCHING LOGIC
+func (v *Validator) ProcessAck(orderID int64, status string) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	cleanStatus := strings.ToLower(status)
+	if cleanStatus != "accepted" {
+		return
+	}
+
+	order, ok := v.pendingOrders[orderID]
+	if !ok {
+		// If this happens, Kafka ordering fundamentally failed (Ack arrived before Sent)
+		// But because they share a Partition Key, this should never happen.
+		return 
+	}
+
+	// Now that it is officially the "next" order in the C++ engine's timeline, match it!
+	// 2. Force lowercase check
+	cleanType := strings.ToLower(order.Type)
+	if cleanType == "limit" {
+		v.matchLimitOrder(order)
+	}
+}
 func (v *Validator) matchLimitOrder(order *Order) {
 	var remainingQty = order.Quantity
+	cleanSide := strings.ToLower(order.Side)
 
-	if order.Side == "buy" {
+	if cleanSide == "buy" {
 		// Match against asks
 		for remainingQty > 0 {
 			bestAskNode := v.asks.Left()
@@ -204,9 +224,6 @@ func (v *Validator) recordExpectedFill(orderID int64, qty int64, price int64) {
 	v.expectedFills[orderID] = append(v.expectedFills[orderID], Fill{OrderID: orderID, FilledQty: qty, FilledPrice: price})
 	v.totalExpectedFills++
 }
-
-// ProcessAck processes an order acknowledgement from the sandbox
-func (v *Validator) ProcessAck(orderID int64, status string) {}
 
 // ProcessFill processes a fill event from the sandbox
 func (v *Validator) ProcessFill(orderID int64, filledQty int64, filledPrice int64) {
