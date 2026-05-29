@@ -25,7 +25,8 @@ var dockerClient *client.Client
 //Docker image name for the sandbox environment and network name for container communication
 const (
     SandboxImage   = "iicpc-sandbox:v1"
-    SandboxNetwork = "iicpc-net"
+    SandboxNetwork = "iicpc-net"   // workers, redpanda, master
+	SandboxIsolatedNet = "sandbox-net" //contestant containers only
 )
 
 // Track active sandboxes
@@ -267,8 +268,18 @@ func runSandbox(hostSubmitDir string) (string, string, error) {
     // -----------------------------------------------------------------------
 	// Get IP again for the endpoint
 info, _ := dockerClient.ContainerInspect(ctx, containerID, client.ContainerInspectOptions{})
-ip := info.Container.NetworkSettings.Networks[SandboxNetwork].IPAddress
-endpoint := fmt.Sprintf("ws://%s:8080/ws", ip)
+netInfo,ok := info.Container.NetworkSettings.Networks[SandboxIsolatedNet]
+if !ok || netInfo == nil {
+    dockerClient.ContainerRemove(ctx, containerID, client.ContainerRemoveOptions{Force: true})
+    return "", "", fmt.Errorf("container not attached to %s — check network exists", SandboxIsolatedNet)
+}
+
+// netInfo.IPAddress is netip.Addr, not string — use .IsValid()
+if !netInfo.IPAddress.IsValid() {
+    dockerClient.ContainerRemove(ctx, containerID, client.ContainerRemoveOptions{Force: true})
+    return "", "", fmt.Errorf("container on %s but has no IP assigned yet", SandboxIsolatedNet)
+}
+endpoint := fmt.Sprintf("ws://%s:8080/ws", netInfo.IPAddress.String())
 return containerID, endpoint, nil
 	// // Endpoint uses internal DNS — only reachable from iicpc-net
     // endpoint := fmt.Sprintf("ws://%s:8080/ws", containerName)
@@ -330,11 +341,13 @@ func createContainer(ctx context.Context, cmd []string, hostSubmitDir string, co
 	if containerName != "" {
     networkConfig = &network.NetworkingConfig{
         EndpointsConfig: map[string]*network.EndpointSettings{
-            SandboxNetwork: {
+            SandboxIsolatedNet: {
                 Aliases: []string{containerName},
             },
         },
     }
+}else{
+	hostConfig.NetworkMode = "none"
 }
 
 	resp, err := dockerClient.ContainerCreate(ctx, client.ContainerCreateOptions{
@@ -405,6 +418,10 @@ func compileCode(ctx context.Context, hostSubmitDir string) error {
 	return nil
 }
 func ensureNetwork(ctx context.Context) error {
+	 for _, net := range []struct{ name string; internal bool }{
+        {SandboxNetwork,     true},
+        {SandboxIsolatedNet, true},
+    } {
     // Check if network already exists
     _, err := dockerClient.NetworkInspect(ctx, SandboxNetwork, client.NetworkInspectOptions{})
 	if err == nil {
@@ -419,7 +436,12 @@ func ensureNetwork(ctx context.Context) error {
 		Driver:   "bridge",
 		Internal: true, // Completely cuts off internet access to the sandbox
 	})
-	return err
+	if err != nil {
+            return fmt.Errorf("create %s failed: %v", net.name, err)
+        }
+        log.Printf("Network '%s' created ✓\n", net.name)
+}
+	return nil
 }
 
 func handleBuildStatus(c fiber.Ctx) error {

@@ -7,7 +7,7 @@ cd "$ROOT_DIR"
 NETWORK_NAME="${NETWORK_NAME:-iicpc-net}"
 SANDBOX_IMAGE="${SANDBOX_IMAGE:-iicpc-sandbox:v1}"
 BOT_IMAGE="${BOT_IMAGE:-bot-fleet:v1}"
-PAYLOAD="${PAYLOAD:-test_payloads/ack_only.cpp}"
+PAYLOAD="${PAYLOAD:-test_payloads/main.cpp}"
 NUM_BOTS="${NUM_BOTS:-6}"
 ORDERS_PER_BOT="${ORDERS_PER_BOT:-20}"
 RATE_PER_SEC="${RATE_PER_SEC:-20}"
@@ -15,8 +15,16 @@ MARKET_MAKER_PCT="${MARKET_MAKER_PCT:-1.0}"
 MOMENTUM_PCT="${MOMENTUM_PCT:-0.0}"
 NOISE_PCT="${NOISE_PCT:-0.0}"
 
+# 1. Create the standard bridge network for the infrastructure
 if ! docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
   docker network create "$NETWORK_NAME" >/dev/null
+  echo "Created network: $NETWORK_NAME"
+fi
+
+# 2. Create the airgapped internal network for the contestant sandboxes
+if ! docker network inspect sandbox-net >/dev/null 2>&1; then
+  docker network create --internal sandbox-net >/dev/null
+  echo "Created network: sandbox-net"
 fi
 
 docker build -f Dockerfile.sandbox -t "$SANDBOX_IMAGE" .
@@ -84,7 +92,7 @@ fi
 echo "Sandbox endpoint: $ENDPOINT"
 
 RUN_BODY="$(printf '{"endpoint":"%s","num_bots":%s,"orders_per_bot":%s,"mid_price":100.0,"spread":0.10,"rate_per_sec":%s,"strategy_mix":{"market_maker":%s,"momentum_trader":%s,"noise_trader":%s}}' "$ENDPOINT" "$NUM_BOTS" "$ORDERS_PER_BOT" "$RATE_PER_SEC" "$MARKET_MAKER_PCT" "$MOMENTUM_PCT" "$NOISE_PCT")"
-RUN_RESPONSE="$(curl -fsS -X POST -H 'Content-Type: application/json' -d "$RUN_BODY" http://localhost:4000/run)"
+RUN_RESPONSE="$(curl -fsS -X POST -H 'Content-Type: application/json' -d "$RUN_BODY" http://127.0.0.1:4000/run)"
 JOB_ID="$(printf '%s' "$RUN_RESPONSE" | sed -n 's/.*"job_id":"\([^"]*\)".*/\1/p')"
 
 if [ -z "$JOB_ID" ]; then
@@ -95,7 +103,7 @@ echo "Job ID: $JOB_ID"
 
 FINAL_STATUS=""
 for _ in $(seq 1 120); do
-  JOB_STATUS="$(curl -fsS "http://localhost:4000/status/${JOB_ID}")"
+  JOB_STATUS="$(curl -fsS "http://127.0.0.1:4000/status/${JOB_ID}")"
   STATUS="$(printf '%s' "$JOB_STATUS" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')"
   if [ "$STATUS" = "completed" ] || [ "$STATUS" = "aborted" ]; then
     FINAL_STATUS="$STATUS"
