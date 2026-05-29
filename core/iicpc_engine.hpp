@@ -20,7 +20,7 @@ public:
     virtual void on_order(const Order& order) = 0;
 
     // The functions the contestant calls to output data
-    void emit_ack(int64_t order_id);
+void emit_ack(int64_t order_id, const std::string& status = "accepted");
     void emit_fill(int64_t order_id, int64_t filled_qty, int64_t filled_price, int64_t matched_with);
 };
 

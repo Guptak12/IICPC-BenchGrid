@@ -28,11 +28,12 @@ thread_local int current_client_fd = -1;
 static void sendFrame(int fd, const std::string& msg);
 
 // --- SDK Implementations ---
-void IICPCEngine::emit_ack(int64_t order_id) {
+// Replace the emit_ack implementation with this:
+void IICPCEngine::emit_ack(int64_t order_id, const std::string& status) {
     if (current_client_fd == -1) return;
     
     uint64_t seq_id = global_engine_seq_id++;
-    std::string json = "{\"status\":\"accepted\", \"order_id\":" + std::to_string(order_id) + 
+    std::string json = "{\"status\":\"" + status + "\", \"order_id\":" + std::to_string(order_id) + 
                        ", \"engine_seq_id\":" + std::to_string(seq_id) + "}";
                        
     sendFrame(current_client_fd, json);

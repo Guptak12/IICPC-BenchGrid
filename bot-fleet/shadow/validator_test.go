@@ -4,6 +4,11 @@ import (
 	"testing"
 )
 
+// helper: encodes a real bot-style order ID: (numericID << 32) | seq
+func makeOrderID(botID, seq int64) int64 {
+	return (botID << 32) | seq
+}
+
 func TestValidatorBasicMatching(t *testing.T) {
 	v := NewValidator()
 
@@ -167,5 +172,104 @@ func TestValidatorPriorityViolationPenalized(t *testing.T) {
 
 	if score := v.GetCorrectnessScore(); score >= 100.0 {
 		t.Errorf("Expected score < 100.0 for priority violation, got %f", score)
+	}
+}
+
+// ── Self-crossing tests (use real bot-encoded IDs) ──────────────────────────
+
+func TestValidatorSelfCrossingPrevented(t *testing.T) {
+	v := NewValidator()
+
+	// Both orders from bot-1
+	buy  := makeOrderID(1, 1)
+	sell := makeOrderID(1, 2)
+
+	v.ProcessOrder(buy, "LIMIT", "BUY", 100, 10)
+	v.ProcessAck(buy, "accepted")
+
+	// Bot-1 sends a crossing SELL — should not produce any expected fills
+	v.ProcessOrder(sell, "LIMIT", "SELL", 100, 10)
+	v.ProcessAck(sell, "accepted")
+
+	// No fills reported by contestant — correct behaviour
+	if score := v.GetCorrectnessScore(); score != 100.0 {
+		t.Errorf("Expected 100.0 when self-cross blocked correctly, got %f", score)
+	}
+}
+
+func TestValidatorSelfCrossSkipsToNextBot(t *testing.T) {
+	v := NewValidator()
+
+	bot1buy  := makeOrderID(1, 1) // bot-1 resting BUY (arrives first → front of queue)
+	bot2buy  := makeOrderID(2, 1) // bot-2 resting BUY (arrives second → back of queue)
+	bot1sell := makeOrderID(1, 2) // bot-1 SELL — crosses both bids
+
+	v.ProcessOrder(bot1buy, "LIMIT", "BUY", 100, 10)
+	v.ProcessAck(bot1buy, "accepted")
+
+	v.ProcessOrder(bot2buy, "LIMIT", "BUY", 100, 10)
+	v.ProcessAck(bot2buy, "accepted")
+
+	// Bot-1 sends a SELL at 100.
+	// Price-time priority says bot1buy should match first,
+	// but it is a self-cross — validator skips it.
+	// Bot-2's resting buy is next and matches instead.
+	v.ProcessOrder(bot1sell, "LIMIT", "SELL", 100, 10)
+	v.ProcessAck(bot1sell, "accepted")
+
+	// Only the cross-bot pair fills
+	v.ProcessFill(bot1sell, 10, 100, bot2buy)
+	v.ProcessFill(bot2buy,  10, 100, bot1sell)
+
+	if score := v.GetCorrectnessScore(); score != 100.0 {
+		t.Errorf("Expected 100.0 when self-cross skips to next valid order, got %f", score)
+	}
+}
+
+func TestValidatorSelfCrossInfiniteLoopPrevented(t *testing.T) {
+	v := NewValidator()
+
+	// Bot-1 has the ONLY resting ask — incoming buy from same bot
+	// Old code: infinite loop. New code: skips level, returns remainingQty unmatched.
+	bot1sell := makeOrderID(1, 1)
+	bot1buy  := makeOrderID(1, 2)
+
+	v.ProcessOrder(bot1sell, "LIMIT", "SELL", 100, 10)
+	v.ProcessAck(bot1sell, "accepted")
+
+	// Market buy from same bot — no eligible counterparty exists
+	v.ProcessOrder(bot1buy, "MARKET", "BUY", 0, 10)
+	v.ProcessAck(bot1buy, "accepted")
+
+	// No fills expected — bot-1 cannot match itself
+	// Test passes if it completes at all (no hang) and scores 100
+	if score := v.GetCorrectnessScore(); score != 100.0 {
+		t.Errorf("Expected 100.0 when only counterparty is self, got %f", score)
+	}
+}
+
+func TestValidatorSelfCrossMixedLevelMatchesOtherBot(t *testing.T) {
+	v := NewValidator()
+
+	// Price level 100 has BOTH a bot-1 order AND a bot-2 order
+	bot1ask  := makeOrderID(1, 1) // bot-1 resting SELL at 100 (front of queue)
+	bot2ask  := makeOrderID(2, 1) // bot-2 resting SELL at 100 (back of queue)
+	bot1buy  := makeOrderID(1, 2) // bot-1 BUY — skips own ask, hits bot-2's ask
+
+	v.ProcessOrder(bot1ask, "LIMIT", "SELL", 100, 10)
+	v.ProcessAck(bot1ask, "accepted")
+
+	v.ProcessOrder(bot2ask, "LIMIT", "SELL", 100, 10)
+	v.ProcessAck(bot2ask, "accepted")
+
+	v.ProcessOrder(bot1buy, "LIMIT", "BUY", 100, 10)
+	v.ProcessAck(bot1buy, "accepted")
+
+	// Bot-1's own ask is skipped; bot-2's ask fills instead
+	v.ProcessFill(bot1buy, 10, 100, bot2ask)
+	v.ProcessFill(bot2ask, 10, 100, bot1buy)
+
+	if score := v.GetCorrectnessScore(); score != 100.0 {
+		t.Errorf("Expected 100.0 for mixed-level self-cross skip, got %f", score)
 	}
 }

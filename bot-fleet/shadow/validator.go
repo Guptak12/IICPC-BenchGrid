@@ -166,32 +166,40 @@ func (v *Validator) matchMarketOrder(order *Order) {
 func (v *Validator) matchIncoming(order *Order, useLimitPrice bool) int64 {
 	remainingQty := order.Quantity
 	cleanSide := strings.ToLower(order.Side)
+	// Collect empty price levels to remove AFTER the iterator is done.
+	// Removing from the tree mid-iteration invalidates the iterator's
+	// internal stack in gods/redblacktree — defer all deletions.
+	var emptyLevels []int64
 
 	if cleanSide == "buy" {
-		// Match against asks
-		for remainingQty > 0 {
-			bestAskNode := v.asks.Left()
-			if bestAskNode == nil {
-				break
+		iter := v.asks.Iterator()
+		for iter.Next() && remainingQty > 0 {
+			askPrice := iter.Key().(int64)
+
+			if useLimitPrice && order.Price < askPrice {
+				break // price crossed — no more eligible asks
 			}
 
-			bestAskPrice := bestAskNode.Key.(int64)
-			if useLimitPrice && order.Price < bestAskPrice {
-				break // No cross
-			}
+			level := iter.Value().(*PriceLevel)
 
-			level := bestAskNode.Value.(*PriceLevel)
 			for e := level.Orders.Front(); e != nil && remainingQty > 0; {
 				restingOrder := e.Value.(*Order)
 				next := e.Next()
+
+				// Wash trade prevention: skip orders from the same bot.
+				// The order stays in the book — another bot may match it later.
+				if isSelfCross(order.ID, restingOrder.ID) {
+					e = next
+					continue
+				}
 
 				tradeQty := remainingQty
 				if restingOrder.Quantity < tradeQty {
 					tradeQty = restingOrder.Quantity
 				}
 
-				v.recordExpectedFill(order.ID, tradeQty, bestAskPrice, restingOrder.ID)
-				v.recordExpectedFill(restingOrder.ID, tradeQty, bestAskPrice, order.ID)
+				v.recordExpectedFill(order.ID, tradeQty, askPrice, restingOrder.ID)
+				v.recordExpectedFill(restingOrder.ID, tradeQty, askPrice, order.ID)
 
 				remainingQty -= tradeQty
 				restingOrder.Quantity -= tradeQty
@@ -203,36 +211,45 @@ func (v *Validator) matchIncoming(order *Order, useLimitPrice bool) int64 {
 				e = next
 			}
 
+			// Only schedule removal if truly empty.
+			// A level with self-cross orders still resting is NOT empty.
 			if level.Orders.Len() == 0 {
-				v.asks.Remove(bestAskPrice)
+				emptyLevels = append(emptyLevels, askPrice)
 			}
 		}
 
+		// Safe to modify the tree now — iterator is no longer active.
+		for _, price := range emptyLevels {
+			v.asks.Remove(price)
+		}
+
 	} else if cleanSide == "sell" {
-		// Match against bids
-		for remainingQty > 0 {
-			bestBidNode := v.bids.Left()
-			if bestBidNode == nil {
-				break
+		iter := v.bids.Iterator()
+		for iter.Next() && remainingQty > 0 {
+			bidPrice := iter.Key().(int64)
+
+			if useLimitPrice && order.Price > bidPrice {
+				break // price crossed — no more eligible bids
 			}
 
-			bestBidPrice := bestBidNode.Key.(int64)
-			if useLimitPrice && order.Price > bestBidPrice {
-				break // No cross
-			}
+			level := iter.Value().(*PriceLevel)
 
-			level := bestBidNode.Value.(*PriceLevel)
 			for e := level.Orders.Front(); e != nil && remainingQty > 0; {
 				restingOrder := e.Value.(*Order)
 				next := e.Next()
+
+				if isSelfCross(order.ID, restingOrder.ID) {
+					e = next
+					continue
+				}
 
 				tradeQty := remainingQty
 				if restingOrder.Quantity < tradeQty {
 					tradeQty = restingOrder.Quantity
 				}
 
-				v.recordExpectedFill(order.ID, tradeQty, bestBidPrice, restingOrder.ID)
-				v.recordExpectedFill(restingOrder.ID, tradeQty, bestBidPrice, order.ID)
+				v.recordExpectedFill(order.ID, tradeQty, bidPrice, restingOrder.ID)
+				v.recordExpectedFill(restingOrder.ID, tradeQty, bidPrice, order.ID)
 
 				remainingQty -= tradeQty
 				restingOrder.Quantity -= tradeQty
@@ -245,8 +262,12 @@ func (v *Validator) matchIncoming(order *Order, useLimitPrice bool) int64 {
 			}
 
 			if level.Orders.Len() == 0 {
-				v.bids.Remove(bestBidPrice)
+				emptyLevels = append(emptyLevels, bidPrice)
 			}
+		}
+
+		for _, price := range emptyLevels {
+			v.bids.Remove(price)
 		}
 	}
 
@@ -498,4 +519,18 @@ func maxFloat64(a, b float64) float64 {
 		return a
 	}
 	return b
+}
+
+// botID extracts the bot's numeric identity from a structured order ID.
+// Convention: orderID = (NumericID << 32) | sequenceNumber
+// The upper 32 bits uniquely identify which bot placed the order.
+func botID(orderID int64) int64 {
+    return orderID >> 32
+}
+
+// isSelfCross returns true when both orders originated from the same bot.
+// We only enforce this when the upper 32 bits are non-zero — raw integer IDs
+// used in unit tests (1, 2, 3) have botID=0 and are exempt from this check.
+func isSelfCross(incomingID, restingID int64) bool {
+    return botID(incomingID) != 0 && botID(incomingID) == botID(restingID)
 }

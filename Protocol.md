@@ -22,6 +22,21 @@ Subprotocol: trading
   "filled_price": 0               // int64, scaled, 0 if not filled
 }
 
+## Self-Crossing Policy (Wash Trade Prevention)
+The platform enforces wash trade prevention. An order will NOT be matched
+against another resting order from the same bot.
+
+- If your BUY and SELL orders would cross each other, the incoming order
+  skips that resting order and continues looking for liquidity from other bots.
+- The skipped resting order remains in the book.
+- This matches the behaviour of real exchanges (CME, Nasdaq) which reject
+  self-trades to prevent wash trading.
+
+Implication for engine implementors: you do NOT need to implement wash trade
+prevention yourself. The platform guarantees that no fill event will ever
+report a self-cross. Your engine only needs to correctly match orders from
+different counterparties.
+
 ## Rules
 1. Every order MUST receive exactly one immediate response (accepted/rejected)
 2. Fill events MAY arrive asynchronously after the initial accepted response

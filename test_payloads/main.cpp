@@ -2,49 +2,71 @@
 #include <map>
 #include <queue>
 #include <algorithm>
-#include <cmath>
+#include <iostream>
+#include <string>
 
 class BaselineEngine : public IICPCEngine {
 private:
-    // STRICTLY int64_t to prevent floating-point bucket fragmentation
     std::map<int64_t, std::queue<Order>, std::less<int64_t>> asks;    
     std::map<int64_t, std::queue<Order>, std::greater<int64_t>> bids; 
 
-    // Helpers for scaled tick-math
-    int64_t to_ticks(double price) {
-        return std::round(price * 10000.0);
-    }
-    double to_price(int64_t ticks) {
-        return ticks / 10000.0;
+    // Keep track of active limit orders to handle lazy cancels
+    std::map<int64_t, bool> active_orders;
+
+    std::string to_upper(std::string s) {
+        std::transform(s.begin(), s.end(), s.begin(), ::toupper);
+        return s;
     }
 
 public:
     void on_order(const Order& order) override {
-        emit_ack(order.order_id);
-        
         Order incoming = order;
-        int64_t strict_price = to_ticks(incoming.price);
+        std::string type = to_upper(incoming.type);
+        std::string side = to_upper(incoming.side);
 
-        if (incoming.side == "BUY") {
+        // 1. Handle Cancels Immediately
+        if (type == "CANCEL") {
+            if (active_orders.find(incoming.order_id) != active_orders.end() && active_orders[incoming.order_id]) {
+                active_orders[incoming.order_id] = false; // Mark cancelled
+                emit_ack(incoming.order_id, "cancelled");
+            } else {
+                emit_ack(incoming.order_id, "rejected"); // Never existed
+            }
+            return;
+        }
+
+        // 2. Limit & Market orders are always accepted
+        emit_ack(incoming.order_id, "accepted");
+
+        if (side == "BUY") {
             auto it = asks.begin();
-            
-            while (it != asks.end() && incoming.quantity > 0 && it->first <= strict_price) {
+            // MARKET orders ignore price checks. LIMIT orders stop at their limit.
+            while (it != asks.end() && incoming.quantity > 0) {
+                if (type == "LIMIT" && it->first > incoming.price) {
+                    break; 
+                }
+
                 auto& queue = it->second;
-                
                 while (!queue.empty() && incoming.quantity > 0) {
-                    Order& resting_ask = queue.front();
+                    Order resting_ask = queue.front();
+                    
+                    // Skip if this resting order was previously cancelled
+                    if (!active_orders[resting_ask.order_id]) {
+                        queue.pop();
+                        continue;
+                    }
+
                     int64_t fill_qty = std::min(incoming.quantity, resting_ask.quantity);
                     
-                    // JUST ONE EMIT: Taker ID, Qty, Executed Price, Maker ID
-                    emit_fill(incoming.order_id, fill_qty, to_price(it->first), resting_ask.order_id);
-                    
-                    emit_fill(resting_ask.order_id, fill_qty, to_price(it->first), incoming.order_id); // ← add this
-
+                    // Emit fills for both Maker and Taker
+                    emit_fill(incoming.order_id, fill_qty, it->first, resting_ask.order_id);
+                    emit_fill(resting_ask.order_id, fill_qty, it->first, incoming.order_id);
 
                     incoming.quantity -= fill_qty;
-                    resting_ask.quantity -= fill_qty;
+                    queue.front().quantity -= fill_qty; 
 
-                    if (resting_ask.quantity == 0) {
+                    if (queue.front().quantity == 0) {
+                        active_orders.erase(resting_ask.order_id);
                         queue.pop();
                     }
                 }
@@ -56,28 +78,39 @@ public:
                 }
             }
             
-            if (incoming.quantity > 0) {
-                bids[strict_price].push(incoming);
+            // Market orders that don't fill are killed. Limit orders rest on the book.
+            if (type == "LIMIT" && incoming.quantity > 0) {
+                bids[incoming.price].push(incoming);
+                active_orders[incoming.order_id] = true;
             }
             
-        } else if (incoming.side == "SELL") {
+        } else if (side == "SELL") {
             auto it = bids.begin();
             
-            while (it != bids.end() && incoming.quantity > 0 && it->first >= strict_price) {
+            while (it != bids.end() && incoming.quantity > 0) {
+                if (type == "LIMIT" && it->first < incoming.price) {
+                    break;
+                }
+
                 auto& queue = it->second;
-                
                 while (!queue.empty() && incoming.quantity > 0) {
-                    Order& resting_bid = queue.front();
+                    Order resting_bid = queue.front();
+
+                    if (!active_orders[resting_bid.order_id]) {
+                        queue.pop();
+                        continue;
+                    }
+
                     int64_t fill_qty = std::min(incoming.quantity, resting_bid.quantity);
                     
-                    // JUST ONE EMIT: Taker ID, Qty, Executed Price, Maker ID
-                    emit_fill(incoming.order_id, fill_qty, to_price(it->first), resting_bid.order_id);
-                    emit_fill(resting_bid.order_id, fill_qty, to_price(it->first), incoming.order_id); // ← add this
+                    emit_fill(incoming.order_id, fill_qty, it->first, resting_bid.order_id);
+                    emit_fill(resting_bid.order_id, fill_qty, it->first, incoming.order_id);
 
                     incoming.quantity -= fill_qty;
-                    resting_bid.quantity -= fill_qty;
+                    queue.front().quantity -= fill_qty; 
 
-                    if (resting_bid.quantity == 0) {
+                    if (queue.front().quantity == 0) {
+                        active_orders.erase(resting_bid.order_id);
                         queue.pop();
                     }
                 }
@@ -89,8 +122,9 @@ public:
                 }
             }
             
-            if (incoming.quantity > 0) {
-                asks[strict_price].push(incoming);
+            if (type == "LIMIT" && incoming.quantity > 0) {
+                asks[incoming.price].push(incoming);
+                active_orders[incoming.order_id] = true;
             }
         }
     }
