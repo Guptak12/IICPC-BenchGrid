@@ -37,6 +37,9 @@ public:
                     
                     // JUST ONE EMIT: Taker ID, Qty, Executed Price, Maker ID
                     emit_fill(incoming.order_id, fill_qty, to_price(it->first), resting_ask.order_id);
+                    
+                    emit_fill(resting_ask.order_id, fill_qty, to_price(it->first), incoming.order_id); // ← add this
+
 
                     incoming.quantity -= fill_qty;
                     resting_ask.quantity -= fill_qty;
@@ -69,6 +72,7 @@ public:
                     
                     // JUST ONE EMIT: Taker ID, Qty, Executed Price, Maker ID
                     emit_fill(incoming.order_id, fill_qty, to_price(it->first), resting_bid.order_id);
+                    emit_fill(resting_bid.order_id, fill_qty, to_price(it->first), incoming.order_id); // ← add this
 
                     incoming.quantity -= fill_qty;
                     resting_bid.quantity -= fill_qty;

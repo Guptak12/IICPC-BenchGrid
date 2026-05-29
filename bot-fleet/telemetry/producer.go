@@ -95,7 +95,7 @@ func (p *Producer) PublishFillAsync(event FillEvent) {
     key := strconv.FormatInt(event.OrderID, 10)
 
     record := &kgo.Record{
-        Topic: TopicFillEvents,
+        Topic: TopicOrderEvents,
         Key:   []byte(key),
         Value: data,
     }

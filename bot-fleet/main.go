@@ -435,6 +435,7 @@ func handleCancel(w http.ResponseWriter, r *http.Request) {
 	// Fix 2: new struct — don't mutate the existing job pointer
 	replaceJob(&Job{
 		ID:        job.ID,
+		ContestantID: job.ContestantID,
 		Status:    JobAborted,
 		StartedAt: job.StartedAt,
 		EndedAt:   &now,

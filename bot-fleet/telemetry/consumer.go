@@ -42,7 +42,7 @@ type Consumer struct {
 func NewConsumer(brokers []string, jobID string, numWorkers int) (*Consumer, error) {
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(brokers...),
-		kgo.ConsumeTopics(TopicOrderEvents, TopicFillEvents),
+		kgo.ConsumeTopics(TopicOrderEvents),
 		// Fresh consumer group per job — always reads from latest
 		kgo.ConsumerGroup(fmt.Sprintf("master-%s", jobID)),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtEnd()),

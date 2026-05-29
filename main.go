@@ -564,7 +564,7 @@ func ensureNetwork(ctx context.Context) error {
         {SandboxIsolatedNet, true},
     } {
     // Check if network already exists
-    _, err := dockerClient.NetworkInspect(ctx, SandboxNetwork, client.NetworkInspectOptions{})
+    _, err := dockerClient.NetworkInspect(ctx, net.name, client.NetworkInspectOptions{})
 	if err == nil {
 		return nil // Network already exists
 	}
@@ -573,7 +573,7 @@ func ensureNetwork(ctx context.Context) error {
 		return fmt.Errorf("network inspect failed: %v", err)
 	}
     // 3. Create the isolated bridge network
-	_, err = dockerClient.NetworkCreate(ctx, SandboxNetwork, client.NetworkCreateOptions{
+	_, err = dockerClient.NetworkCreate(ctx, net.name, client.NetworkCreateOptions{
 		Driver:   "bridge",
 		Internal: true, // Completely cuts off internet access to the sandbox
 	})
@@ -650,6 +650,8 @@ func triggerOfficialRun(buildID, contestantID, endpoint string) (string, error) 
 		"orders_per_bot": 1000,
 		"rate_per_sec":   100.0,
 		"seed":           42424242,
+		"mid_price":      100.0,
+		"spread":         0.10,
 		"strategy_mix": map[string]float64{
 			"market_maker":    0.4,
 			"momentum_trader": 0.3,
