@@ -41,11 +41,13 @@ done
 
 docker exec redpanda rpk topic create order-events fill-events --brokers localhost:9092 >/dev/null 2>&1 || true
 
-docker compose -f docker-compose.workers.yml up -d --force-recreate worker-1 worker-2 worker-3 master
+docker compose -f docker-compose.workers.yml up -d --force-recreate redis worker-1 worker-2 worker-3 master
 
 ORCH_LOG="${ORCH_LOG:-/tmp/iicpc-orchestrator.log}"
 GOCACHE="${GOCACHE:-/tmp/go-build-iicpc-local}"
 export GOCACHE
+
+export MASTER_ADDR="http://127.0.0.1:4000"
 
 go run . >"$ORCH_LOG" 2>&1 &
 ORCH_PID=$!
@@ -61,7 +63,12 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 
-SUBMIT_RESPONSE="$(curl -fsS -X POST -F "source_code=@${PAYLOAD}" http://localhost:3000/api/v1/submit)"
+# --- CORRECTED CURL SYNTAX ---
+SUBMIT_RESPONSE="$(curl -fsS -X POST \
+  -F "source_code=@${PAYLOAD}" \
+  -F "contestant_id=kush-gupta-01" \
+  http://localhost:3000/api/v1/submit)"
+
 BUILD_ID="$(printf '%s' "$SUBMIT_RESPONSE" | sed -n 's/.*"build_id":"\([^"]*\)".*/\1/p')"
 
 if [ -z "$BUILD_ID" ]; then
@@ -71,43 +78,45 @@ fi
 echo "Build ID: $BUILD_ID"
 
 ENDPOINT=""
+JOB_ID=""
+
+# Wait for the build to finish AND the Master to assign a Job ID
 for _ in $(seq 1 90); do
   BUILD_STATUS="$(curl -fsS "http://localhost:3000/api/v1/build/${BUILD_ID}")"
   STATUS="$(printf '%s' "$BUILD_STATUS" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')"
+  
   if [ "$STATUS" = "running" ]; then
     ENDPOINT="$(printf '%s' "$BUILD_STATUS" | sed -n 's/.*"endpoint":"\([^"]*\)".*/\1/p')"
-    break
+    JOB_ID="$(printf '%s' "$BUILD_STATUS" | sed -n 's/.*"job_id":"\([^"]*\)".*/\1/p')"
+    
+    # Wait a fraction of a second for the async auto-trigger to populate the job_id
+    if [ -n "$JOB_ID" ]; then
+      break
+    fi
   fi
   if [ "$STATUS" = "failed" ]; then
-    echo "$BUILD_STATUS" >&2
+    echo "Build Failed: $BUILD_STATUS" >&2
     exit 1
   fi
   sleep 1
 done
 
-if [ -z "$ENDPOINT" ]; then
-  echo "Sandbox did not reach running state. Orchestrator log: $ORCH_LOG" >&2
+if [ -z "$ENDPOINT" ] || [ -z "$JOB_ID" ]; then
+  echo "Sandbox did not reach running state or failed to trigger master. Orchestrator log: $ORCH_LOG" >&2
   exit 1
 fi
 echo "Sandbox endpoint: $ENDPOINT"
-
-RUN_BODY="$(printf '{"endpoint":"%s","num_bots":%s,"orders_per_bot":%s,"mid_price":100.0,"spread":0.10,"rate_per_sec":%s,"strategy_mix":{"market_maker":%s,"momentum_trader":%s,"noise_trader":%s}}' "$ENDPOINT" "$NUM_BOTS" "$ORDERS_PER_BOT" "$RATE_PER_SEC" "$MARKET_MAKER_PCT" "$MOMENTUM_PCT" "$NOISE_PCT")"
-RUN_RESPONSE="$(curl -fsS -X POST -H 'Content-Type: application/json' -d "$RUN_BODY" http://127.0.0.1:4000/run)"
-JOB_ID="$(printf '%s' "$RUN_RESPONSE" | sed -n 's/.*"job_id":"\([^"]*\)".*/\1/p')"
-
-if [ -z "$JOB_ID" ]; then
-  echo "Could not parse job_id from: $RUN_RESPONSE" >&2
-  exit 1
-fi
 echo "Job ID: $JOB_ID"
 
 FINAL_STATUS=""
+# Track the exact job on the Master node (Restores fast-fail on aborted jobs!)
 for _ in $(seq 1 120); do
   JOB_STATUS="$(curl -fsS "http://127.0.0.1:4000/status/${JOB_ID}")"
   STATUS="$(printf '%s' "$JOB_STATUS" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')"
+  
   if [ "$STATUS" = "completed" ] || [ "$STATUS" = "aborted" ]; then
     FINAL_STATUS="$STATUS"
-    printf '%s\n' "$JOB_STATUS"
+    printf '%s\n' "$JOB_STATUS" | python3 -m json.tool
     break
   fi
   sleep 1

@@ -16,6 +16,7 @@ message ShardRequest {
     double momentum_pct     = 9;
     double noise_pct        = 10;
     int64  bot_id_offset    = 11; // Worker 2 starts at bot 1001
+    int64 seed              = 12;   // ← new: deterministic RNG seed
 }
 
 // Worker → Master: live telemetry AND final result

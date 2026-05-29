@@ -35,6 +35,7 @@ type ShardRequest struct {
 	MomentumPct    float64                `protobuf:"fixed64,9,opt,name=momentum_pct,json=momentumPct,proto3" json:"momentum_pct,omitempty"`
 	NoisePct       float64                `protobuf:"fixed64,10,opt,name=noise_pct,json=noisePct,proto3" json:"noise_pct,omitempty"`
 	BotIdOffset    int64                  `protobuf:"varint,11,opt,name=bot_id_offset,json=botIdOffset,proto3" json:"bot_id_offset,omitempty"` // Worker 2 starts at bot 1001
+	Seed           int64                  `protobuf:"varint,12,opt,name=seed,proto3" json:"seed,omitempty"`                                    // ← new: deterministic RNG seed
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -146,6 +147,13 @@ func (x *ShardRequest) GetBotIdOffset() int64 {
 	return 0
 }
 
+func (x *ShardRequest) GetSeed() int64 {
+	if x != nil {
+		return x.Seed
+	}
+	return 0
+}
+
 // Worker → Master: live telemetry AND final result
 type ShardResult struct {
 	state        protoimpl.MessageState `protogen:"open.v1"`
@@ -244,7 +252,7 @@ var File_fleet_proto protoreflect.FileDescriptor
 
 const file_fleet_proto_rawDesc = "" +
 	"\n" +
-	"\vfleet.proto\x12\x05fleet\"\xe7\x02\n" +
+	"\vfleet.proto\x12\x05fleet\"\xfb\x02\n" +
 	"\fShardRequest\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x1a\n" +
 	"\bendpoint\x18\x02 \x01(\tR\bendpoint\x12\x19\n" +
@@ -258,7 +266,8 @@ const file_fleet_proto_rawDesc = "" +
 	"\fmomentum_pct\x18\t \x01(\x01R\vmomentumPct\x12\x1b\n" +
 	"\tnoise_pct\x18\n" +
 	" \x01(\x01R\bnoisePct\x12\"\n" +
-	"\rbot_id_offset\x18\v \x01(\x03R\vbotIdOffset\"\xda\x01\n" +
+	"\rbot_id_offset\x18\v \x01(\x03R\vbotIdOffset\x12\x12\n" +
+	"\x04seed\x18\f \x01(\x03R\x04seed\"\xda\x01\n" +
 	"\vShardResult\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x1f\n" +
 	"\vorders_sent\x18\x02 \x01(\x03R\n" +

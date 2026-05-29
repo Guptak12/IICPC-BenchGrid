@@ -184,6 +184,7 @@ func runDistributed(ctx context.Context, cfg FleetConfig, jobID string) (*FleetR
 				MomentumPct:    cfg.StrategyMix.MomentumTrader,
 				NoisePct:       cfg.StrategyMix.NoiseTrader,
 				BotIdOffset:    botIDOffset,
+				Seed:		    cfg.Seed,
 			})
 
 			if err != nil {

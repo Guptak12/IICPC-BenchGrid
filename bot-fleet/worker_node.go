@@ -57,7 +57,7 @@ func (w *workerServer) RunShard(req *pb.ShardRequest, stream pb.WorkerService_Ru
 	}()
 
 	// 1. Initialize the Kafka Producer for this specific worker
-	producer, err := telemetry.NewProducer([]string{"redpanda:9092"}, req.JobId)
+	producer, err := telemetry.NewProducer(kafkaBrokers(), req.JobId)
 	if err != nil {
 		log.Printf("[worker] Failed to init Kafka producer: %v", err)
 	}
@@ -105,6 +105,11 @@ func buildShardBots(req *pb.ShardRequest) []*Bot {
 	numMakers := int(float64(req.NumBots) * req.MarketMakerPct)
 	numMomentum := int(float64(req.NumBots) * req.MomentumPct)
 
+	 baseSeed := req.Seed
+    if baseSeed == 0 {
+        baseSeed = time.Now().UnixNano()
+    }
+
 	for i := 0; i < int(req.NumBots); i++ {
 		var strategy StrategyType
 		switch {
@@ -125,6 +130,9 @@ func buildShardBots(req *pb.ShardRequest) []*Bot {
 			req.Spread,
 			int(req.OrdersPerBot),
 			req.RatePerSec,
+			// Key: seed = base + offset + i so Worker 2's bots don't
+            // duplicate Worker 1's seeds but stay fully deterministic
+            baseSeed+req.BotIdOffset+int64(i),
 		)
 		bots[i] = NewBot(botCfg)
 	}

@@ -8,17 +8,34 @@ import (
 	"net/http"
 	"sync"
 	"time"
-
+	"math"
 	"flag"
 	"net"
 	"os"
 	"strings"
+	"sort"
 
 	"github.com/google/uuid"
 	pb "github.com/guptak12/bot-fleet/gen/fleet" // replace with actual import path
 	"github.com/guptak12/bot-fleet/telemetry"
 	"google.golang.org/grpc"
+	"github.com/redis/go-redis/v9"
 )
+
+
+// LeaderboardEntry is what the frontend receives
+type LeaderboardEntry struct {
+    Rank             int     `json:"rank"`
+    ContestantID     string  `json:"contestant_id"`
+    CompositeScore   float64 `json:"composite_score"`
+    CorrectnessScore float64 `json:"correctness_score"`
+    PerfScore        float64 `json:"perf_score"`
+    TPS              float64 `json:"tps"`
+    P50Us            float64 `json:"p50_us"`
+    P99Us            float64 `json:"p99_us"`
+    JobID            string  `json:"job_id"`
+    SubmittedAt      time.Time `json:"submitted_at"`
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Job store
@@ -39,6 +56,7 @@ const (
 // This means any reader holding the old pointer sees a consistent snapshot.
 type Job struct {
 	ID        string       `json:"job_id"`
+	ContestantID string    `json:"contestant_id"`
 	Status    JobStatus    `json:"status"`
 	StartedAt time.Time    `json:"started_at"`
 	EndedAt   *time.Time   `json:"ended_at,omitempty"`
@@ -51,6 +69,8 @@ var (
 	jobStore   = map[string]*Job{}
 	jobStoreMu sync.RWMutex
 )
+
+var rdb *redis.Client
 
 // getJob returns the current Job pointer — caller gets a stable snapshot
 func getJob(id string) (*Job, bool) {
@@ -65,8 +85,29 @@ func getJob(id string) (*Job, bool) {
 // Readers holding the old pointer continue to see a consistent snapshot.
 func replaceJob(newJob *Job) {
 	jobStoreMu.Lock()
-	defer jobStoreMu.Unlock()
 	jobStore[newJob.ID] = newJob
+	jobStoreMu.Unlock()
+
+	 // Write-through to Redis — non-blocking, best-effort
+    if rdb != nil {
+        data, err := json.Marshal(newJob)
+        if err == nil {
+            ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+            defer cancel()
+            if err := rdb.HSet(ctx, "jobs", newJob.ID, data).Err(); err != nil {
+                log.Printf("[redis] replaceJob write failed: %v\n", err)
+            }
+        }
+    }
+
+	// Broadcast leaderboard update to all SSE subscribers when a job finishes
+    if newJob.Status == JobCompleted {
+        go func() {
+            if payload, err := buildLeaderboardJSON(); err == nil {
+                hub.broadcast(payload)
+            }
+        }()
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -74,6 +115,7 @@ func replaceJob(newJob *Job) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 type FleetConfig struct {
+	ContestantID   string    `json:"contestant_id"`
 	Endpoint     string      `json:"endpoint"`
 	NumBots      int         `json:"num_bots"`
 	OrdersPerBot int         `json:"orders_per_bot"`
@@ -81,6 +123,7 @@ type FleetConfig struct {
 	Spread       float64     `json:"spread"`
 	RatePerSec   float64     `json:"rate_per_sec"`
 	StrategyMix  StrategyMix `json:"strategy_mix"`
+	Seed		 int64       `json:"seed"` // seed for deterministic bot generation
 }
 
 type StrategyMix struct {
@@ -144,11 +187,18 @@ func runMasterMode() {
     if w := os.Getenv("WORKERS"); w != "" {
         masterCfg.WorkerAddresses = strings.Split(w, ",")
     }
+
+	initRedis()
+	rehydrateFromRedis()
+
+
     // existing HTTP server setup
 	mux := http.NewServeMux()
 	mux.HandleFunc("/run",     handleRun)
 	mux.HandleFunc("/status/", handleStatus)
 	mux.HandleFunc("/cancel/", handleCancel)
+	mux.HandleFunc("/leaderboard",        handleLeaderboard)
+	mux.HandleFunc("/leaderboard/stream", handleLeaderboardStream)
 	mux.HandleFunc("/health",  func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
@@ -193,12 +243,14 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "endpoint is required", http.StatusBadRequest)
 		return
 	}
+	log.Printf("==== MASTER RECEIVED ID: '%s' ====", cfg.ContestantID)
 
 	// Fix 2: context.Background() — fleet outlives the HTTP request
 	jobCtx, jobCancel := context.WithTimeout(context.Background(), 15*time.Minute)
 
 	job := &Job{
 		ID:        uuid.New().String(),
+		ContestantID: cfg.ContestantID,
 		Status:    JobPending,
 		StartedAt: time.Now(),
 		cancel:    jobCancel,
@@ -211,32 +263,33 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
         if r := recover(); r != nil {
             now := time.Now()
             log.Printf("[job:%s] PANIC: %v\n", job.ID[:8], r)
-            replaceJob(&Job{
-                ID:        job.ID,
-                Status:    JobAborted,
-                StartedAt: job.StartedAt,
-                EndedAt:   &now,
-                Error:     fmt.Sprintf("internal panic: %v", r),
-                cancel:    jobCancel,
-            })
+            updatedJob := *job // <--- Copy all original fields (including ContestantID!)
+            updatedJob.Status = JobAborted
+            updatedJob.EndedAt = &now
+            updatedJob.Error = fmt.Sprintf("internal panic: %v", r)
+            replaceJob(&updatedJob)
             jobCancel()
         }
     }()
 
+	// 2. The Running Update
+    runningJob := *job
+    runningJob.Status = JobRunning
+    replaceJob(&runningJob)
 		// Fix 2: build a new Job struct for each state transition
 		// never mutate fields on the existing pointer
-		replaceJob(&Job{
-			ID:        job.ID,
-			Status:    JobRunning,
-			StartedAt: job.StartedAt,
-			cancel:    jobCancel,
-		})
+		// replaceJob(&Job{
+		// 	ID:        job.ID,
+		// 	Status:    JobRunning,
+		// 	StartedAt: job.StartedAt,
+		// 	cancel:    jobCancel,
+		// })
 
 		bots := buildBots(cfg)
 		log.Printf("[job:%s] Starting: %d bots × %d orders → %s\n",
 			job.ID[:8], len(bots), cfg.OrdersPerBot, cfg.Endpoint)
 
-		brokers := []string{"redpanda:9092"} // inside iicpc-net
+		brokers := kafkaBrokers() // inside iicpc-net
 		consumer, err := telemetry.NewConsumer(brokers, job.ID, len(masterCfg.WorkerAddresses))
 		if err != nil {
 			log.Printf("[job:%s] Kafka consumer init failed: %v — running without telemetry\n",
@@ -262,8 +315,15 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
 		elapsed := time.Since(start)
 
         if err != nil {
-            jobCancel() // Stop the consumer immediately
-        }
+        now := time.Now()
+        abortedJob := *job
+        abortedJob.Status = JobAborted
+        abortedJob.EndedAt = &now
+        abortedJob.Error = err.Error()
+        replaceJob(&abortedJob)
+        jobCancel()
+        return
+    }
 
 		if consumer != nil {
 			wg.Wait()
@@ -280,49 +340,27 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Step 5: Initialize global aggregator matrix (1ns to 1hr tracking bounds)
-		if err != nil {
-    now := time.Now()
-    replaceJob(&Job{
-        ID:        job.ID,
-        Status:    JobAborted,
-        StartedAt: job.StartedAt,
-        EndedAt:   &now,
-        Error:     err.Error(),
-        cancel:    jobCancel,
-    })
-    jobCancel()
-    return
-}
 
-// Fill in fields runDistributed doesn't set
-report.DurationMs = elapsed.Milliseconds()
-report.TPS = float64(report.OrdersSent) / (float64(elapsed.Milliseconds()) / 1000.0)
-report.StrategyBreakdown = map[string]int{
-    "market_maker":    countStrategy(bots, MarketMaker),
-    "momentum_trader": countStrategy(bots, MomentumTrader),
-    "noise_trader":    countStrategy(bots, NoiseTrader),
-}
+			// Fill in fields runDistributed doesn't set
+			report.DurationMs = elapsed.Milliseconds()
+			report.TPS = float64(report.OrdersSent) / (float64(elapsed.Milliseconds()) / 1000.0)
+			report.StrategyBreakdown = map[string]int{
+				"market_maker":    countStrategy(bots, MarketMaker),
+				"momentum_trader": countStrategy(bots, MomentumTrader),
+				"noise_trader":    countStrategy(bots, NoiseTrader),
+			}
 
-report.Status = "completed"
+			report.Status = "completed"
 
-		now := time.Now()
-
-		// Fix 2: replace with a new Job struct — old pointer untouched
-		replaceJob(&Job{
-			ID:        job.ID,
-			Status:    JobCompleted,
-			StartedAt: job.StartedAt,
-			EndedAt:   &now,
-			Report:    report,
-			cancel:    jobCancel,
-		})
-
-		log.Printf("[job:%s] Done: %d/%d orders in %s\n",
-			job.ID[:8], report.OrdersSent, cfg.NumBots*cfg.OrdersPerBot,
-			elapsed.Round(time.Millisecond))
-
-		jobCancel()
+		// 2. The Completed Update (NO err != nil wrapper)
+        now := time.Now()
+        completedJob := *job
+        completedJob.Status = JobCompleted
+        completedJob.EndedAt = &now
+        completedJob.Report = report
+        replaceJob(&completedJob)
+        
+        jobCancel()
 	}()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -420,6 +458,12 @@ func buildBots(cfg FleetConfig) []*Bot {
 	numMakers   := int(float64(cfg.NumBots) * cfg.StrategyMix.MarketMaker)
 	numMomentum := int(float64(cfg.NumBots) * cfg.StrategyMix.MomentumTrader)
 
+	// If no seed provided (manual testing), fall back to time-based
+    baseSeed := cfg.Seed
+    if baseSeed == 0 {
+        baseSeed = time.Now().UnixNano()
+    }
+
 	for i := 0; i < cfg.NumBots; i++ {
 		var strategy StrategyType
 		switch {
@@ -439,6 +483,7 @@ func buildBots(cfg FleetConfig) []*Bot {
 			cfg.Spread,
 			cfg.OrdersPerBot,
 			cfg.RatePerSec,
+			baseSeed+int64(i), // ← each bot gets a unique but deterministic seed
 		)
 		bots[i] = NewBot(botCfg)
 	}
@@ -454,3 +499,242 @@ func countStrategy(bots []*Bot, s StrategyType) int {
 	}
 	return count
 }
+
+// kafkaBrokers reads KAFKA_BROKERS env var, falls back to redpanda:9092
+// Set KAFKA_BROKERS=broker1:9092,broker2:9092 for multi-broker clusters
+func kafkaBrokers() []string {
+    if v := os.Getenv("KAFKA_BROKERS"); v != "" {
+        return strings.Split(v, ",")
+    }
+    return []string{"redpanda:9092"}
+}
+
+func redisAddr() string {
+    if v := os.Getenv("REDIS_ADDR"); v != "" {
+        return v
+    }
+    return "localhost:6379"
+}
+
+func initRedis() {
+    rdb = redis.NewClient(&redis.Options{
+        Addr: redisAddr(),
+    })
+    ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+    defer cancel()
+    if err := rdb.Ping(ctx).Err(); err != nil {
+        // Non-fatal — degrade gracefully, leaderboard won't persist
+        log.Printf("[redis] connection failed: %v — running without persistence\n", err)
+        rdb = nil
+    } else {
+        log.Printf("[redis] connected at %s ✓\n", redisAddr())
+    }
+}
+
+func rehydrateFromRedis() {
+    if rdb == nil {
+        return
+    }
+
+    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+    defer cancel()
+
+    entries, err := rdb.HGetAll(ctx, "jobs").Result()
+    if err != nil {
+        log.Printf("[redis] rehydrate failed: %v\n", err)
+        return
+    }
+
+    now := time.Now()
+    rehydrated, zombies := 0, 0
+
+    jobStoreMu.Lock()
+    defer jobStoreMu.Unlock()
+
+    for _, jsonStr := range entries {
+        // Unmarshal into a value, not a pointer — avoids loop variable capture bug
+        var job Job
+        if err := json.Unmarshal([]byte(jsonStr), &job); err != nil {
+            continue
+        }
+
+        // Upgrade 1: sanitize zombies — the goroutine that owned this job is dead
+        if job.Status == JobRunning || job.Status == JobPending {
+            job.Status = JobAborted
+            job.Error = "system restarted while job was active"
+            job.EndedAt = &now
+            zombies++
+
+            // Write sanitized state back to Redis immediately
+            if fixed, err := json.Marshal(job); err == nil {
+                rdb.HSet(ctx, "jobs", job.ID, fixed)
+            }
+        }
+
+        // Store pointer to the local copy (safe — loop variable was value-copied above)
+        jobCopy := job
+        jobStore[job.ID] = &jobCopy
+        rehydrated++
+    }
+
+    log.Printf("[redis] rehydrated %d jobs (%d zombies sanitized)\n", rehydrated, zombies)
+}
+
+// calculatePerfScore: 100% at ≤500µs, 0% at ≥5ms, linear decay between
+func calculatePerfScore(p99Us float64) float64 {
+    const targetUs  = 500.0
+    const penaltyUs = 5000.0
+    if p99Us <= targetUs  { return 100.0 }
+    if p99Us >= penaltyUs { return 0.0 }
+    return 100.0 * (1.0 - ((p99Us - targetUs) / (penaltyUs - targetUs)))
+}
+
+// calculateCompositeScore: correctness gates everything
+// A fast wrong engine scores 0, not 30%
+func calculateCompositeScore(correctness, perf float64) float64 {
+    if correctness <= 0 {
+        return 0.0
+    }
+    return (0.7 * correctness) + (0.3 * perf)
+}
+
+// SSE hub — broadcaster for live leaderboard updates
+type sseHub struct {
+    mu          sync.Mutex
+    subscribers []chan string
+}
+
+var hub = &sseHub{}
+
+func (h *sseHub) subscribe() chan string {
+    ch := make(chan string, 4)
+    h.mu.Lock()
+    h.subscribers = append(h.subscribers, ch)
+    h.mu.Unlock()
+    return ch
+}
+
+func (h *sseHub) unsubscribe(ch chan string) {
+    h.mu.Lock()
+    defer h.mu.Unlock()
+    for i, s := range h.subscribers {
+        if s == ch {
+            h.subscribers = append(h.subscribers[:i], h.subscribers[i+1:]...)
+            return
+        }
+    }
+}
+
+func (h *sseHub) broadcast(payload string) {
+    h.mu.Lock()
+    defer h.mu.Unlock()
+    for _, ch := range h.subscribers {
+        select {
+        case ch <- payload:
+        default: // slow subscriber — skip, don't block
+        }
+    }
+}
+
+// buildLeaderboardJSON is the shared logic used by both endpoints
+func buildLeaderboardJSON() (string, error) {
+    jobStoreMu.RLock()
+    defer jobStoreMu.RUnlock()
+
+    bestRuns := make(map[string]LeaderboardEntry)
+
+    for _, job := range jobStore {
+        if job.Status != JobCompleted || job.Report == nil || job.ContestantID == "" {
+            continue
+        }
+
+        perf      := calculatePerfScore(job.Report.P99Us)
+        composite := calculateCompositeScore(job.Report.CorrectnessScore, perf)
+
+        entry := LeaderboardEntry{
+            ContestantID:     job.ContestantID,
+            CompositeScore:   math.Round(composite*100) / 100,
+            CorrectnessScore: math.Round(job.Report.CorrectnessScore*100) / 100,
+            PerfScore:        math.Round(perf*100) / 100,
+            TPS:              math.Round(job.Report.TPS*10) / 10,
+            P50Us:            job.Report.P50Us,
+            P99Us:            job.Report.P99Us,
+            JobID:            job.ID,
+            SubmittedAt:      job.StartedAt,
+        }
+
+        existing, exists := bestRuns[job.ContestantID]
+        if !exists || entry.CompositeScore > existing.CompositeScore {
+            bestRuns[job.ContestantID] = entry
+        }
+    }
+
+    leaderboard := make([]LeaderboardEntry, 0, len(bestRuns))
+    for _, e := range bestRuns {
+        leaderboard = append(leaderboard, e)
+    }
+
+    sort.Slice(leaderboard, func(i, j int) bool {
+        a, b := leaderboard[i], leaderboard[j]
+        if a.CompositeScore != b.CompositeScore {
+            return a.CompositeScore > b.CompositeScore
+        }
+        if a.CorrectnessScore != b.CorrectnessScore {
+            return a.CorrectnessScore > b.CorrectnessScore
+        }
+        return a.TPS > b.TPS
+    })
+
+    // Assign ranks after sorting
+    for i := range leaderboard {
+        leaderboard[i].Rank = i + 1
+    }
+
+    data, err := json.Marshal(leaderboard)
+    return string(data), err
+}
+
+func handleLeaderboard(w http.ResponseWriter, r *http.Request) {
+    payload, err := buildLeaderboardJSON()
+    if err != nil {
+        http.Error(w, "failed to build leaderboard", http.StatusInternalServerError)
+        return
+    }
+    w.Header().Set("Content-Type", "application/json")
+    w.Header().Set("Access-Control-Allow-Origin", "*")
+    fmt.Fprint(w, payload)
+}
+
+func handleLeaderboardStream(w http.ResponseWriter, r *http.Request) {
+    // SSE requires these exact headers
+    w.Header().Set("Content-Type", "text/event-stream")
+    w.Header().Set("Cache-Control", "no-cache")
+    w.Header().Set("Connection", "keep-alive")
+    w.Header().Set("Access-Control-Allow-Origin", "*")
+
+    flusher, ok := w.(http.Flusher)
+    if !ok {
+        http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+        return
+    }
+
+    // Send current state immediately on connect
+    if payload, err := buildLeaderboardJSON(); err == nil {
+        fmt.Fprintf(w, "data: %s\n\n", payload)
+        flusher.Flush()
+    }
+
+    ch := hub.subscribe()
+    defer hub.unsubscribe(ch)
+
+    for {
+        select {
+        case payload := <-ch:
+            fmt.Fprintf(w, "data: %s\n\n", payload)
+            flusher.Flush()
+        case <-r.Context().Done():
+            return // client disconnected
+        }
+    }
+}
+

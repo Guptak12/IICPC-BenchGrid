@@ -9,7 +9,9 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"encoding/json"
 	"time"
+	"net/http"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
@@ -46,6 +48,7 @@ const (
 
 type BuildJob struct {
     ID          string      `json:"build_id"`
+    ContestantID string     `json:"contestant_id"`
     Status      BuildStatus `json:"status"`
     SubmittedAt time.Time   `json:"submitted_at"`
     EndedAt     *time.Time  `json:"ended_at,omitempty"`
@@ -53,6 +56,7 @@ type BuildJob struct {
     Endpoint    string      `json:"endpoint,omitempty"`
     HostPort    string      `json:"host_port,omitempty"`
     Error       string      `json:"error,omitempty"`
+	JobID 	 string      `json:"job_id"`
 }
 
 var (
@@ -115,96 +119,233 @@ func main() {
 	log.Fatal(app.Listen(":3000"))
 }
 
+// func handleSubmission(c fiber.Ctx) error {
+// 	contestantID := c.FormValue("contestant_id")
+// 	if contestantID == "" {
+// 		contestantID = "anonymous"
+// 	}
+	
+// 	file, err := c.FormFile("source_code")
+// 	if err != nil {
+// 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Failed to parse source_code field"})
+// 	}
+
+// 	if filepath.Ext(file.Filename) != ".cpp" {
+// 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+// 			"error": "Only .cpp files accepted",
+// 		})
+// 	}
+
+// 	hostSubmitDir, err := os.MkdirTemp(".", "submission_*")
+// 	if err != nil {
+// 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to create temp directory"})
+// 	}
+
+// 	absHostSubmitDir, err := filepath.Abs(hostSubmitDir)
+// 	if err != nil {
+// 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to resolve absolute path"})
+// 	}
+
+// 	savePath := filepath.Join(absHostSubmitDir, "main.cpp")
+// 	if err := c.SaveFile(file, savePath); err != nil {
+// 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to save file"})
+// 	}
+
+// 	// Generate build ID immediately
+// buildID := uuid.New().String()
+
+// log.Printf("==== ORCHESTRATOR EXTRACTED ID: '%s' ====", contestantID)
+
+// replaceBuild(&BuildJob{
+//     ID:          buildID,
+// 	ContestantID: contestantID,
+//     Status:      BuildPending,
+//     SubmittedAt: time.Now(),
+// })
+
+// // Launch compilation in background — return immediately
+// go func() {
+//     defer func() {
+//         if r := recover(); r != nil {
+//             now := time.Now()
+//             replaceBuild(&BuildJob{
+//                 ID:      buildID,
+//                 Status:  BuildFailed,
+//                 Error:   fmt.Sprintf("panic: %v", r),
+//                 EndedAt: &now,
+//             })
+//         }
+//     }()
+
+//     replaceBuild(&BuildJob{
+//         ID:          buildID,
+//         Status:      BuildCompiling,
+//         SubmittedAt: time.Now(),
+//     })
+
+//     containerID, endpoint, err := runSandbox(absHostSubmitDir)
+//     now := time.Now()
+
+//     if err != nil {
+//         os.RemoveAll(absHostSubmitDir)
+//         replaceBuild(&BuildJob{
+//             ID:      buildID,
+//             Status:  BuildFailed,
+//             Error:   err.Error(),
+//             EndedAt: &now,
+//         })
+//         return
+// 	}
+
+
+// 	activeSandboxesMu.Lock()
+// 	activeSandboxes[containerID] = absHostSubmitDir
+// 	activeSandboxesMu.Unlock()
+
+// 	// 1. Extract it safely here, while the HTTP context is still alive
+// 	contestantID := c.FormValue("contestant_id")
+// 	if contestantID == "" {
+// 		contestantID = "anonymous" // Fallback just in case
+// 	}
+
+// 	replaceBuild(&BuildJob{
+//         ID:          buildID,
+//         Status:      BuildRunning,
+//         ContainerID: containerID[:12],
+//         Endpoint:    endpoint,
+//         EndedAt:     &now,
+//     })
+// 	// 2. AUTO-TRIGGER THE OFFICIAL EXAM RIGHT HERE
+// 		go func() {
+// 			jobID, err := triggerOfficialRun(buildID, contestantID, endpoint)
+// 			if err != nil {
+// 				log.Printf("[job:%s] auto-trigger failed: %v\n", buildID[:8], err)
+// 			} else {
+// 				// This log will now print the JobID!
+// 				log.Printf("[job:%s] official exam triggered for %s (JobID: %s)\n", buildID[:8], contestantID, jobID)
+				
+// 				// Save the JobID into the Orchestrator's state so the bash script can fetch it!
+// 				buildStoreMu.Lock()
+// 				if build, exists := buildStore[buildID]; exists {
+// 					build.JobID = jobID
+// 				}
+// 				buildStoreMu.Unlock()
+// 			}
+// 		}()
+// }()
+// // Return 202 immediately — client polls /api/v1/build/:id
+// return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
+//     "build_id": buildID,
+//     "status":   "pending",
+//     "poll":     fmt.Sprintf("/api/v1/build/%s", buildID),
+// })
+	
+// }
+
 func handleSubmission(c fiber.Ctx) error {
+	// 1. EXTRACT DATA ON MAIN THREAD (Safe from Fiber recycling)
+	contestantID := c.FormValue("contestant_id")
+	if contestantID == "" {
+		contestantID = "anonymous"
+	}
+
 	file, err := c.FormFile("source_code")
 	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Failed to parse source_code field"})
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "missing source_code"})
 	}
 
-	if filepath.Ext(file.Filename) != ".cpp" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Only .cpp files accepted",
-		})
-	}
-
-	hostSubmitDir, err := os.MkdirTemp(".", "submission_*")
-	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to create temp directory"})
-	}
-
-	absHostSubmitDir, err := filepath.Abs(hostSubmitDir)
-	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to resolve absolute path"})
-	}
-
-	savePath := filepath.Join(absHostSubmitDir, "main.cpp")
-	if err := c.SaveFile(file, savePath); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to save file"})
-	}
-
-	// Generate build ID immediately
-buildID := uuid.New().String()
-
-replaceBuild(&BuildJob{
-    ID:          buildID,
-    Status:      BuildPending,
-    SubmittedAt: time.Now(),
-})
-
-// Launch compilation in background — return immediately
-go func() {
-    defer func() {
-        if r := recover(); r != nil {
-            now := time.Now()
-            replaceBuild(&BuildJob{
-                ID:      buildID,
-                Status:  BuildFailed,
-                Error:   fmt.Sprintf("panic: %v", r),
-                EndedAt: &now,
-            })
-        }
-    }()
-
-    replaceBuild(&BuildJob{
-        ID:          buildID,
-        Status:      BuildCompiling,
-        SubmittedAt: time.Now(),
-    })
-
-    containerID, endpoint, err := runSandbox(absHostSubmitDir)
-    now := time.Now()
-
-    if err != nil {
-        os.RemoveAll(absHostSubmitDir)
-        replaceBuild(&BuildJob{
-            ID:      buildID,
-            Status:  BuildFailed,
-            Error:   err.Error(),
-            EndedAt: &now,
-        })
-        return
-	}
-
-
-	activeSandboxesMu.Lock()
-	activeSandboxes[containerID] = absHostSubmitDir
-	activeSandboxesMu.Unlock()
-
-	replaceBuild(&BuildJob{
-        ID:          buildID,
-        Status:      BuildRunning,
-        ContainerID: containerID[:12],
-        Endpoint:    endpoint,
-        EndedAt:     &now,
-    })
-}()
-// Return 202 immediately — client polls /api/v1/build/:id
-return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
-    "build_id": buildID,
-    "status":   "pending",
-    "poll":     fmt.Sprintf("/api/v1/build/%s", buildID),
-})
+	buildID := uuid.New().String()
 	
+	// Use a local 'submissions' folder in the current working directory instead of the OS Temp dir
+	cwd, _ := os.Getwd()
+	absHostSubmitDir := filepath.Join(cwd, "submissions", "iicpc_"+buildID)
+	os.MkdirAll(absHostSubmitDir, 0755)
+
+	// 2. SAVE FILE ON MAIN THREAD 
+	// (Never do this inside the go func!)
+	if err := c.SaveFile(file, filepath.Join(absHostSubmitDir, "main.cpp")); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save file"})
+	}
+
+	// 3. INITIALIZE THE JOB SAFELY
+	buildStoreMu.Lock()
+	buildStore[buildID] = &BuildJob{
+		ID:           buildID,
+		ContestantID: contestantID,
+		Status:       BuildCompiling,
+		SubmittedAt:  time.Now(),
+	}
+	buildStoreMu.Unlock()
+
+	// 4. LAUNCH ASYNC GOROUTINE
+	// Pass strings explicitly as arguments to avoid closure leaks
+	go func(bID, cID, hostDir string) {
+		// Panic Recovery (Updates instead of Overwriting)
+		defer func() {
+			if r := recover(); r != nil {
+				now := time.Now()
+				buildStoreMu.Lock()
+				if b, ok := buildStore[bID]; ok {
+					b.Status = BuildFailed
+					b.Error = fmt.Sprintf("panic: %v", r)
+					b.EndedAt = &now
+				}
+				buildStoreMu.Unlock()
+			}
+		}()
+
+		// Compile and Boot Sandbox
+		containerID, endpoint, err := runSandbox(hostDir)
+		now := time.Now()
+
+		if err != nil {
+			os.RemoveAll(hostDir)
+			buildStoreMu.Lock()
+			if b, ok := buildStore[bID]; ok {
+				b.Status = BuildFailed
+				b.Error = err.Error()
+				b.EndedAt = &now
+			}
+			buildStoreMu.Unlock()
+			return
+		}
+
+		activeSandboxesMu.Lock()
+		activeSandboxes[containerID] = hostDir
+		activeSandboxesMu.Unlock()
+
+		// Update to Running
+		buildStoreMu.Lock()
+		if b, ok := buildStore[bID]; ok {
+			b.Status = BuildRunning
+			b.ContainerID = containerID[:12]
+			b.Endpoint = endpoint
+			b.EndedAt = &now
+		}
+		buildStoreMu.Unlock()
+
+		// Trigger Master Node
+		jobID, err := triggerOfficialRun(bID, cID, endpoint)
+		if err != nil {
+			log.Printf("[job:%s] auto-trigger failed: %v\n", bID[:8], err)
+		} else {
+			log.Printf("[job:%s] official exam triggered for %s (JobID: %s)\n", bID[:8], cID, jobID)
+			
+			// Safely save the JobID for the shell script to poll
+			buildStoreMu.Lock()
+			if b, ok := buildStore[bID]; ok {
+				b.JobID = jobID
+			}
+			buildStoreMu.Unlock()
+		}
+
+	}(buildID, contestantID, absHostSubmitDir)
+
+	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
+		"build_id": buildID,
+		"status":   "pending",
+		"poll":     fmt.Sprintf("/api/v1/build/%s", buildID),
+	})
 }
 
 func runSandbox(hostSubmitDir string) (string, string, error) {
@@ -490,4 +631,53 @@ func waitForSandboxReady(ctx context.Context, containerID string, _ string, time
         time.Sleep(500 * time.Millisecond)
     }
     return fmt.Errorf("timeout waiting for %s", addr)
+}
+// masterAddr reads MASTER_ADDR env var
+func masterAddr() string {
+    if v := os.Getenv("MASTER_ADDR"); v != "" {
+        return v
+    }
+    return "http://localhost:4000"
+}
+
+// triggerOfficialRun fires the standardized benchmark against the master.
+// Called by the orchestrator once the sandbox is confirmed running.
+func triggerOfficialRun(buildID, contestantID, endpoint string) (string, error) {
+	payload := map[string]interface{}{
+		"contestant_id":  contestantID,
+		"endpoint":       endpoint,
+		"num_bots":       500,
+		"orders_per_bot": 1000,
+		"rate_per_sec":   100.0,
+		"seed":           42424242,
+		"strategy_mix": map[string]float64{
+			"market_maker":    0.4,
+			"momentum_trader": 0.3,
+			"noise_trader":    0.3,
+		},
+	}
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := http.Post(masterAddr()+"/run", "application/json", bytes.NewBuffer(data))
+	if err != nil {
+		return "", fmt.Errorf("master unreachable: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusAccepted {
+		return "", fmt.Errorf("master rejected run: status %d", resp.StatusCode)
+	}
+
+	// Capture the JobID returned by the Master node
+	var result struct {
+		JobID string `json:"job_id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+	return result.JobID, nil
 }

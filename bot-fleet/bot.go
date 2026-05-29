@@ -64,6 +64,7 @@ type BotConfig struct {
 	Spread       int64   // scaled: $0.10 = 10
 	OrdersToSend int     // how many orders this bot will send total
 	RatePerSec   float64 // target orders per second
+	Seed 		 int64   // seed for deterministic behavior (0 = random)
 }
 
 // BotResult is returned after a bot finishes its run
@@ -87,7 +88,7 @@ type Bot struct {
 func NewBot(cfg BotConfig) *Bot {
 	return &Bot{
 		config: cfg,
-		rng:    rand.New(rand.NewSource(time.Now().UnixNano() + cfg.NumericID)),
+		rng:       rand.New(rand.NewSource(cfg.Seed)),
 		// Pre-allocate SendTimes for all orders this bot will send
 		// Index = seq & 0xFFFFFFFF — safe because OrdersToSend << 2^32
 		SendTimes: make([]int64, cfg.OrdersToSend+1),
@@ -250,7 +251,7 @@ func ScaledToFloat(scaled int64) float64 {
 // NewBotConfig converts float config values to scaled int64 at startup
 // This is the ONLY place FloatToScaled is called
 func NewBotConfig(numericID int64, stringID string, strategy StrategyType,
-	midPrice, spread float64, ordersToSend int, ratePerSec float64) BotConfig {
+	midPrice, spread float64, ordersToSend int, ratePerSec float64, seed int64) BotConfig {
 	return BotConfig{
 		NumericID:    numericID,
 		StringID:     stringID,
@@ -259,5 +260,6 @@ func NewBotConfig(numericID int64, stringID string, strategy StrategyType,
 		Spread:       FloatToScaled(spread),
 		OrdersToSend: ordersToSend,
 		RatePerSec:   ratePerSec,
+		Seed: 	   	  seed,
 	}
 }
