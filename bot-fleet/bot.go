@@ -80,10 +80,12 @@ type BotResult struct {
 
 // Bot is a single simulated market participant
 type Bot struct {
-	config    BotConfig
-	rng       *rand.Rand   // per-bot RNG — not shared, so no mutex needed
-	seqNum    atomic.Int64 // order sequence number, unique per bot
-	SendTimes []int64
+	config       BotConfig
+	rng          *rand.Rand   // per-bot RNG — not shared, so no mutex needed
+	seqNum       atomic.Int64 // order sequence number, unique per bot
+	ordersSent   int
+	activeOrders []int64
+	SendTimes    []int64
 }
 
 func NewBot(cfg BotConfig) *Bot {
@@ -97,17 +99,44 @@ func NewBot(cfg BotConfig) *Bot {
 }
 
 func (b *Bot) NextOrder() OrderMessage {
+	b.ordersSent++
 	seq := b.seqNum.Add(1)
 	orderID := (b.config.NumericID << 32) | (seq & 0xFFFFFFFF)
 
-	switch b.config.Strategy {
-	case MarketMaker:
-		return b.marketMakerOrder(orderID, seq)
-	case MomentumTrader:
-		return b.momentumOrder(orderID, seq)
-	default:
-		return b.noiseOrder(orderID, seq)
+	if b.config.OrdersToSend <= 0 {
+		return OrderMessage{BotID: b.config.StringID, OrderID: orderID, Type: Limit, Side: Buy, Price: 1, Quantity: 1}
 	}
+
+	progress := float64(b.ordersSent) / float64(b.config.OrdersToSend)
+
+	if progress < 0.60 {
+		side := Buy
+		price := b.config.MidPrice -1- int64(b.rng.Intn(10))
+		if b.rng.Intn(2) == 0 {
+			side = Sell
+			price = b.config.MidPrice +1+ int64(b.rng.Intn(10))
+		}
+
+		b.activeOrders = append(b.activeOrders, orderID)
+		return OrderMessage{BotID: b.config.StringID, OrderID: orderID, Type: Limit, Side: side, Price: price, Quantity: 100}
+	}
+
+	if progress < 0.80 {
+		side := Buy
+		if b.rng.Intn(2) == 0 {
+			side = Sell
+		}
+
+		return OrderMessage{BotID: b.config.StringID, OrderID: orderID, Type: Market, Side: side, Quantity: 5000}
+	}
+
+	if len(b.activeOrders) > 0 {
+		cancelID := b.activeOrders[0]
+		b.activeOrders = b.activeOrders[1:]
+		return OrderMessage{BotID: b.config.StringID, OrderID: cancelID, Type: Cancel}
+	}
+
+	return OrderMessage{BotID: b.config.StringID, OrderID: orderID, Type: Limit, Side: Buy, Price: 1, Quantity: 1}
 }
 
 func (b *Bot) RecordSendTime(seq int64) {

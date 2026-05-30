@@ -27,6 +27,26 @@ type Fill struct {
 	MatchedWith int64
 }
 
+// foldPartials merges consecutive fills that have the same price and counterparty.
+func foldPartials(fills []Fill) []Fill {
+	if len(fills) <= 1 {
+		return fills
+	}
+
+	folded := make([]Fill, 0, len(fills))
+	current := fills[0]
+	for i := 1; i < len(fills); i++ {
+		if fills[i].FilledPrice == current.FilledPrice && fills[i].MatchedWith == current.MatchedWith {
+			current.FilledQty += fills[i].FilledQty
+			continue
+		}
+		folded = append(folded, current)
+		current = fills[i]
+	}
+	folded = append(folded, current)
+	return folded
+}
+
 // PriceLevel represents a single price level in the order book containing multiple orders (FIFO)
 type PriceLevel struct {
 	Price  int64
@@ -369,6 +389,10 @@ func (v *Validator) GetCorrectnessScore() float64 {
 
 	for orderID, expectedList := range v.expectedFills {
 		actualList, actOk := v.actualFills[orderID]
+		expectedList = foldPartials(expectedList)
+		if actOk {
+			actualList = foldPartials(actualList)
+		}
 
 		if !actOk {
 			v.missedFills++

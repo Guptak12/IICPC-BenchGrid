@@ -82,7 +82,7 @@ done
 # --- CORRECTED CURL SYNTAX ---
 SUBMIT_RESPONSE="$(curl -fsS -X POST \
   -F "source_code=@${PAYLOAD}" \
-  -F "contestant_id=kush-gupta-01" \
+  -F "contestant_id=kush-gupta-02" \
   http://localhost:3000/api/v1/submit)"
 
 BUILD_ID="$(printf '%s' "$SUBMIT_RESPONSE" | sed -n 's/.*"build_id":"\([^"]*\)".*/\1/p')"
@@ -147,3 +147,5 @@ fi
 if [ "$FINAL_STATUS" != "completed" ]; then
   exit 1
 fi
+
+

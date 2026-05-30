@@ -319,3 +319,25 @@ func TestValidatorMatchedWithWrongCounterparty(t *testing.T) {
         t.Errorf("wrong counterparty must not score 100.0, got %.2f", score)
     }
 }
+
+// TestValidatorFoldsConsecutivePartialFills ensures adjacent fills with the
+// same price and counterparty are compared as one execution block.
+func TestValidatorFoldsConsecutivePartialFills(t *testing.T) {
+	v := NewValidator()
+
+	v.ProcessOrder(1, "LIMIT", "BUY", 100, 60)
+	v.ProcessAck(1, "accepted")
+	v.ProcessOrder(2, "LIMIT", "SELL", 100, 60)
+	v.ProcessAck(2, "accepted")
+
+	v.ProcessFill(1, 10, 100, 2)
+	v.ProcessFill(1, 20, 100, 2)
+	v.ProcessFill(1, 30, 100, 2)
+	v.ProcessFill(2, 10, 100, 1)
+	v.ProcessFill(2, 20, 100, 1)
+	v.ProcessFill(2, 30, 100, 1)
+
+	if score := v.GetCorrectnessScore(); score != 100.0 {
+		t.Fatalf("expected folded partial fills to score 100.0, got %.2f", score)
+	}
+}

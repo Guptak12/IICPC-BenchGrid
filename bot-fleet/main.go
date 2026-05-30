@@ -3,38 +3,38 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
+	"math"
+	"net"
 	"net/http"
+	"os"
+	"sort"
+	"strings"
 	"sync"
 	"time"
-	"math"
-	"flag"
-	"net"
-	"os"
-	"strings"
-	"sort"
 
 	"github.com/google/uuid"
 	pb "github.com/guptak12/bot-fleet/gen/fleet" // replace with actual import path
 	"github.com/guptak12/bot-fleet/telemetry"
-	"google.golang.org/grpc"
 	"github.com/redis/go-redis/v9"
+	"google.golang.org/grpc"
 )
-
 
 // LeaderboardEntry is what the frontend receives
 type LeaderboardEntry struct {
-    Rank             int     `json:"rank"`
-    ContestantID     string  `json:"contestant_id"`
-    CompositeScore   float64 `json:"composite_score"`
-    CorrectnessScore float64 `json:"correctness_score"`
-    PerfScore        float64 `json:"perf_score"`
-    TPS              float64 `json:"tps"`
-    P50Us            float64 `json:"p50_us"`
-    P99Us            float64 `json:"p99_us"`
-    JobID            string  `json:"job_id"`
-    SubmittedAt      time.Time `json:"submitted_at"`
+	Rank             int       `json:"rank"`
+	ContestantID     string    `json:"contestant_id"`
+	CompositeScore   float64   `json:"composite_score"`
+	CorrectnessScore float64   `json:"correctness_score"`
+	PerfScore        float64   `json:"perf_score"`
+	TPS              float64   `json:"tps"`
+	P50Us            float64   `json:"p50_us"`
+	P99Us            float64   `json:"p99_us"`
+	JobID            string    `json:"job_id"`
+	SubmittedAt      time.Time `json:"submitted_at"`
+	KafkaUnavailable bool      `json:"kafka_unavailable"`
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -150,6 +150,7 @@ type FleetReport struct {
 	P99Us             float64        `json:"p99_us"`
 	MaxUs             float64        `json:"max_us"`
 	CorrectnessScore  float64        `json:"correctness_score"`
+	KafkaUnavailable  bool           `json:"kafka_unavailable"`
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -339,6 +340,7 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
 					job.ID[:8], telResult.OrdersProcessed, telResult.FillsProcessed, telResult.Correctness)
 			}
 		}
+		report.KafkaUnavailable = (consumer == nil)
 
 
 			// Fill in fields runDistributed doesn't set
@@ -590,13 +592,24 @@ func calculatePerfScore(p99Us float64) float64 {
     return 100.0 * (1.0 - ((p99Us - targetUs) / (penaltyUs - targetUs)))
 }
 
-// calculateCompositeScore: correctness gates everything
-// A fast wrong engine scores 0, not 30%
-func calculateCompositeScore(correctness, perf float64) float64 {
-    if correctness <= 0 {
-        return 0.0
-    }
-    return (0.7 * correctness) + (0.3 * perf)
+// calculateCompositeScore executes the benchmark formula.
+func calculateCompositeScore(tps float64, p99Us float64, correctness float64) float64 {
+	if correctness <= 0 {
+		return 0.0
+	}
+
+	baseScore := tps
+	baselineP99 := 5000.0
+	latencyMultiplier := baselineP99 / p99Us
+	if latencyMultiplier > 10.0 {
+		latencyMultiplier = 10.0
+	}
+
+	correctnessRatio := correctness / 100.0
+	penaltyFactor := 20.0
+	correctnessMultiplier := math.Pow(correctnessRatio, penaltyFactor)
+
+	return baseScore * latencyMultiplier * correctnessMultiplier
 }
 
 // SSE hub — broadcaster for live leaderboard updates
@@ -649,8 +662,8 @@ func buildLeaderboardJSON() (string, error) {
             continue
         }
 
-        perf      := calculatePerfScore(job.Report.P99Us)
-        composite := calculateCompositeScore(job.Report.CorrectnessScore, perf)
+				perf := calculatePerfScore(job.Report.P99Us)
+				composite := calculateCompositeScore(job.Report.TPS, job.Report.P99Us, job.Report.CorrectnessScore)
 
         entry := LeaderboardEntry{
             ContestantID:     job.ContestantID,
@@ -662,6 +675,7 @@ func buildLeaderboardJSON() (string, error) {
             P99Us:            job.Report.P99Us,
             JobID:            job.ID,
             SubmittedAt:      job.StartedAt,
+				KafkaUnavailable: job.Report.KafkaUnavailable,
         }
 
         existing, exists := bestRuns[job.ContestantID]

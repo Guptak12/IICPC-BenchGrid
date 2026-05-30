@@ -438,6 +438,27 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 
 			status := strings.ToLower(ack.Status)
 			if isFillStatus(status) {
+				sendTime, ok := removePending(ack.OrderID)
+				if ok {
+					latency := receivedAt - sendTime
+					latencyCh <- latResult{latencyNs: latency}
+
+					if producer != nil {
+						producer.PublishAckAsync(telemetry.AckEvent{
+							Type:            telemetry.EventOrderAck,
+							JobID:           jobID,
+							WorkerID:        workerID,
+							BotID:           b.config.StringID,
+							OrderID:         ack.OrderID,
+							Status:          "accepted_and_filled",
+							LatencyNs:       latency,
+							ReceivedNs:      receivedAt,
+							EngineSeqID:     ack.EngineSeqID,
+							EngineLatencyNs: ack.ProcessingNs,
+						})
+					}
+				}
+
 				if producer != nil {
 					producer.PublishFillAsync(telemetry.FillEvent{
 						Type:        telemetry.EventFill,

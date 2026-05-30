@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -40,16 +41,25 @@ func TestRunBotDoesNotCountFillFramesAsAcks(t *testing.T) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
 
-		for i := 1; i <= 2; i++ {
-			_, _, err := conn.Read(ctx)
+		for i := 1; i <= 3; i++ {
+			_, payload, err := conn.Read(ctx)
 			if err != nil {
 				t.Errorf("read order %d failed: %v", i, err)
 				return
 			}
 			received.Add(1)
 
-			orderID := int64(1<<32) | int64(i)
-			ack := fmt.Sprintf(`{"order_id":%d,"status":"accepted","engine_seq_id":%d}`, orderID, i)
+			var msg OrderMessage
+			if err := json.Unmarshal(payload, &msg); err != nil {
+				t.Errorf("unmarshal order %d failed: %v", i, err)
+				return
+			}
+
+			status := "accepted"
+			if i == 3 {
+				status = "cancelled"
+			}
+			ack := fmt.Sprintf(`{"order_id":%d,"status":"%s","engine_seq_id":%d}`, msg.OrderID, status, i)
 			if err := conn.Write(ctx, websocket.MessageText, []byte(ack)); err != nil {
 				t.Errorf("write ack %d failed: %v", i, err)
 				return
@@ -69,7 +79,7 @@ func TestRunBotDoesNotCountFillFramesAsAcks(t *testing.T) {
 	defer server.Close()
 
 	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
-	cfg := NewBotConfig(1, "bot-1", MarketMaker, 100.0, 0.10, 2, 1000.0,42)
+	cfg := NewBotConfig(1, "bot-1", MarketMaker, 100.0, 0.10, 3, 1000.0, 42)
 	var totalSent atomic.Int64
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -85,7 +95,7 @@ func TestRunBotDoesNotCountFillFramesAsAcks(t *testing.T) {
 	if totalSent.Load() != 2 {
 		t.Fatalf("expected totalSent 2, got %d", totalSent.Load())
 	}
-	if received.Load() != 2 {
-		t.Fatalf("expected server to receive 2 orders, got %d", received.Load())
+	if received.Load() != 3 {
+		t.Fatalf("expected server to receive 3 orders, got %d", received.Load())
 	}
 }
