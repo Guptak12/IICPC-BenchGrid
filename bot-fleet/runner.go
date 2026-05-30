@@ -475,6 +475,7 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 					Status:      ack.Status,
 					LatencyNs:   latency,
 					EngineSeqID: ack.EngineSeqID,
+					EngineLatencyNs: ack.ProcessingNs,
 				})
 			}
 		}

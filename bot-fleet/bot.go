@@ -53,6 +53,7 @@ type OrderAck struct {
 	FilledPrice int64  `json:"filled_price,omitempty"`
 	MatchedWith int64  `json:"matched_with,omitempty"`
 	EngineSeqID int64  `json:"engine_seq_id,omitempty"`
+	ProcessingNs int64  `json:"processing_ns"`
 }
 
 // BotConfig -> holds everything a bot needs to know before it starts

@@ -43,6 +43,7 @@ type AckEvent struct {
 	LatencyNs   int64     `json:"latency_ns"`
 	ReceivedNs  int64     `json:"received_at_ns"`
 	EngineSeqID int64     `json:"engine_seq_id"`
+	EngineLatencyNs int64     `json:"engine_latency_ns"`
 }
 
 // FillEvent published by worker when contestant reports a fill
