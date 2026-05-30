@@ -7,10 +7,17 @@ import (
 	"log"
 	"sync"
 	"time"
-
+	"sort"
 	hdr "github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/guptak12/bot-fleet/shadow"
 	"github.com/twmb/franz-go/pkg/kgo"
+)
+
+const (
+    // If the buffer holds this many events ahead of the expected seq ID,
+    // assume the missing event was dropped by the contestant's engine.
+    // Advancing avoids unbounded memory growth and infinite quiet-period loops.
+    jitterGapThreshold = 100
 )
 
 // TelemetryResult is what the consumer produces after a job completes
@@ -75,6 +82,7 @@ func (c *Consumer) Consume(ctx context.Context) (*TelemetryResult, error) {
 		c.mu.Unlock()
 
 		if allDone && time.Since(lastMessage) > quietPeriod {
+			c.flushRemainingBuffer() // drain anything stuck behinf a gap
 			log.Printf("[telemetry] quiet period elapsed — finalising\n")
 			break
 		}
@@ -166,7 +174,16 @@ func (c *Consumer) drainJitterBuffer() {
 	for {
 		event, ok := c.jitterBuffer[c.nextSeqID]
 		if !ok {
-			break // Missing the next sequence ID, wait for it to arrive
+			 // Gap detected — check if buffer has grown past the threshold.
+            // If so, the missing seq ID was almost certainly dropped, not delayed.
+            // Advance past it so we don't stall forever.
+            if len(c.jitterBuffer) >= jitterGapThreshold {
+                log.Printf("[telemetry] seq gap at %d (buffer=%d) — advancing past dropped event\n",
+                    c.nextSeqID, len(c.jitterBuffer))
+                c.nextSeqID++
+                continue // try the next ID immediately
+            }
+            break // buffer is small — event is just delayed, wait for it
 		}
 		delete(c.jitterBuffer, c.nextSeqID)
 
@@ -186,4 +203,41 @@ func (c *Consumer) drainJitterBuffer() {
 
 func (c *Consumer) Close() {
 	c.client.Close()
+}
+
+// flushRemainingBuffer processes whatever is left in the jitter buffer after
+// the quiet period fires. Events are processed in sequence order.
+// Any remaining gaps are skipped — the missing events count against correctness.
+func (c *Consumer) flushRemainingBuffer() {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+
+    if len(c.jitterBuffer) == 0 {
+        return
+    }
+
+    log.Printf("[telemetry] flushing %d remaining buffered events on quiet period\n",
+        len(c.jitterBuffer))
+
+    // Sort remaining seq IDs — process in order so validator sees
+    // events as close to engine-sequence order as possible
+    seqIDs := make([]int64, 0, len(c.jitterBuffer))
+    for id := range c.jitterBuffer {
+        seqIDs = append(seqIDs, id)
+    }
+    sort.Slice(seqIDs, func(i, j int) bool { return seqIDs[i] < seqIDs[j] })
+
+    for _, id := range seqIDs {
+        event := c.jitterBuffer[id]
+        delete(c.jitterBuffer, id)
+        switch e := event.(type) {
+        case AckEvent:
+            c.hist.RecordValue(e.LatencyNs)
+            c.orderCount++
+            c.validator.ProcessAck(e.OrderID, e.Status)
+        case FillEvent:
+            c.fillCount++
+            c.validator.ProcessFill(e.OrderID, e.FilledQty, e.FilledPrice, e.MatchedWith)
+        }
+    }
 }

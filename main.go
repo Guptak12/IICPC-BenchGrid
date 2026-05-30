@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"time"
 	"net/http"
+	"strconv"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
@@ -327,17 +328,22 @@ func handleSubmission(c fiber.Ctx) error {
 		// Trigger Master Node
 		jobID, err := triggerOfficialRun(bID, cID, endpoint)
 		if err != nil {
-			log.Printf("[job:%s] auto-trigger failed: %v\n", bID[:8], err)
-		} else {
-			log.Printf("[job:%s] official exam triggered for %s (JobID: %s)\n", bID[:8], cID, jobID)
-			
-			// Safely save the JobID for the shell script to poll
-			buildStoreMu.Lock()
-			if b, ok := buildStore[bID]; ok {
-				b.JobID = jobID
-			}
-			buildStoreMu.Unlock()
+			// Trigger failed — container will never be used. Clean up immediately.
+    		log.Printf("[job:%s] auto-trigger failed: %v — cleaning up sandbox now\n", bID[:8], err)
+    		cleanupSandbox(containerID, hostDir)
+    return
 		}
+		
+		log.Printf("[job:%s] official exam triggered for %s (JobID: %s)\n", bID[:8], cID, jobID)
+			
+		buildStoreMu.Lock()
+		if b, ok := buildStore[bID]; ok {
+			b.JobID = jobID
+		}
+		buildStoreMu.Unlock()
+
+	// Launch the cleanup watcher — runs independently until job completes
+	go watchAndCleanup(jobID, containerID, hostDir)
 
 	}(buildID, contestantID, absHostSubmitDir)
 
@@ -566,7 +572,8 @@ func ensureNetwork(ctx context.Context) error {
     // Check if network already exists
     _, err := dockerClient.NetworkInspect(ctx, net.name, client.NetworkInspectOptions{})
 	if err == nil {
-		return nil // Network already exists
+		log.Printf("Network '%s' already exists ✓\n", net.name)
+            continue // ← was return nil — that skipped the second network entirely
 	}
     // 2. If the error is anything OTHER than "Not Found", panic
 	if client.IsErrConnectionFailed(err) {
@@ -646,10 +653,12 @@ func triggerOfficialRun(buildID, contestantID, endpoint string) (string, error) 
 	payload := map[string]interface{}{
 		"contestant_id":  contestantID,
 		"endpoint":       endpoint,
-		"num_bots":       500,
-		"orders_per_bot": 1000,
-		"rate_per_sec":   100.0,
-		"seed":           42424242,
+		 // All values read from env — production defaults baked in,
+        // overridable for local testing without touching code
+        "num_bots":       getEnvInt("EXAM_NUM_BOTS", 500),
+        "orders_per_bot": getEnvInt("EXAM_ORDERS_PER_BOT", 1000),
+        "rate_per_sec":   getEnvFloat("EXAM_RATE_PER_SEC", 100.0),
+        "seed":           getEnvInt64("EXAM_SEED", 42424242),
 		"mid_price":      100.0,
 		"spread":         0.10,
 		"strategy_mix": map[string]float64{
@@ -682,4 +691,103 @@ func triggerOfficialRun(buildID, contestantID, endpoint string) (string, error) 
 		return "", err
 	}
 	return result.JobID, nil
+}
+
+// cleanupSandbox stops the container, removes it, and deletes the submission dir.
+// Safe to call multiple times — Docker and os.RemoveAll are both idempotent.
+func cleanupSandbox(containerID, hostDir string) {
+    ctx := context.Background()
+    dockerClient.ContainerStop(ctx, containerID, client.ContainerStopOptions{})
+    dockerClient.ContainerRemove(ctx, containerID, client.ContainerRemoveOptions{Force: true})
+
+    activeSandboxesMu.Lock()
+    delete(activeSandboxes, containerID)
+    activeSandboxesMu.Unlock()
+
+    os.RemoveAll(hostDir)
+    log.Printf("[gc] removed container %s and submission dir\n", containerID[:12])
+}
+
+// pollJobStatus asks the master for the current status of a job.
+// Returns "" on any error so the caller retries next tick.
+func pollJobStatus(jobID string) string {
+    c := &http.Client{Timeout: 5 * time.Second}
+    resp, err := c.Get(masterAddr() + "/status/" + jobID)
+    if err != nil {
+        return ""
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != http.StatusOK {
+        return ""
+    }
+
+    var job struct {
+        Status string `json:"status"`
+    }
+    if err := json.NewDecoder(resp.Body).Decode(&job); err != nil {
+        return ""
+    }
+    return job.Status
+}
+
+// watchAndCleanup polls the master every 15 seconds until the job reaches a
+// terminal state, then tears down the sandbox container and submission dir.
+// A hard 20-minute deadline ensures cleanup happens even if the master dies.
+func watchAndCleanup(jobID, containerID, hostDir string) {
+    ticker  := time.NewTicker(15 * time.Second)
+    deadline := time.NewTimer(20 * time.Minute)
+    defer ticker.Stop()
+    defer deadline.Stop()
+
+    for {
+        select {
+        case <-deadline.C:
+            log.Printf("[gc] job %s hit 20m deadline — forcing cleanup\n", jobID[:8])
+            cleanupSandbox(containerID, hostDir)
+            return
+
+        case <-ticker.C:
+            status := pollJobStatus(jobID)
+            switch status {
+            case "completed", "aborted":
+                log.Printf("[gc] job %s finished (%s) — cleaning up sandbox\n", jobID[:8], status)
+                cleanupSandbox(containerID, hostDir)
+                return
+            case "":
+                // Master unreachable — log and retry next tick
+                log.Printf("[gc] job %s: master unreachable, will retry\n", jobID[:8])
+            default:
+                // "pending" or "running" — still active, keep polling
+            }
+        }
+    }
+}
+
+// helper functions — add these near the top of main.go
+func getEnvInt(key string, fallback int) int {
+    if v := os.Getenv(key); v != "" {
+        if n, err := strconv.Atoi(v); err == nil {
+            return n
+        }
+    }
+    return fallback
+}
+
+func getEnvFloat(key string, fallback float64) float64 {
+    if v := os.Getenv(key); v != "" {
+        if f, err := strconv.ParseFloat(v, 64); err == nil {
+            return f
+        }
+    }
+    return fallback
+}
+
+func getEnvInt64(key string, fallback int64) int64 {
+    if v := os.Getenv(key); v != "" {
+        if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+            return n
+        }
+    }
+    return fallback
 }
