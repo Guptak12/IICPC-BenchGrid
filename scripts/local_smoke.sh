@@ -8,12 +8,18 @@ NETWORK_NAME="${NETWORK_NAME:-iicpc-net}"
 SANDBOX_IMAGE="${SANDBOX_IMAGE:-iicpc-sandbox:v1}"
 BOT_IMAGE="${BOT_IMAGE:-bot-fleet:v1}"
 PAYLOAD="${PAYLOAD:-test_payloads/main.cpp}"
-NUM_BOTS="${NUM_BOTS:-6}"
-ORDERS_PER_BOT="${ORDERS_PER_BOT:-20}"
-RATE_PER_SEC="${RATE_PER_SEC:-20}"
+
+# ── Exam config — kept tiny so a laptop can run this in ~30 seconds ──────────
+export EXAM_NUM_BOTS="${EXAM_NUM_BOTS:-5}"
+export EXAM_ORDERS_PER_BOT="${EXAM_ORDERS_PER_BOT:-20}"
+export EXAM_RATE_PER_SEC="${EXAM_RATE_PER_SEC:-10}"
+export EXAM_SEED="${EXAM_SEED:-42424242}"
 MARKET_MAKER_PCT="${MARKET_MAKER_PCT:-1.0}"
 MOMENTUM_PCT="${MOMENTUM_PCT:-0.0}"
 NOISE_PCT="${NOISE_PCT:-0.0}"
+echo "Smoke config: ${EXAM_NUM_BOTS} bots × ${EXAM_ORDERS_PER_BOT} orders @ ${EXAM_RATE_PER_SEC}/s"
+
+# ── Networks ──────────────────────────────────────────────────────────────────
 
 # 1. Create the standard bridge network for the infrastructure
 if ! docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
@@ -39,7 +45,17 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 
-docker exec redpanda rpk topic create order-events fill-events --brokers localhost:9092 >/dev/null 2>&1 || true
+docker exec redpanda rpk topic create order-events \
+  --brokers localhost:9092 \
+  --partitions 3 \
+  --replicas 1 \
+  >/dev/null 2>&1 || true
+
+docker exec redpanda rpk topic create fill-events \
+  --brokers localhost:9092 \
+  --partitions 3 \
+  --replicas 1 \
+  >/dev/null 2>&1 || true
 
 docker compose -f docker-compose.workers.yml up -d --force-recreate redis worker-1 worker-2 worker-3 master
 

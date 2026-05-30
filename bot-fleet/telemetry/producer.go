@@ -29,6 +29,10 @@ func NewProducer(brokers []string, jobID string) (*Producer, error) {
         // If Kafka is unavailable, buffer up to 100k records in memory
         // before dropping (graceful degradation)
         kgo.MaxBufferedRecords(100_000),
+        // Batch records for up to 20ms before flushing.
+        // Reduces per-record overhead at high throughput.
+        // 20ms is imperceptible to humans but 10-20x better batch efficiency.
+        kgo.ProducerLinger(20 * time.Millisecond),
     )
     if err != nil {
         return nil, fmt.Errorf("kafka producer init failed: %v", err)

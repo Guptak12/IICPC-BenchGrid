@@ -418,6 +418,10 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 
 		for {
 			_, ackBytes, err := conn.Read(ctx)
+			 // Record receive time immediately — before ANY processing.
+			// This is what we're actually measuring: time from send to wire arrival.
+			// JSON parse time is our overhead, not the contestant's.
+			receivedAt := time.Now().UnixNano()
 			if err != nil {
 				failAllPending()
 				if isTerminalError(err) || isContextError(err) {
@@ -425,7 +429,7 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 				}
 				continue
 			}
-			lastReportNs.Store(time.Now().UnixNano())
+			lastReportNs.Store(receivedAt)
 
 			var ack OrderAck
 			if err := gojson.Unmarshal(ackBytes, &ack); err != nil {
@@ -458,7 +462,7 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 				continue
 			}
 
-			latency := time.Now().UnixNano() - sendTime
+			latency := receivedAt- sendTime
 			latencyCh <- latResult{latencyNs: latency}
 
 			if producer != nil {

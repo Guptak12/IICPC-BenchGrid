@@ -5,7 +5,7 @@ services:
     command:
       - redpanda
       - start
-      - --smp 1                          # Point E: pin to 1 CPU
+      - --smp 2                          # Point E: pin to 1 CPU
       - --memory 400M
       - --reserve-memory 0M                 # Point E: hard memory cap
       - --overprovisioned
@@ -16,7 +16,7 @@ services:
     networks:
       - iicpc-net
     mem_limit: 512m                       # Point E: Docker-level enforcement
-    cpus: 1.0
+    cpus: 2.0
 
 networks:
   iicpc-net:

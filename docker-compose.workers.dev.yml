@@ -1,0 +1,60 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --appendfsync everysec
+    networks:
+      - iicpc-net
+    volumes:
+      - redis_data:/data
+
+  redpanda:
+    image: redpandadata/redpanda:v23.3.11
+    container_name: redpanda
+    command:
+      - redpanda
+      - start
+      - --smp 1
+      - --memory 200M          # reduced from 400M
+      - --reserve-memory 0M
+      - --overprovisioned
+      - --kafka-addr PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr PLAINTEXT://redpanda:9092
+    ports:
+      - "9092:9092"
+    networks:
+      - iicpc-net
+    mem_limit: 256m            # reduced from 512m
+    cpus: 0.5                  # reduced from 1.0
+
+  worker-1:
+    image: bot-fleet:v1
+    command: ["-mode=worker", "-port=5001"]
+    ports:
+      - "5001:5001"
+    environment:
+      - KAFKA_BROKERS=redpanda:9092
+      - REDIS_ADDR=redis:6379
+    networks:
+      - iicpc-net
+      - sandbox-net
+
+  master:
+    image: bot-fleet:v1
+    command: ["-mode=master"]
+    ports:
+      - "4000:4000"
+    environment:
+      - KAFKA_BROKERS=redpanda:9092
+      - REDIS_ADDR=redis:6379
+      - WORKERS=worker-1:5001  # single worker for dev
+    networks:
+      - iicpc-net
+
+volumes:
+  redis_data:
+
+networks:
+  iicpc-net:
+    external: true
+  sandbox-net:
+    external: true

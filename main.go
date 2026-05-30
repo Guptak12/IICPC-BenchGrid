@@ -462,6 +462,21 @@ func handleStop(c fiber.Ctx) error {
 func createContainer(ctx context.Context, cmd []string, hostSubmitDir string, containerName string) (string, error) {
 	pidsLimit := int64(2048) // Increased to support high concurrency testing
 
+	isRuntime := containerName != ""
+	 // Threat 1 fix: runtime containers get read-only mount.
+    // Compile containers need write access to produce the /usr/src/app binary.
+    bind := fmt.Sprintf("%s:/usr/src:ro", hostSubmitDir)
+    if !isRuntime {
+        bind = fmt.Sprintf("%s:/usr/src", hostSubmitDir)
+    }
+
+    // Threat 2 fix: runtime containers get seccomp profile blocking
+    // fork/exec syscalls. Compile containers are exempt — g++ needs them.
+    securityOpts := []string{"no-new-privileges"}
+    if isRuntime {
+        securityOpts = append(securityOpts, "seccomp="+sandboxSeccompProfile)
+    }
+
 	config := &container.Config{
 		Image: SandboxImage,
 		Cmd:   cmd,
@@ -473,14 +488,14 @@ func createContainer(ctx context.Context, cmd []string, hostSubmitDir string, co
 
 
 	hostConfig := &container.HostConfig{
-		Binds: []string{fmt.Sprintf("%s:/usr/src", hostSubmitDir)},
+		Binds: []string{bind},
 		Resources: container.Resources{
 			Memory:    256 * 1024 * 1024,
 			NanoCPUs:  int64(1 * 1e9),
 			PidsLimit: &pidsLimit,
 		},
 		CapDrop:      []string{"ALL"},
-		SecurityOpt:  []string{"no-new-privileges"},
+		SecurityOpt:  securityOpts,
 	}
 
 	// Attach to sandbox network
