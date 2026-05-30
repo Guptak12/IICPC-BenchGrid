@@ -452,6 +452,16 @@ func (v *Validator) GetCorrectnessScore() float64 {
 	return score
 }
 
+// priorityMatchedQty checks that fills arrived in the EXACT sequence the shadow
+// book produced them: same qty, same price, same counterparty.
+//
+// FIX: removed the `actual.MatchedWith != 0` escape hatch.
+// Previously an engine could send matched_with:0 to bypass the counterparty
+// check and still score a full priority match. Now:
+//   - If the validator expected a counterparty, the engine MUST report it.
+//   - matched_with:0 is only accepted when the expected counterparty is also 0
+//     (which never happens in practice — every fill has a real counterparty).
+
 func (v *Validator) priorityMatchedQty(expectedList []Fill, actualList []Fill) int64 {
 	var matched int64
 	for i, expected := range expectedList {
@@ -464,10 +474,13 @@ func (v *Validator) priorityMatchedQty(expectedList []Fill, actualList []Fill) i
 			v.priorityViolations++
 			continue
 		}
-		if actual.MatchedWith != 0 && actual.MatchedWith != expected.MatchedWith {
-			v.priorityViolations++
-			continue
-		}
+		// Counterparty must match exactly.
+        // Zero is NOT a wildcard — every real fill has a counterparty order ID.
+        if actual.MatchedWith != expected.MatchedWith {
+            v.priorityViolations++
+            continue
+        }
+
 		matched += expected.FilledQty
 	}
 	if len(actualList) > len(expectedList) {

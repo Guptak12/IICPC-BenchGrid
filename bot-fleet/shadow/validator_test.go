@@ -273,3 +273,49 @@ func TestValidatorSelfCrossMixedLevelMatchesOtherBot(t *testing.T) {
 		t.Errorf("Expected 100.0 for mixed-level self-cross skip, got %f", score)
 	}
 }
+
+// TestValidatorMatchedWithZeroBypass ensures engines cannot skip the
+// counterparty check by reporting matched_with:0.
+// Before the fix this scored 100.0 — it should score < 100.0.
+func TestValidatorMatchedWithZeroBypass(t *testing.T) {
+    v := NewValidator()
+
+    v.ProcessOrder(1, "LIMIT", "BUY", 100, 10)
+    v.ProcessAck(1, "accepted")
+    v.ProcessOrder(2, "LIMIT", "SELL", 100, 10)
+    v.ProcessAck(2, "accepted")
+
+    // Correct fills would be: order 1 matched_with 2, order 2 matched_with 1.
+    // Cheating engine sends matched_with:0 to skip the counterparty check.
+    v.ProcessFill(1, 10, 100, 0) // ← zero bypass attempt
+    v.ProcessFill(2, 10, 100, 0) // ← zero bypass attempt
+
+    score := v.GetCorrectnessScore()
+    if score >= 100.0 {
+        t.Errorf("matched_with:0 bypass must not score 100.0, got %.2f", score)
+    }
+}
+
+// TestValidatorMatchedWithWrongCounterparty ensures a fill with the right
+// qty and price but wrong counterparty is penalised on priority score.
+func TestValidatorMatchedWithWrongCounterparty(t *testing.T) {
+    v := NewValidator()
+
+    // Three orders: buy 1 rests, buy 2 rests, sell crosses buy 1 (best time priority)
+    v.ProcessOrder(1, "LIMIT", "BUY", 100, 10)
+    v.ProcessAck(1, "accepted")
+    v.ProcessOrder(2, "LIMIT", "BUY", 100, 10)
+    v.ProcessAck(2, "accepted")
+    v.ProcessOrder(3, "LIMIT", "SELL", 100, 10)
+    v.ProcessAck(3, "accepted")
+
+    // Correct: sell fills against order 1 (arrived first = time priority).
+    // Cheating engine fills against order 2 instead — same price, wrong counterparty.
+    v.ProcessFill(3, 10, 100, 2)  // should be matched_with:1
+    v.ProcessFill(2, 10, 100, 3)  // should be order 1 filled, not order 2
+
+    score := v.GetCorrectnessScore()
+    if score >= 100.0 {
+        t.Errorf("wrong counterparty must not score 100.0, got %.2f", score)
+    }
+}
