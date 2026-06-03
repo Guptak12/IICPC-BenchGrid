@@ -4,148 +4,149 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-NETWORK_NAME="${NETWORK_NAME:-iicpc-net}"
-SANDBOX_IMAGE="${SANDBOX_IMAGE:-iicpc-sandbox:v1}"
-BOT_IMAGE="${BOT_IMAGE:-bot-fleet:v1}"
-PAYLOAD="${PAYLOAD:-test_payloads/main.cpp}"
+export DOCKER_HOST="unix:///var/run/docker.sock"
 
-# ── Exam config — kept tiny so a laptop can run this in ~30 seconds ──────────
-export EXAM_NUM_BOTS="${EXAM_NUM_BOTS:-5}"
-export EXAM_ORDERS_PER_BOT="${EXAM_ORDERS_PER_BOT:-20}"
-export EXAM_RATE_PER_SEC="${EXAM_RATE_PER_SEC:-10}"
-export EXAM_SEED="${EXAM_SEED:-42424242}"
-MARKET_MAKER_PCT="${MARKET_MAKER_PCT:-1.0}"
-MOMENTUM_PCT="${MOMENTUM_PCT:-0.0}"
-NOISE_PCT="${NOISE_PCT:-0.0}"
-echo "Smoke config: ${EXAM_NUM_BOTS} bots × ${EXAM_ORDERS_PER_BOT} orders @ ${EXAM_RATE_PER_SEC}/s"
-
-# ── Networks ──────────────────────────────────────────────────────────────────
-
-# 1. Create the standard bridge network for the infrastructure
-if ! docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
-  docker network create "$NETWORK_NAME" >/dev/null
-  echo "Created network: $NETWORK_NAME"
+# Ensure standard networks exist
+if ! docker network inspect iicpc-net >/dev/null 2>&1; then
+  docker network create iicpc-net
+  echo "Created network: iicpc-net"
 fi
-
-# 2. Create the airgapped internal network for the contestant sandboxes
 if ! docker network inspect sandbox-net >/dev/null 2>&1; then
-  docker network create --internal sandbox-net >/dev/null
+  docker network create --internal sandbox-net
   echo "Created network: sandbox-net"
 fi
 
-docker build -f Dockerfile.sandbox -t "$SANDBOX_IMAGE" .
-docker build -f bot-fleet/Dockerfile.botfleet -t "$BOT_IMAGE" bot-fleet
+SANDBOX_IMAGE="${SANDBOX_IMAGE:-iicpc-sandbox:v1}"
+PAYLOAD="${PAYLOAD:-test_payloads/main.cpp}"
 
-docker compose -f docker-compose.yml up -d redpanda
+echo "=== 1. Skipping sandbox image build (pre-built) ==="
+# docker build -f Dockerfile.sandbox -t "$SANDBOX_IMAGE" .
 
-for _ in $(seq 1 60); do
-  if docker exec redpanda rpk topic list --brokers localhost:9092 >/dev/null 2>&1; then
-    break
+echo "=== 2. Skipping infrastructure startup (already running) ==="
+# docker compose up -d postgres redis || true
+
+# Autodetect running Postgres and Redis container names
+POSTGRES_CONTAINER=$(docker ps --filter name=postgres --format "{{.Names}}" | head -n 1)
+REDIS_CONTAINER=$(docker ps --filter name=redis --format "{{.Names}}" | head -n 1)
+
+if [ -z "$POSTGRES_CONTAINER" ]; then
+  echo "Error: Postgres container is not running"
+  exit 1
+fi
+echo "Detected Postgres container: $POSTGRES_CONTAINER"
+echo "Detected Redis container: $REDIS_CONTAINER"
+
+echo "=== 3. Waiting for Postgres and Redis to be healthy ==="
+for _ in {1..30}; do
+  if docker exec "$POSTGRES_CONTAINER" pg_isready -U iicpc -d iicpc_db >/dev/null 2>&1; then
+    if docker exec "$REDIS_CONTAINER" redis-cli ping >/dev/null 2>&1; then
+      break
+    fi
   fi
   sleep 1
 done
 
-docker exec redpanda rpk topic create order-events \
-  --brokers localhost:9092 \
-  --partitions 3 \
-  --replicas 1 \
-  >/dev/null 2>&1 || true
+# Initialize PostgreSQL Schema
+echo "=== 4. Running PostgreSQL Migrations ==="
+docker exec -i "$POSTGRES_CONTAINER" psql -U iicpc -d iicpc_db < migrations/001_submissions.sql
+docker exec -i "$POSTGRES_CONTAINER" psql -U iicpc -d iicpc_db < migrations/002_add_source_code.sql
 
-docker exec redpanda rpk topic create fill-events \
-  --brokers localhost:9092 \
-  --partitions 3 \
-  --replicas 1 \
-  >/dev/null 2>&1 || true
+# Pre-create and open submissions folder to guarantee write access for compiler container
+mkdir -p submissions
+chmod 777 submissions
 
-docker compose -f docker-compose.workers.yml up -d --force-recreate redis worker-1 worker-2 worker-3 master
+echo "=== 5. Starting Platform Microservices ==="
+export REDIS_ADDR="127.0.0.1:6379"
+export DB_ADDR="postgres://iicpc:iicpc_secret@127.0.0.1:5432/iicpc_db?sslmode=disable"
+export SANDBOX_NET="host"
 
-ORCH_LOG="${ORCH_LOG:-/tmp/iicpc-orchestrator.log}"
-GOCACHE="${GOCACHE:-/tmp/go-build-iicpc-local}"
-export GOCACHE
-
-export MASTER_ADDR="http://127.0.0.1:4000"
-
-go run . >"$ORCH_LOG" 2>&1 &
-ORCH_PID=$!
+# Clean up background jobs on exit
+PIDS=()
 cleanup() {
-  kill "$ORCH_PID" >/dev/null 2>&1 || true
+  echo "=== Cleaning up services ==="
+  for pid in "${PIDS[@]}"; do
+    kill "$pid" >/dev/null 2>&1 || true
+  done
+  # docker compose down
 }
 trap cleanup EXIT
 
-for _ in $(seq 1 60); do
+# Run decoupled microservices
+go run services/gateway/*.go > /tmp/gateway.log 2>&1 &
+PIDS+=($!)
+
+go run services/compiler/*.go > /tmp/compiler.log 2>&1 &
+PIDS+=($!)
+
+go run services/pretest/*.go > /tmp/pretest.log 2>&1 &
+PIDS+=($!)
+
+go run services/leaderboard/*.go > /tmp/leaderboard.log 2>&1 &
+PIDS+=($!)
+
+# Wait for gateway to start
+echo "=== Waiting for Submission Gateway to listen on port 3000 ==="
+for _ in {1..30}; do
   if curl -fsS http://localhost:3000/api/v1/builds >/dev/null 2>&1; then
     break
   fi
   sleep 1
 done
 
-# --- CORRECTED CURL SYNTAX ---
+echo "=== 6. Submitting Contestant Code ==="
 SUBMIT_RESPONSE="$(curl -fsS -X POST \
   -F "source_code=@${PAYLOAD}" \
-  -F "contestant_id=kush-gupta-02" \
+  -F "contestant_id=smoke-contestant-$(date +%s)" \
   http://localhost:3000/api/v1/submit)"
 
+echo "Submit Response: $SUBMIT_RESPONSE"
 BUILD_ID="$(printf '%s' "$SUBMIT_RESPONSE" | sed -n 's/.*"build_id":"\([^"]*\)".*/\1/p')"
 
 if [ -z "$BUILD_ID" ]; then
-  echo "Could not parse build_id from: $SUBMIT_RESPONSE" >&2
+  echo "Failed to extract build_id from submission response"
   exit 1
 fi
-echo "Build ID: $BUILD_ID"
+echo "Submission ID: $BUILD_ID"
 
-ENDPOINT=""
-JOB_ID=""
-
-# Wait for the build to finish AND the Master to assign a Job ID
-for _ in $(seq 1 90); do
+echo "=== 7. Polling Submission Lifecycle Status ==="
+FINAL_STATUS=""
+for _ in {1..60}; do
   BUILD_STATUS="$(curl -fsS "http://localhost:3000/api/v1/build/${BUILD_ID}")"
   STATUS="$(printf '%s' "$BUILD_STATUS" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')"
+  VERDICT="$(printf '%s' "$BUILD_STATUS" | sed -n 's/.*"verdict":"\([^"]*\)".*/\1/p')"
+  SCORE="$(printf '%s' "$BUILD_STATUS" | sed -n 's/.*"composite_score":\([^,}]*\).*/\1/p')"
   
-  if [ "$STATUS" = "running" ]; then
-    ENDPOINT="$(printf '%s' "$BUILD_STATUS" | sed -n 's/.*"endpoint":"\([^"]*\)".*/\1/p')"
-    JOB_ID="$(printf '%s' "$BUILD_STATUS" | sed -n 's/.*"job_id":"\([^"]*\)".*/\1/p')"
-    
-    # Wait a fraction of a second for the async auto-trigger to populate the job_id
-    if [ -n "$JOB_ID" ]; then
-      break
-    fi
-  fi
-  if [ "$STATUS" = "failed" ]; then
-    echo "Build Failed: $BUILD_STATUS" >&2
-    exit 1
-  fi
-  sleep 1
-done
-
-if [ -z "$ENDPOINT" ] || [ -z "$JOB_ID" ]; then
-  echo "Sandbox did not reach running state or failed to trigger master. Orchestrator log: $ORCH_LOG" >&2
-  exit 1
-fi
-echo "Sandbox endpoint: $ENDPOINT"
-echo "Job ID: $JOB_ID"
-
-FINAL_STATUS=""
-# Track the exact job on the Master node (Restores fast-fail on aborted jobs!)
-for _ in $(seq 1 120); do
-  JOB_STATUS="$(curl -fsS "http://127.0.0.1:4000/status/${JOB_ID}")"
-  STATUS="$(printf '%s' "$JOB_STATUS" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')"
+  echo "Current status: $STATUS | Verdict: $VERDICT | Score: ${SCORE:-0.0}"
   
-  if [ "$STATUS" = "completed" ] || [ "$STATUS" = "aborted" ]; then
+  if [ "$STATUS" = "completed" ]; then
     FINAL_STATUS="$STATUS"
-    printf '%s\n' "$JOB_STATUS" | python3 -m json.tool
+    echo "=== SUCCESS: Submission completed execution! ==="
+    printf '%s\n' "$BUILD_STATUS" | python3 -m json.tool || echo "$BUILD_STATUS"
     break
   fi
+  
+  if [ "$STATUS" = "failed" ]; then
+    echo "=== ERROR: Compilation/Execution Failed! ==="
+    printf '%s\n' "$BUILD_STATUS" | python3 -m json.tool || echo "$BUILD_STATUS"
+    exit 1
+  fi
+  
   sleep 1
 done
 
 if [ -z "$FINAL_STATUS" ]; then
-  echo "Job did not finish before timeout. Last status:" >&2
-  printf '%s\n' "${JOB_STATUS:-<none>}" >&2
+  echo "Timeout waiting for submission to compile and execute"
   exit 1
 fi
 
-if [ "$FINAL_STATUS" != "completed" ]; then
+echo "=== 8. Checking Leaderboard Static JSON ==="
+sleep 3 # wait for next periodic leaderboard generation tick
+if [ -f "frontend/leaderboard.json" ]; then
+  echo "Leaderboard generated successfully! Content:"
+  cat "frontend/leaderboard.json"
+else
+  echo "Error: static leaderboard.json was not generated"
   exit 1
 fi
 
-
+echo "=== SMOKE TEST PASSED SUCCESSFULLY! ==="

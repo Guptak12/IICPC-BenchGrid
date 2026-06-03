@@ -1,0 +1,93 @@
+[
+  {
+    "rank": 1,
+    "contestant_id": "systest-contestant-1780475559",
+    "submission_id": "d84c673d-8246-41a8-b5fe-b8bf162c8edc",
+    "verdict": "Completed",
+    "composite_score": 80,
+    "correctness_score": 100,
+    "p50_us": 21069,
+    "p90_us": 37925,
+    "p99_us": 42139,
+    "actual_tps": 50,
+    "updated_at": "2026-06-03T08:32:46.233113Z"
+  },
+  {
+    "rank": 2,
+    "contestant_id": "smoke-contestant-1780479139",
+    "submission_id": "d155ac14-ab85-40f0-add4-4bf751f3d398",
+    "verdict": "Partial — Latency",
+    "composite_score": 70,
+    "correctness_score": 100,
+    "p50_us": 19922,
+    "p90_us": 35860,
+    "p99_us": 39845,
+    "actual_tps": 50,
+    "updated_at": "2026-06-03T09:32:26.187877Z"
+  },
+  {
+    "rank": 3,
+    "contestant_id": "smoke-contestant-1780479950",
+    "submission_id": "dd49c5c3-425e-4757-9656-730bd193d6ed",
+    "verdict": "Partial — Latency",
+    "composite_score": 70,
+    "correctness_score": 100,
+    "p50_us": 10469,
+    "p90_us": 18844,
+    "p99_us": 20938,
+    "actual_tps": 50,
+    "updated_at": "2026-06-03T09:45:57.691345Z"
+  },
+  {
+    "rank": 4,
+    "contestant_id": "smoke-contestant-1780480051",
+    "submission_id": "a3893d42-9791-4afc-af0b-35b496e5da4d",
+    "verdict": "Partial — Latency",
+    "composite_score": 70,
+    "correctness_score": 100,
+    "p50_us": 10543,
+    "p90_us": 18977,
+    "p99_us": 21086,
+    "actual_tps": 50,
+    "updated_at": "2026-06-03T09:47:38.307885Z"
+  },
+  {
+    "rank": 5,
+    "contestant_id": "optimus_prime",
+    "submission_id": "ffbd8525-637f-4514-be92-a54c97600946",
+    "verdict": "Partial — Latency",
+    "composite_score": 70,
+    "correctness_score": 100,
+    "p50_us": 20299,
+    "p90_us": 36539,
+    "p99_us": 40599,
+    "actual_tps": 58.33,
+    "updated_at": "2026-06-03T10:39:44.875243Z"
+  },
+  {
+    "rank": 6,
+    "contestant_id": "smoke-contestant-1780479874",
+    "submission_id": "7d0c973e-928c-4712-85d4-c6015a04a636",
+    "verdict": "Wrong Answer",
+    "composite_score": 60,
+    "correctness_score": 0,
+    "p50_us": 1,
+    "p90_us": 2,
+    "p99_us": 3,
+    "actual_tps": 50,
+    "updated_at": "2026-06-03T09:44:40.34336Z"
+  },
+  {
+    "rank": 7,
+    "contestant_id": "smoke-contestant-1780480007",
+    "submission_id": "81fa3268-ed85-4bb9-8ee2-cc764fc5aa8d",
+    "verdict": "Throughput Exceeded",
+    "composite_score": -57.5,
+    "correctness_score": 100,
+    "p50_us": 0,
+    "p90_us": 0,
+    "p99_us": 0,
+    "actual_tps": 0,
+    "updated_at": "2026-06-03T09:46:52.98741Z"
+  }
+]

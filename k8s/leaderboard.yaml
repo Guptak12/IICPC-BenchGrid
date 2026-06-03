@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: leaderboard-generator
+  namespace: default
+  labels:
+    app: leaderboard-generator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: leaderboard-generator
+  template:
+    metadata:
+      labels:
+        app: leaderboard-generator
+    spec:
+      containers:
+      - name: leaderboard
+        image: iicpc-leaderboard:latest
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: DB_ADDR
+          value: "postgres://iicpc:iicpc_secret@postgres:5432/iicpc_db?sslmode=disable"
+        - name: FRONTEND_DIR
+          value: "/app/data"
+        volumeMounts:
+        - name: public-html
+          mountPath: /app/data
+        resources:
+          limits:
+            cpu: "250m"
+            memory: 128Mi
+          requests:
+            cpu: "100m"
+            memory: 64Mi
+      volumes:
+      - name: public-html
+        persistentVolumeClaim:
+          claimName: public-html-pvc

@@ -1,0 +1,36 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: iicpc-migration-job
+  namespace: default
+spec:
+  template:
+    spec:
+      containers:
+      - name: migration
+        image: postgres:15-alpine
+        imagePullPolicy: IfNotPresent
+        command:
+        - sh
+        - -c
+        - |
+          export PGPASSWORD=iicpc_secret
+          echo "Connecting to PostgreSQL at host postgres..."
+          until pg_isready -h postgres -U iicpc -d iicpc_db; do
+            echo "Waiting for postgres to be ready..."
+            sleep 2
+          done
+          echo "Running migration scripts..."
+          for f in $(ls /migrations/*.sql | sort); do
+            echo "Applying migration: $f"
+            psql -h postgres -U iicpc -d iicpc_db -f "$f"
+          done
+        volumeMounts:
+        - name: migration-volume
+          mountPath: /migrations
+      volumes:
+      - name: migration-volume
+        configMap:
+          name: migrations-config
+      restartPolicy: OnFailure
+  backoffLimit: 5

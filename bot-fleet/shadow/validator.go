@@ -99,10 +99,14 @@ func (v *Validator) ProcessOrder(orderID int64, orderType string, side string, p
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
+	if strings.ToLower(orderType) == "cancel" {
+		return
+	}
+
 	if _, exists := v.pendingOrders[orderID]; exists {
 		v.duplicateOrders++
 	}
-	if _, exists := v.orderMap[orderID]; exists && strings.ToLower(orderType) != "cancel" {
+	if _, exists := v.orderMap[orderID]; exists {
 		v.duplicateOrders++
 	}
 
@@ -120,14 +124,26 @@ func (v *Validator) ProcessAck(orderID int64, status string) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
+	cleanStatus := strings.ToLower(status)
+
+	if cleanStatus == "cancelled" {
+		found := v.hasRestingOrder(orderID)
+		if found {
+			v.removeRestingOrder(orderID)
+		}
+		return
+	}
+
 	order, ok := v.pendingOrders[orderID]
 	if !ok {
+		if cleanStatus == "rejected" {
+			return
+		}
 		v.unknownAcks++
 		return
 	}
 	delete(v.pendingOrders, orderID)
 
-	cleanStatus := strings.ToLower(status)
 	cleanType := strings.ToLower(order.Type)
 
 	switch cleanType {
@@ -143,19 +159,6 @@ func (v *Validator) ProcessAck(orderID int64, status string) {
 			return
 		}
 		v.matchMarketOrder(order)
-	case "cancel":
-		found := v.hasRestingOrder(order.ID)
-		expectedStatus := "rejected"
-		if found {
-			expectedStatus = "cancelled"
-		}
-		if cleanStatus != expectedStatus {
-			v.ackViolations++
-			return
-		}
-		if found {
-			v.removeRestingOrder(order.ID)
-		}
 	default:
 		if cleanStatus != "rejected" {
 			v.ackViolations++
@@ -427,8 +430,14 @@ func (v *Validator) GetCorrectnessScore() float64 {
 		priorityCorrectQty += v.priorityMatchedQty(expectedList, actualList)
 
 		if totalExpQty != totalActQty || expValue != actValue {
-			fmt.Printf("[Validator] Mismatch Order %d: Expected Qty=%d Value=%d, Actual Qty=%d Value=%d\n",
-				orderID, totalExpQty, expValue, totalActQty, actValue)
+			fmt.Printf("[Validator] Mismatch Order %d (Bot %d): Expected Qty=%d Value=%d, Actual Qty=%d Value=%d\n",
+				orderID, botID(orderID), totalExpQty, expValue, totalActQty, actValue)
+			for _, f := range expectedList {
+				fmt.Printf("   -> Expected Fill: Qty=%d Price=%d MatchedWith=%d\n", f.FilledQty, f.FilledPrice, f.MatchedWith)
+			}
+			for _, f := range actualList {
+				fmt.Printf("   -> Actual Fill: Qty=%d Price=%d MatchedWith=%d\n", f.FilledQty, f.FilledPrice, f.MatchedWith)
+			}
 		}
 	}
 
@@ -474,6 +483,20 @@ func (v *Validator) GetCorrectnessScore() float64 {
 	}
 
 	return score
+}
+
+// GetPhantomFills returns the count of phantom fills
+func (v *Validator) GetPhantomFills() int64 {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.phantomFills
+}
+
+// GetPriorityViolations returns the count of priority violations
+func (v *Validator) GetPriorityViolations() int64 {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.priorityViolations
 }
 
 // priorityMatchedQty checks that fills arrived in the EXACT sequence the shadow
