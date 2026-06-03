@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-export DOCKER_HOST="unix:///var/run/docker.sock"
+export DOCKER_HOST="${DOCKER_HOST:-unix:///var/run/docker.sock}"
 
 # Ensure standard networks exist
 if ! docker network inspect iicpc-net >/dev/null 2>&1; then
