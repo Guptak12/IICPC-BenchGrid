@@ -380,9 +380,11 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 			seq := msg.OrderID & 0xFFFFFFFF
 			b.RecordSendTime(seq)
 
-			pendingMu.Lock()
-			pendingAcks[msg.OrderID] = b.SendTimes[seq]
-			pendingMu.Unlock()
+			if msg.Type != Cancel {
+				pendingMu.Lock()
+				pendingAcks[msg.OrderID] = b.SendTimes[seq]
+				pendingMu.Unlock()
+			}
 
 			if err := conn.Write(ctx, websocket.MessageText, payload); err != nil {
 				removePending(msg.OrderID)

@@ -79,7 +79,7 @@ func TestRunBotDoesNotCountFillFramesAsAcks(t *testing.T) {
 	defer server.Close()
 
 	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
-	cfg := NewBotConfig(1, "bot-1", MarketMaker, 100.0, 0.10, 3, 1000.0, 42)
+	cfg := NewBotConfig(1, "bot-1", StrategyType("PROGRESS_BASED"), 100.0, 0.10, 3, 1000.0, 42)
 	var totalSent atomic.Int64
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

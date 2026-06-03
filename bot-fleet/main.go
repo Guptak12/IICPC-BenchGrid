@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -20,6 +21,8 @@ import (
 	"github.com/guptak12/bot-fleet/telemetry"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
+
+	_ "github.com/lib/pq"
 )
 
 // LeaderboardEntry is what the frontend receives
@@ -115,15 +118,16 @@ func replaceJob(newJob *Job) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 type FleetConfig struct {
+	JobID          string    `json:"job_id,omitempty"`
 	ContestantID   string    `json:"contestant_id"`
-	Endpoint     string      `json:"endpoint"`
-	NumBots      int         `json:"num_bots"`
-	OrdersPerBot int         `json:"orders_per_bot"`
-	MidPrice     float64     `json:"mid_price"`
-	Spread       float64     `json:"spread"`
-	RatePerSec   float64     `json:"rate_per_sec"`
-	StrategyMix  StrategyMix `json:"strategy_mix"`
-	Seed		 int64       `json:"seed"` // seed for deterministic bot generation
+	Endpoint       string    `json:"endpoint"`
+	NumBots        int       `json:"num_bots"`
+	OrdersPerBot   int       `json:"orders_per_bot"`
+	MidPrice       float64   `json:"mid_price"`
+	Spread         float64   `json:"spread"`
+	RatePerSec     float64   `json:"rate_per_sec"`
+	StrategyMix    StrategyMix `json:"strategy_mix"`
+	Seed           int64     `json:"seed"` // seed for deterministic bot generation
 }
 
 type StrategyMix struct {
@@ -246,15 +250,20 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("==== MASTER RECEIVED ID: '%s' ====", cfg.ContestantID)
 
+	jobID := cfg.JobID
+	if jobID == "" {
+		jobID = uuid.New().String()
+	}
+
 	// Fix 2: context.Background() — fleet outlives the HTTP request
 	jobCtx, jobCancel := context.WithTimeout(context.Background(), 15*time.Minute)
 
 	job := &Job{
-		ID:        uuid.New().String(),
+		ID:           jobID,
 		ContestantID: cfg.ContestantID,
-		Status:    JobPending,
-		StartedAt: time.Now(),
-		cancel:    jobCancel,
+		Status:       JobPending,
+		StartedAt:    time.Now(),
+		cancel:       jobCancel,
 	}
 	replaceJob(job)
 
@@ -361,6 +370,74 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
         completedJob.EndedAt = &now
         completedJob.Report = report
         replaceJob(&completedJob)
+
+        // Persist official system test results to PostgreSQL database
+        dbAddr := os.Getenv("DB_ADDR")
+        if dbAddr == "" {
+            dbAddr = "postgres://postgres:postgres@postgres:5432/postgres?sslmode=disable"
+        }
+        db, err := sql.Open("postgres", dbAddr)
+        if err == nil {
+            defer db.Close()
+            
+            // Calculate latencyScore based on P99Us
+            latencyScore := 0.0
+            if report.P99Us <= 500.0 {
+                latencyScore = 100.0
+            } else if report.P99Us >= 5000.0 {
+                latencyScore = 0.0
+            } else {
+                latencyScore = 100.0 * (1.0 - (report.P99Us-500.0)/4500.0)
+            }
+
+            failRate := 0.0
+            if report.OrdersSent > 0 {
+                failRate = float64(report.OrdersFailed) / float64(report.OrdersSent)
+            }
+            throughputScore := (1.0 - failRate) * 100.0
+
+            compositeScore := (throughputScore * 0.3) + (latencyScore * 0.3) + (report.CorrectnessScore * 0.4)
+            compositeScore = math.Round(compositeScore*100) / 100
+
+            // Deduce verdict based on correctness/latency/failures
+            verdict := "Accepted"
+            if report.CorrectnessScore < 50.0 {
+                verdict = "Wrong Answer"
+            } else if report.P99Us > 50000.0 {
+                verdict = "Time Limit Exceeded"
+            } else if failRate > 0.3 {
+                verdict = "Throughput Exceeded"
+            }
+
+            diag := map[string]interface{}{
+                "correctness":          report.CorrectnessScore,
+                "p50_us":              report.P50Us,
+                "p90_us":              report.P90Us,
+                "p99_us":              report.P99Us,
+                "orders_sent":         report.OrdersSent,
+                "orders_failed":       report.OrdersFailed,
+                "tps":                 report.TPS,
+                "throughput_score":    throughputScore,
+                "latency_score":       latencyScore,
+            }
+            diagBytes, _ := json.Marshal(diag)
+
+            _, err = db.Exec(
+                `UPDATE submissions 
+                 SET status = $1, verdict = $2, composite_score = $3, correctness_score = $4,
+                     p50_us = $5, p90_us = $6, p99_us = $7, actual_tps = $8, diagnostics = $9, updated_at = NOW()
+                 WHERE id = $10`,
+                "completed", verdict, compositeScore, report.CorrectnessScore,
+                int64(report.P50Us), int64(report.P90Us), int64(report.P99Us), report.TPS, diagBytes, job.ID,
+            )
+            if err != nil {
+                log.Printf("[master] Failed to save official results for job %s to DB: %v\n", job.ID, err)
+            } else {
+                log.Printf("[master] Successfully persisted official results for job %s to DB ✓\n", job.ID)
+            }
+        } else {
+            log.Printf("[master] Failed to connect to DB to save results: %v\n", err)
+        }
         
         jobCancel()
 	}()

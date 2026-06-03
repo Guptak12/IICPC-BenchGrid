@@ -107,14 +107,27 @@ func (b *Bot) NextOrder() OrderMessage {
 		return OrderMessage{BotID: b.config.StringID, OrderID: orderID, Type: Limit, Side: Buy, Price: 1, Quantity: 1}
 	}
 
+	switch b.config.Strategy {
+	case MarketMaker:
+		return b.marketMakerOrder(orderID, seq)
+	case MomentumTrader:
+		return b.momentumOrder(orderID, seq)
+	case NoiseTrader:
+		return b.noiseOrder(orderID, seq)
+	default:
+		return b.progressBasedOrder(orderID, seq)
+	}
+}
+
+func (b *Bot) progressBasedOrder(orderID, seq int64) OrderMessage {
 	progress := float64(b.ordersSent) / float64(b.config.OrdersToSend)
 
 	if progress < 0.60 {
 		side := Buy
-		price := b.config.MidPrice -1- int64(b.rng.Intn(10))
+		price := b.config.MidPrice - 1 - int64(b.rng.Intn(10))
 		if b.rng.Intn(2) == 0 {
 			side = Sell
-			price = b.config.MidPrice +1+ int64(b.rng.Intn(10))
+			price = b.config.MidPrice + 1 + int64(b.rng.Intn(10))
 		}
 
 		b.activeOrders = append(b.activeOrders, orderID)
