@@ -174,9 +174,9 @@ docker compose up -d
 ### 2. Running database migrations
 Apply database schema:
 ```bash
-docker compose run --rm migrator
+docker exec -i iicpc-postgres psql -U iicpc -d iicpc_db < migrations/001_submissions.sql
+docker exec -i iicpc-postgres psql -U iicpc -d iicpc_db < migrations/002_add_source_code.sql
 ```
-*(Or use scripts that automatically apply migrations on start)*
 
 ### 3. Local Smoke Test Verification
 Runs the local smoke pipeline, compiles the matching engine, runs pretest validations, and outputs scores:

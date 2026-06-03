@@ -2,7 +2,7 @@ name: iicpc
 
 services:
   redpanda:
-    image: redpandadata/redpanda:v23.3.11
+    image: redpandadata/redpanda:v23.3.14
     container_name: iicpc-redpanda
     command:
       - redpanda
