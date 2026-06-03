@@ -47,6 +47,7 @@ services:
       - KAFKA_BROKERS=redpanda:9092
       - REDIS_ADDR=redis:6379
       - WORKERS=worker-1:5001  # single worker for dev
+      - DB_ADDR=postgres://iicpc:iicpc_secret@postgres:5432/iicpc_db?sslmode=disable
     networks:
       - iicpc-net
 

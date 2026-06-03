@@ -1,0 +1,13 @@
+FROM alpine:3.18
+RUN apk --no-cache add ca-certificates curl
+
+WORKDIR /app
+
+ARG SERVICE
+# Copy pre-compiled binary from host
+COPY bin/${SERVICE} ./service-bin
+
+# Copy static frontend resources (needed by gateway, harmless for others)
+COPY frontend/ ./frontend/
+
+ENTRYPOINT ["./service-bin"]

@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: submission-gateway
+  namespace: default
+  labels:
+    app: submission-gateway
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: submission-gateway
+  template:
+    metadata:
+      labels:
+        app: submission-gateway
+    spec:
+      containers:
+      - name: gateway
+        image: iicpc-gateway:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 3000
+        env:
+        - name: REDIS_ADDR
+          value: "redis:6379"
+        - name: DB_ADDR
+          value: "postgres://iicpc:iicpc_secret@postgres:5432/iicpc_db?sslmode=disable"
+        - name: LEADERBOARD_JSON_PATH
+          value: "/app/data/leaderboard.json"
+        volumeMounts:
+        - name: public-html
+          mountPath: /app/data
+        resources:
+          limits:
+            cpu: "1"
+            memory: 512Mi
+          requests:
+            cpu: "250m"
+            memory: 256Mi
+        readinessProbe:
+          httpGet:
+            path: /api/v1/builds
+            port: 3000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /api/v1/builds
+            port: 3000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+      volumes:
+      - name: public-html
+        persistentVolumeClaim:
+          claimName: public-html-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: submission-gateway
+  namespace: default
+spec:
+  ports:
+  - port: 3000
+    targetPort: 3000
+  selector:
+    app: submission-gateway
+  type: ClusterIP

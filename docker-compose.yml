@@ -1,7 +1,9 @@
+name: iicpc
+
 services:
   redpanda:
     image: redpandadata/redpanda:v23.3.11
-    container_name: redpanda
+    container_name: iicpc-redpanda
     command:
       - redpanda
       - start
@@ -20,7 +22,7 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: redis
+    container_name: iicpc-redis
     command: redis-server --appendonly yes --appendfsync everysec
     ports:
       - "6379:6379"
@@ -31,11 +33,11 @@ services:
 
   postgres:
     image: postgres:15-alpine
-    container_name: postgres
+    container_name: iicpc-postgres
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: postgres
+      POSTGRES_USER: iicpc
+      POSTGRES_PASSWORD: iicpc_secret
+      POSTGRES_DB: iicpc_db
     ports:
       - "5432:5432"
     networks:
