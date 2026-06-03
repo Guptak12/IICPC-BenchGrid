@@ -104,11 +104,11 @@ The platform operates two grading phases: **Pretests** (instant feedback during 
 ```
 
 ### Composite Scoring Formula
-$$composite\_score = (correctness\_score \times 0.4) + (throughput\_score \times 0.3) + (latency\_score \times 0.3)$$
+$$\text{Composite Score} = (\text{Correctness Score} \times 0.4) + (\text{Throughput Score} \times 0.3) + (\text{Latency Score} \times 0.3)$$
 
 * **Correctness Score**: Calculated by an in-process Shadow Book validator that mimics the orders dispatched to the contestant engine, verifying fills, quantities, execution prices, counterparty order IDs, and priority rules.
 * **Throughput Score**: Measured based on successful transactions per second against target thresholds:
-  $$\text{throughput\_score} = \min\left(\frac{\text{actual\_tps}}{\text{target\_tps}}, 1.0\right) \times 100$$
+  $$\text{Throughput Score} = \min\left(\frac{\text{Actual TPS}}{\text{Target TPS}}, 1.0\right) \times 100$$
 * **Latency Score**: Evaluated using High-Dynamic Range (HDR) Histograms (`HdrHistogram`). Maximum score is achieved if P99 latency remains under 500 microseconds, decaying linearly to 0 at 5 milliseconds.
 
 ### Post-Contest High-Load System Tests
