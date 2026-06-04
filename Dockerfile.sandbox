@@ -9,6 +9,7 @@ libssl-dev \
 RUN mkdir /core
 COPY core/iicpc_engine.hpp /core/
 COPY core/hidden_server.cpp /core/
+RUN mkdir -p /usr/src && chmod 777 /usr/src
 WORKDIR /usr/src
 
 EXPOSE 8080

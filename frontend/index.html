@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IICPC Summer Hackathon 2026 - Live Leaderboard & Submissions</title>
+    
+    <!-- CSS Dependencies -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="style.css">
+    
+    <!-- Chart.js Dependency -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+
+    <!-- Header -->
+    <header>
+        <div class="logo-container">
+            <i class="fa-solid fa-tower-broadcast"></i>
+            <h1>IICPC Contestant Arena</h1>
+        </div>
+        <div class="system-status">
+            <div class="status-pill">
+                <div class="status-indicator status-ok" id="postgres-led"></div>
+                <span>Database</span>
+            </div>
+            <div class="status-pill">
+                <div class="status-indicator status-ok" id="redis-led"></div>
+                <span>Event Streams</span>
+            </div>
+            <div class="status-pill">
+                <i class="fa-solid fa-server" style="color: var(--accent-cyan);"></i>
+                <span id="node-count">Nodes: Active</span>
+            </div>
+            <a href="/dashboard" target="_blank" class="status-pill link-pill" style="background: rgba(138, 43, 226, 0.15); border: 1px solid rgba(138, 43, 226, 0.4); text-decoration: none; color: var(--text-primary); cursor: pointer; transition: all 0.2s; font-weight: 500;">
+                <i class="fa-solid fa-gauge-high" style="color: var(--accent-violet);"></i>
+                <span>Developer Dashboard</span>
+            </a>
+        </div>
+    </header>
+
+    <!-- Main Grid -->
+    <div class="main-layout">
+        
+        <!-- Left Side: Submission Deck & Monitor -->
+        <div style="display: flex; flex-direction: column; gap: 24px;">
+            
+            <!-- Upload Card -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title">
+                        <i class="fa-solid fa-cloud-arrow-up"></i>
+                        <span>Upload Submission</span>
+                    </div>
+                </div>
+                <form id="submission-form" onsubmit="submitEngine(event)">
+                    <div class="form-group">
+                        <label class="form-label" for="contestant-id-input">Contestant ID</label>
+                        <input class="form-control" type="text" id="contestant-id-input" placeholder="e.g. cpp_ninja_42" required autocomplete="off">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label class="form-label">Matching Engine Source (.cpp)</label>
+                        <div class="file-dropzone" id="dropzone" onclick="document.getElementById('file-input').click()">
+                            <i class="fa-solid fa-code"></i>
+                            <p>Drag and drop your matching engine C++ file here, or click to browse</p>
+                            <input type="file" id="file-input" accept=".cpp" onchange="handleFileSelect(event)">
+                            <div class="file-name-preview" id="file-name-preview"></div>
+                        </div>
+                    </div>
+                    
+                    <button class="btn btn-primary" type="submit" id="submit-btn">
+                        <i class="fa-solid fa-play"></i> Deploy & Stress Test
+                    </button>
+                </form>
+            </div>
+
+            <!-- Active Run Progress Monitor -->
+            <div class="card" id="run-monitor-card" style="display: none;">
+                <div class="card-header">
+                    <div class="card-title">
+                        <i class="fa-solid fa-spinner fa-spin" style="color: var(--accent-cyan);"></i>
+                        <span>Active Pipeline Monitor</span>
+                    </div>
+                </div>
+                <div class="submission-monitor">
+                    <div class="monitor-header">
+                        <span id="monitor-submission-id" style="font-family: var(--font-mono); font-size: 12px; color: var(--text-secondary);">ID: -</span>
+                        <div class="monitor-status" id="monitor-status-val">QUEUED</div>
+                    </div>
+                    <div class="progress-bar-container">
+                        <div class="progress-bar" id="monitor-progress-bar"></div>
+                    </div>
+                    <div class="timeline">
+                        <div class="timeline-step" id="step-queued">
+                            <div class="step-dot"><i class="fa-solid fa-list-ul"></i></div>
+                            <div class="step-label">Queued</div>
+                        </div>
+                        <div class="timeline-step" id="step-compiling">
+                            <div class="step-dot"><i class="fa-solid fa-gears"></i></div>
+                            <div class="step-label">Compiling</div>
+                        </div>
+                        <div class="timeline-step" id="step-running">
+                            <div class="step-dot"><i class="fa-solid fa-gauge-high"></i></div>
+                            <div class="step-label">Stress Testing</div>
+                        </div>
+                        <div class="timeline-step" id="step-finished">
+                            <div class="step-dot"><i class="fa-solid fa-circle-check"></i></div>
+                            <div class="step-label">Finished</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+        </div>
+
+        <!-- Right Side: Scoreboard Leaderboard -->
+        <div class="card">
+            <div class="card-header">
+                <div class="card-title">
+                    <i class="fa-solid fa-trophy" style="color: #ffd700;"></i>
+                    <span>Global Standings Scoreboard</span>
+                </div>
+            </div>
+            
+            <div class="search-bar-container">
+                <div class="search-input-wrapper">
+                    <i class="fa-solid fa-magnifying-glass"></i>
+                    <input class="form-control" type="text" id="scoreboard-search" placeholder="Search by Contestant ID..." oninput="filterScoreboard()">
+                </div>
+                <button class="btn btn-secondary" id="anonymize-btn" style="width: auto; white-space: nowrap;" onclick="toggleAnonymize()">
+                    <i class="fa-solid fa-eye"></i> Plain IDs
+                </button>
+                <button class="btn btn-secondary" style="width: auto;" onclick="fetchLeaderboard()">
+                    <i class="fa-solid fa-rotate"></i>
+                </button>
+            </div>
+
+            <div class="table-wrapper">
+                <table id="leaderboard-table">
+                    <thead>
+                        <tr>
+                            <th style="width: 85px; cursor: pointer;" onclick="setSort('rank')">Rank <span id="sort-icon-rank" class="sort-icon"><i class="fa-solid fa-sort"></i></span></th>
+                            <th style="cursor: pointer;" onclick="setSort('contestant_id')">Contestant ID <span id="sort-icon-contestant_id" class="sort-icon"></span></th>
+                            <th style="cursor: pointer;" onclick="setSort('verdict')">Verdict <span id="sort-icon-verdict" class="sort-icon"></span></th>
+                            <th style="text-align: right; cursor: pointer;" onclick="setSort('composite_score')">Composite Score <span id="sort-icon-composite_score" class="sort-icon"></span></th>
+                            <th style="text-align: right; cursor: pointer;" onclick="setSort('correctness_score')">Correctness <span id="sort-icon-correctness_score" class="sort-icon"></span></th>
+                            <th style="text-align: right; cursor: pointer;" onclick="setSort('p99_us')">P99 Latency <span id="sort-icon-p99_us" class="sort-icon"></span></th>
+                            <th style="text-align: right; cursor: pointer;" onclick="setSort('actual_tps')">Throughput (TPS) <span id="sort-icon-actual_tps" class="sort-icon"></span></th>
+                        </tr>
+                    </thead>
+                    <tbody id="leaderboard-tbody">
+                        <tr>
+                            <td colspan="7" style="text-align: center; color: var(--text-secondary);">Loading scoreboard data...</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Telemetry Slide-out Drawer -->
+    <div class="drawer-backdrop" id="drawer-backdrop" onclick="closeDrawer()"></div>
+    <div class="drawer" id="drawer">
+        <div class="drawer-header">
+            <h3 id="drawer-title">Submission Diagnostics</h3>
+            <button class="drawer-close" onclick="closeDrawer()"><i class="fa-solid fa-xmark"></i></button>
+        </div>
+        
+        <div class="drawer-content">
+            <!-- Performance Summary -->
+            <div>
+                <div class="drawer-section-title">Performance Summary</div>
+                <div class="analytics-grid">
+                    <div class="metric-card">
+                        <i class="fa-solid fa-circle-check fa-lg metric-correctness"></i>
+                        <div class="value metric-correctness" id="val-correctness">0.0%</div>
+                        <div class="label">Correctness</div>
+                    </div>
+                    <div class="metric-card">
+                        <i class="fa-solid fa-bolt fa-lg metric-latency"></i>
+                        <div class="value metric-latency" id="val-latency">0 µs</div>
+                        <div class="label">P99 Latency</div>
+                    </div>
+                    <div class="metric-card">
+                        <i class="fa-solid fa-arrow-trend-up fa-lg metric-throughput"></i>
+                        <div class="value metric-throughput" id="val-throughput">0 TPS</div>
+                        <div class="label">Throughput</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Radar Chart & Stability Analysis (AlphaForgeBench & PolyBench Visualizer) -->
+            <div class="chart-card">
+                <div class="drawer-section-title" style="margin-bottom: 8px;">Multi-Dimensional Analysis & Stability</div>
+                <div style="display: flex; gap: 12px; align-items: center; justify-content: center; margin-bottom: 12px;">
+                    <div class="metric-card" style="flex: 1; min-width: 0; padding: 10px;">
+                        <i class="fa-solid fa-chart-line" style="color: var(--accent-violet);"></i>
+                        <div class="value" id="val-stability-dev" style="color: var(--accent-violet); font-size: 16px;">0.00</div>
+                        <div class="label" style="font-size: 10px;">Stability Std Dev</div>
+                    </div>
+                    <div class="metric-card" style="flex: 1; min-width: 0; padding: 10px;">
+                        <i class="fa-solid fa-award" style="color: var(--accent-orange);"></i>
+                        <div class="value" id="val-stability-bonus" style="color: var(--accent-orange); font-size: 16px;">+0</div>
+                        <div class="label" style="font-size: 10px;">Stability Bonus</div>
+                    </div>
+                </div>
+                <div class="chart-wrapper" style="position: relative; height: 260px;">
+                    <canvas id="radarChart"></canvas>
+                </div>
+            </div>
+
+            <!-- Run Metadata Details -->
+            <div>
+                <div class="drawer-section-title">Run Telemetry Metadata</div>
+                <div class="meta-rows">
+                    <div class="meta-row"><span class="label">Submission ID</span><span class="value" id="det-sub-id">-</span></div>
+                    <div class="meta-row"><span class="label">Contestant ID</span><span class="value" id="det-contestant-id">-</span></div>
+                    <div class="meta-row"><span class="label">Execution Verdict</span><span class="value" id="det-verdict-badge">-</span></div>
+                    <div class="meta-row"><span class="label">Sandbox Host CPU/Cores</span><span class="value" id="det-cores">-</span></div>
+                    <div class="meta-row"><span class="label">Memory Alloc limit</span><span class="value" id="det-mem">-</span></div>
+                    <div class="meta-row"><span class="label">Time Completed</span><span class="value" id="det-completed-at">-</span></div>
+                </div>
+            </div>
+
+            <!-- Latency Comparative Curve Chart -->
+            <div class="chart-card">
+                <div class="drawer-section-title" style="margin-bottom: 8px;">Latency Percentiles vs SLA Limit</div>
+                <div class="chart-wrapper">
+                    <canvas id="latencyChart"></canvas>
+                </div>
+            </div>
+
+            <!-- Throughput Volatility Chart -->
+            <div class="chart-card">
+                <div class="drawer-section-title" style="margin-bottom: 8px;">Throughput Volatility</div>
+                <div class="chart-wrapper">
+                    <canvas id="tpsChart"></canvas>
+                </div>
+            </div>
+
+            <!-- Anomaly Inspector -->
+            <div>
+                <div class="drawer-section-title">Orderbook Correctness Inspector</div>
+                <div class="inspector-table-wrapper">
+                    <table class="inspector-table">
+                        <thead>
+                            <tr>
+                                <th>Anomalies Detect</th>
+                                <th style="text-align: right;">Count</th>
+                                <th style="text-align: right;">Max SLA Limit</th>
+                                <th style="text-align: right;">Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>Price-Time Priority Violations</td>
+                                <td style="text-align: right; font-weight: 600;" id="det-priority-violations">0</td>
+                                <td style="text-align: right; color: var(--text-secondary);">0</td>
+                                <td style="text-align: right;" id="det-priority-status">-</td>
+                            </tr>
+                            <tr>
+                                <td>Phantom Fills (Unmatched trades)</td>
+                                <td style="text-align: right; font-weight: 600;" id="det-phantom-fills">0</td>
+                                <td style="text-align: right; color: var(--text-secondary);">0</td>
+                                <td style="text-align: right;" id="det-phantom-status">-</td>
+                            </tr>
+                            <tr>
+                                <td>Trade Price/Qty Discrepancies</td>
+                                <td style="text-align: right; font-weight: 600;" id="det-trade-discrepancies">0</td>
+                                <td style="text-align: right; color: var(--text-secondary);">0</td>
+                                <td style="text-align: right;" id="det-discrepancy-status">-</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Bot Strategy Mix Breakdown (PolyBench derived) -->
+            <div>
+                <div class="drawer-section-title">Bot Strategy Traffic Breakdown</div>
+                <div class="inspector-table-wrapper">
+                    <table class="inspector-table">
+                        <thead>
+                            <tr>
+                                <th>Strategy Archetype</th>
+                                <th style="text-align: right;">Orders Sent</th>
+                                <th style="text-align: right;">Orders Failed</th>
+                                <th style="text-align: right;">Avg Latency</th>
+                            </tr>
+                        </thead>
+                        <tbody id="strategy-breakdown-tbody">
+                            <!-- Populated dynamically -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Output console log -->
+            <div>
+                <div class="drawer-section-title">Evaluation Log Console</div>
+                <div class="log-console" id="log-console-box">No compile warnings or execution errors. Output clean.</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Core App Logic Javascript -->
+    <script src="app.js"></script>
+</body>
+</html>

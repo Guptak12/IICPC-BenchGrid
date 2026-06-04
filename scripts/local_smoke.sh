@@ -55,10 +55,17 @@ docker exec -i "$POSTGRES_CONTAINER" psql -U iicpc -d iicpc_db < migrations/002_
 mkdir -p submissions
 chmod 777 submissions
 
+echo "=== 5. Compiling Microservices ==="
+mkdir -p bin
+go build -o bin/gateway services/gateway/*.go
+go build -o bin/compiler services/compiler/*.go
+go build -o bin/pretest services/pretest/*.go
+go build -o bin/leaderboard services/leaderboard/*.go
+
 echo "=== 5. Starting Platform Microservices ==="
 export REDIS_ADDR="127.0.0.1:6379"
 export DB_ADDR="postgres://iicpc:iicpc_secret@127.0.0.1:5432/iicpc_db?sslmode=disable"
-export SANDBOX_NET="host"
+export SANDBOX_NET="sandbox-net"
 
 # Clean up background jobs on exit
 PIDS=()
@@ -72,16 +79,16 @@ cleanup() {
 trap cleanup EXIT
 
 # Run decoupled microservices
-go run services/gateway/*.go > /tmp/gateway.log 2>&1 &
+./bin/gateway > /tmp/gateway.log 2>&1 &
 PIDS+=($!)
 
-go run services/compiler/*.go > /tmp/compiler.log 2>&1 &
+./bin/compiler > /tmp/compiler.log 2>&1 &
 PIDS+=($!)
 
-go run services/pretest/*.go > /tmp/pretest.log 2>&1 &
+./bin/pretest > /tmp/pretest.log 2>&1 &
 PIDS+=($!)
 
-go run services/leaderboard/*.go > /tmp/leaderboard.log 2>&1 &
+./bin/leaderboard > /tmp/leaderboard.log 2>&1 &
 PIDS+=($!)
 
 # Wait for gateway to start

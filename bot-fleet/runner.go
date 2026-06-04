@@ -426,10 +426,7 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 			receivedAt := time.Now().UnixNano()
 			if err != nil {
 				failAllPending()
-				if isTerminalError(err) || isContextError(err) {
-					return
-				}
-				continue
+				return
 			}
 			lastReportNs.Store(receivedAt)
 

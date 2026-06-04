@@ -17,6 +17,7 @@ services:
     networks:
       - iicpc-net
       - sandbox-net
+    mem_limit: 150m
 
   worker-2:
     image: bot-fleet:v1
@@ -29,6 +30,7 @@ services:
     networks:
       - iicpc-net
       - sandbox-net
+    mem_limit: 150m
 
 
   worker-3:
@@ -42,6 +44,7 @@ services:
     networks:
       - iicpc-net
       - sandbox-net
+    mem_limit: 150m
 
 
   master:
@@ -56,7 +59,7 @@ services:
       - WORKERS=worker-1:5001,worker-2:5002,worker-3:5003
       - REDIS_ADDR=redis:6379
       - DB_ADDR=postgres://iicpc:iicpc_secret@postgres:5432/iicpc_db?sslmode=disable
-      #- MASTER_ADDR=http://master:4000
+    mem_limit: 150m
 
 volumes:
   redis_data:
