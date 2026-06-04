@@ -6,6 +6,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"log"
+	"os"
+	"path/filepath"
 	"time"
 
 	"iicpc-sandbox/services/common"
@@ -124,6 +126,19 @@ func processMessage(ctx context.Context, message redis.XMessage) {
 
 	// Encode compiled binary in base64
 	base64Binary := base64.StdEncoding.EncodeToString(binaryBytes)
+
+	// Write compiled binary to host filesystem for system tests / mounting
+	subDir := filepath.Join("submissions", "iicpc_"+submissionID)
+	if err := os.MkdirAll(subDir, 0755); err != nil {
+		log.Printf("[submission:%s] Failed to create submissions directory: %v\n", submissionID[:8], err)
+	} else {
+		binPath := filepath.Join(subDir, "app")
+		if err := os.WriteFile(binPath, binaryBytes, 0755); err != nil {
+			log.Printf("[submission:%s] Failed to write binary to host disk: %v\n", submissionID[:8], err)
+		} else {
+			log.Printf("[submission:%s] Saved compiled binary to %s\n", submissionID[:8], binPath)
+		}
+	}
 
 	log.Printf("[submission:%s] Compilation succeeded ✓\n", submissionID[:8])
 
