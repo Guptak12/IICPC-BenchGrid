@@ -1,4 +1,4 @@
-# IICPC 2026: Distributed Algorithmic Matching Sandbox & Evaluation Platform
+# IICPC 2026: Distributed Benchmarking and Hosting Platform
 
 An event-driven, microservice-based distributed evaluation platform designed to compile, isolate, benchmark, and score contestant-submitted C++ matching engines under high concurrency. Built to scale to 100K concurrent viewers, 5K submitters, and 50K leaderboard contestants, the platform models a real-time trading competition environment with robust security controls and high-precision telemetry.
 
