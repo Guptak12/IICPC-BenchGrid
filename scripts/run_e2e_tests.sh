@@ -4,29 +4,42 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-export DOCKER_HOST="${DOCKER_HOST:-unix:///var/run/docker.sock}"
+export PATH="/usr/local/go/bin:/opt/homebrew/bin:$PATH"
+
+if [ -z "${DOCKER_HOST:-}" ]; then
+  DETECTED_HOST=$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)
+  if [ -n "$DETECTED_HOST" ]; then
+    export DOCKER_HOST="$DETECTED_HOST"
+  else
+    export DOCKER_HOST="unix:///var/run/docker.sock"
+  fi
+fi
+echo "Using DOCKER_HOST=$DOCKER_HOST"
 
 # Verify/Create Docker networks
 if ! docker network inspect iicpc-net >/dev/null 2>&1; then
   docker network create iicpc-net
   echo "Created network: iicpc-net"
 fi
-if ! docker network inspect sandbox-net >/dev/null 2>&1; then
-  docker network create --internal sandbox-net
-  echo "Created network: sandbox-net"
-fi
+# Recreate sandbox network without --internal for local host-to-container routing
+docker network rm sandbox-net >/dev/null 2>&1 || true
+docker network create sandbox-net
+echo "Created network: sandbox-net"
 
 SANDBOX_IMAGE="iicpc-sandbox:v1"
+RUNTIME_IMAGE="iicpc-runtime-sandbox:v1"
 
-echo "=== 1. Building/Verifying Contestant Sandbox Image ==="
+echo "=== 1. Building/Verifying Contestant Sandbox Images ==="
 docker build -f Dockerfile.sandbox -t "$SANDBOX_IMAGE" .
+docker build -f Dockerfile.runtime-sandbox -t "$RUNTIME_IMAGE" .
 
-echo "=== 2. Starting Infrastructure Services (PostgreSQL + Redis) ==="
-docker compose up -d postgres redis || true
+echo "=== 2. Starting Infrastructure Services (PostgreSQL + Redis + MinIO) ==="
+docker compose up -d postgres redis minio init-db
 
 # Autodetect Postgres container
 POSTGRES_CONTAINER=$(docker ps --filter name=postgres --format "{{.Names}}" | head -n 1)
 REDIS_CONTAINER=$(docker ps --filter name=redis --format "{{.Names}}" | head -n 1)
+MINIO_CONTAINER=$(docker ps --filter name=minio --format "{{.Names}}" | head -n 1)
 if [ -z "$POSTGRES_CONTAINER" ]; then
   echo "Error: Postgres container is not running"
   exit 1
@@ -35,20 +48,26 @@ if [ -z "$REDIS_CONTAINER" ]; then
   echo "Error: Redis container is not running"
   exit 1
 fi
+if [ -z "$MINIO_CONTAINER" ]; then
+  echo "Error: MinIO container is not running"
+  exit 1
+fi
 
-echo "=== 3. Waiting for Postgres and Redis to be healthy ==="
+echo "=== 3. Waiting for Postgres, Redis and MinIO to be healthy ==="
 for _ in {1..30}; do
   if docker exec "$POSTGRES_CONTAINER" pg_isready -U iicpc -d iicpc_db >/dev/null 2>&1; then
     if docker exec "$REDIS_CONTAINER" redis-cli ping >/dev/null 2>&1; then
-      break
+      if curl -fs http://localhost:9000/minio/health/live >/dev/null 2>&1; then
+        break
+      fi
     fi
   fi
   sleep 1
 done
 
 # Run Migrations
-echo "=== 4. Running PostgreSQL Migrations ==="
-docker exec -i "$POSTGRES_CONTAINER" psql -U iicpc -d iicpc_db < migrations/001_submissions.sql
+echo "=== 4. Waiting for PostgreSQL Migrations to complete ==="
+docker wait iicpc-init-db >/dev/null || true
 
 # Set world-writable permission on submissions dir to avoid sandboxed compiler permission conflicts
 mkdir -p submissions
@@ -57,6 +76,13 @@ chmod 777 submissions
 echo "=== 5. Starting Platform Microservices in Background ==="
 export REDIS_ADDR="127.0.0.1:6379"
 export DB_ADDR="postgres://iicpc:iicpc_secret@127.0.0.1:5432/iicpc_db?sslmode=disable"
+export S3_ENDPOINT="127.0.0.1:9000"
+export S3_ACCESS_KEY="minioadmin"
+export S3_SECRET_KEY="minioadmin"
+export S3_BUCKET="submissions"
+export S3_USE_SSL="false"
+export COMPILE_IMAGE="iicpc-sandbox:v1"
+export RUNTIME_IMAGE="iicpc-runtime-sandbox:v1"
 
 # Process registry for cleanup
 PIDS=()

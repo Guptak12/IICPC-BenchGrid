@@ -1,0 +1,25 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sandbox-isolation-policy
+  namespace: default
+spec:
+  # Apply this policy to any pod labeled with app=contestant-sandbox
+  # or match all sandbox executions if run in a dedicated namespace/label
+  podSelector:
+    matchLabels:
+      app: contestant-sandbox
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # Allow inbound WebSocket traffic on port 8080 specifically originating from the bot-fleet
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: bot-fleet
+    ports:
+    - protocol: TCP
+      port: 8080
+  # Empty egress rules blocks all outbound egress traffic (Deny All)
+  egress: []

@@ -29,9 +29,10 @@ export DOCKER_HOST="unix:///var/run/docker.sock"
 export HOME="/tmp/empty-home-for-docker"
 mkdir -p "$HOME"
 
-# Build contestant sandbox image
-echo "Building sandbox image..."
+# Build contestant sandbox images
+echo "Building sandbox images..."
 docker build -f Dockerfile.sandbox -t iicpc-sandbox:v1 .
+docker build -f Dockerfile.runtime-sandbox -t iicpc-runtime-sandbox:v1 .
 
 # Build microservices
 SERVICES=("gateway" "compiler" "pretest" "leaderboard")
@@ -51,12 +52,20 @@ echo "=== 3. Loading Images into Kubernetes Cluster ==="
 if [ "$PROVIDER" = "kind" ]; then
   echo "Loading images into Kind cluster '$CLUSTER_NAME'..."
   kind load docker-image iicpc-sandbox:v1 --name "$CLUSTER_NAME"
+  kind load docker-image iicpc-runtime-sandbox:v1 --name "$CLUSTER_NAME"
   for svc in "${SERVICES[@]}"; do
     kind load docker-image "iicpc-${svc}:latest" --name "$CLUSTER_NAME"
   done
+
+  # Deploy Calico CNI for NetworkPolicy support if not already installed
+  if ! kubectl get daemonset -n kube-system calico-node >/dev/null 2>&1; then
+    echo "Calico CNI not detected on Kind cluster. Deploying Calico..."
+    kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/calico.yaml
+  fi
 elif [ "$PROVIDER" = "minikube" ]; then
   echo "Loading images into Minikube..."
   minikube image load iicpc-sandbox:v1
+  minikube image load iicpc-runtime-sandbox:v1
   for svc in "${SERVICES[@]}"; do
     minikube image load "iicpc-${svc}:latest"
   done
@@ -85,6 +94,7 @@ echo "Waiting for migration job to complete..."
 kubectl wait --for=condition=complete --timeout=60s job/iicpc-migration-job
 
 echo "=== 7. Deploying Microservice Workers and Gateway ==="
+kubectl apply -f k8s/sandbox-networkpolicy.yaml
 kubectl apply -f k8s/compiler.yaml
 kubectl apply -f k8s/pretest.yaml
 kubectl apply -f k8s/leaderboard.yaml

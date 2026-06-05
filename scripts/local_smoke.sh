@@ -4,30 +4,53 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-export DOCKER_HOST="${DOCKER_HOST:-unix:///var/run/docker.sock}"
+export PATH="/usr/local/go/bin:/opt/homebrew/bin:$PATH"
+
+if [ -z "${DOCKER_HOST:-}" ]; then
+  DETECTED_HOST=$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)
+  if [ -n "$DETECTED_HOST" ]; then
+    export DOCKER_HOST="$DETECTED_HOST"
+  else
+    export DOCKER_HOST="unix:///var/run/docker.sock"
+  fi
+fi
+echo "Using DOCKER_HOST=$DOCKER_HOST"
 
 # Ensure standard networks exist
 if ! docker network inspect iicpc-net >/dev/null 2>&1; then
   docker network create iicpc-net
   echo "Created network: iicpc-net"
 fi
-if ! docker network inspect sandbox-net >/dev/null 2>&1; then
-  docker network create --internal sandbox-net
-  echo "Created network: sandbox-net"
-fi
+# Recreate sandbox network without --internal for local host-to-container routing
+docker network rm sandbox-net >/dev/null 2>&1 || true
+docker network create sandbox-net
+echo "Created network: sandbox-net"
 
 SANDBOX_IMAGE="${SANDBOX_IMAGE:-iicpc-sandbox:v1}"
+RUNTIME_IMAGE="${RUNTIME_IMAGE:-iicpc-runtime-sandbox:v1}"
 PAYLOAD="${PAYLOAD:-test_payloads/main.cpp}"
 
-echo "=== 1. Skipping sandbox image build (pre-built) ==="
-# docker build -f Dockerfile.sandbox -t "$SANDBOX_IMAGE" .
+if ! docker image inspect "$SANDBOX_IMAGE" >/dev/null 2>&1; then
+  echo "=== 1. Sandbox image not found. Building it... ==="
+  docker build -f Dockerfile.sandbox -t "$SANDBOX_IMAGE" .
+else
+  echo "=== 1. Sandbox image found. Skipping build ==="
+fi
 
-echo "=== 2. Skipping infrastructure startup (already running) ==="
-# docker compose up -d postgres redis || true
+if ! docker image inspect "$RUNTIME_IMAGE" >/dev/null 2>&1; then
+  echo "=== 1. Runtime sandbox image not found. Building it... ==="
+  docker build -f Dockerfile.runtime-sandbox -t "$RUNTIME_IMAGE" .
+else
+  echo "=== 1. Runtime sandbox image found. Skipping build ==="
+fi
 
-# Autodetect running Postgres and Redis container names
+echo "=== 2. Starting Infrastructure Services (PostgreSQL + Redis + MinIO) ==="
+docker compose up -d postgres redis minio init-db
+
+# Autodetect running Postgres, Redis and MinIO container names
 POSTGRES_CONTAINER=$(docker ps --filter name=postgres --format "{{.Names}}" | head -n 1)
 REDIS_CONTAINER=$(docker ps --filter name=redis --format "{{.Names}}" | head -n 1)
+MINIO_CONTAINER=$(docker ps --filter name=minio --format "{{.Names}}" | head -n 1)
 
 if [ -z "$POSTGRES_CONTAINER" ]; then
   echo "Error: Postgres container is not running"
@@ -35,21 +58,23 @@ if [ -z "$POSTGRES_CONTAINER" ]; then
 fi
 echo "Detected Postgres container: $POSTGRES_CONTAINER"
 echo "Detected Redis container: $REDIS_CONTAINER"
+echo "Detected MinIO container: $MINIO_CONTAINER"
 
-echo "=== 3. Waiting for Postgres and Redis to be healthy ==="
+echo "=== 3. Waiting for Postgres, Redis and MinIO to be healthy ==="
 for _ in {1..30}; do
   if docker exec "$POSTGRES_CONTAINER" pg_isready -U iicpc -d iicpc_db >/dev/null 2>&1; then
     if docker exec "$REDIS_CONTAINER" redis-cli ping >/dev/null 2>&1; then
-      break
+      if curl -fs http://localhost:9000/minio/health/live >/dev/null 2>&1; then
+        break
+      fi
     fi
   fi
   sleep 1
 done
 
 # Initialize PostgreSQL Schema
-echo "=== 4. Running PostgreSQL Migrations ==="
-docker exec -i "$POSTGRES_CONTAINER" psql -U iicpc -d iicpc_db < migrations/001_submissions.sql
-docker exec -i "$POSTGRES_CONTAINER" psql -U iicpc -d iicpc_db < migrations/002_add_source_code.sql
+echo "=== 4. Waiting for PostgreSQL Migrations to complete ==="
+docker wait iicpc-init-db >/dev/null || true
 
 # Pre-create and open submissions folder to guarantee write access for compiler container
 mkdir -p submissions
@@ -66,6 +91,13 @@ echo "=== 5. Starting Platform Microservices ==="
 export REDIS_ADDR="127.0.0.1:6379"
 export DB_ADDR="postgres://iicpc:iicpc_secret@127.0.0.1:5432/iicpc_db?sslmode=disable"
 export SANDBOX_NET="sandbox-net"
+export S3_ENDPOINT="127.0.0.1:9000"
+export S3_ACCESS_KEY="minioadmin"
+export S3_SECRET_KEY="minioadmin"
+export S3_BUCKET="submissions"
+export S3_USE_SSL="false"
+export COMPILE_IMAGE="iicpc-sandbox:v1"
+export RUNTIME_IMAGE="iicpc-runtime-sandbox:v1"
 
 # Clean up background jobs on exit
 PIDS=()
