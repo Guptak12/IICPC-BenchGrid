@@ -2,6 +2,8 @@ package main
 
 import (
 	"math"
+
+	"iicpc-sandbox/pkg/scoring"
 )
 
 // StrategyMetrics holds per-strategy performance tracking
@@ -111,24 +113,9 @@ func EvaluateVerdict(res PretestResults) (string, float64, map[string]interface{
 	}
 
 	// --- Calculate Scores ---
-	// Throughput score: linear to successful processed orders percentage
-	throughputScore := (1.0 - failRate) * 100.0
-
-	// Latency score: 100 if P99 <= 500us, linear decay to 0 at P99 = 5ms (5000us)
-	latencyScore := 0.0
-	if res.P99Us <= 500 {
-		latencyScore = 100.0
-	} else if res.P99Us >= 5000 {
-		latencyScore = 0.0
-	} else {
-		// Linear decay between 500us and 5000us
-		latencyScore = 100.0 * (1.0 - float64(res.P99Us-500)/4500.0)
-	}
-
-	// Standard Composite Score Formula:
-	// composite_score = (throughput_score * 0.3) + (latency_score * 0.3) + (correctness_score * 0.4)
-	compositeScore := (throughputScore * 0.3) + (latencyScore * 0.3) + (res.Correctness * 0.4)
-	compositeScore = math.Round(compositeScore*100) / 100 // round to 2 decimal places
+	throughputScore := scoring.ThroughputScore(failRate)
+	latencyScore := scoring.LatencyScore(float64(res.P99Us))
+	compositeScore := scoring.CompositeScore(res.Correctness, latencyScore, throughputScore)
 
 	diagnostics["warnings"] = warnings
 	diagnostics["throughput_score"] = math.Round(throughputScore*100) / 100

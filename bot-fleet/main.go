@@ -7,11 +7,9 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"math"
 	"net"
 	"net/http"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +19,8 @@ import (
 	"github.com/guptak12/bot-fleet/telemetry"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
+
+	"iicpc-sandbox/pkg/scoring"
 
 	_ "github.com/lib/pq"
 )
@@ -74,6 +74,7 @@ var (
 )
 
 var rdb *redis.Client
+var db *sql.DB
 
 // getJob returns the current Job pointer — caller gets a stable snapshot
 func getJob(id string) (*Job, bool) {
@@ -101,15 +102,6 @@ func replaceJob(newJob *Job) {
                 log.Printf("[redis] replaceJob write failed: %v\n", err)
             }
         }
-    }
-
-	// Broadcast leaderboard update to all SSE subscribers when a job finishes
-    if newJob.Status == JobCompleted {
-        go func() {
-            if payload, err := buildLeaderboardJSON(); err == nil {
-                hub.broadcast(payload)
-            }
-        }()
     }
 }
 
@@ -188,22 +180,20 @@ func runWorkerMode(port int) {
 }
 
 func runMasterMode() {
-    // Read worker addresses from env
-    if w := os.Getenv("WORKERS"); w != "" {
-        masterCfg.WorkerAddresses = strings.Split(w, ",")
-    }
+	// Read worker addresses from env
+	if w := os.Getenv("WORKERS"); w != "" {
+		masterCfg.WorkerAddresses = strings.Split(w, ",")
+	}
 
 	initRedis()
 	rehydrateFromRedis()
+	initDB()
 
-
-    // existing HTTP server setup
+	// existing HTTP server setup
 	mux := http.NewServeMux()
 	mux.HandleFunc("/run",     handleRun)
 	mux.HandleFunc("/status/", handleStatus)
 	mux.HandleFunc("/cancel/", handleCancel)
-	mux.HandleFunc("/leaderboard",        handleLeaderboard)
-	mux.HandleFunc("/leaderboard/stream", handleLeaderboardStream)
 	mux.HandleFunc("/health",  func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
@@ -218,6 +208,31 @@ func runMasterMode() {
 
 	log.Println("Bot fleet service running on :4000")
 	log.Fatal(server.ListenAndServe())
+}
+
+func initDB() {
+	dbAddr := os.Getenv("DB_ADDR")
+	if dbAddr == "" {
+		dbAddr = "postgres://iicpc:iicpc_secret@localhost:5432/iicpc_db?sslmode=disable"
+	}
+	var err error
+	db, err = sql.Open("postgres", dbAddr)
+	if err != nil {
+		log.Printf("[db] connection failed: %v — running without DB persistence\n", err)
+		db = nil
+		return
+	}
+	db.SetMaxOpenConns(5)
+	db.SetMaxIdleConns(3)
+	db.SetConnMaxLifetime(30 * time.Minute)
+	db.SetConnMaxIdleTime(5 * time.Minute)
+
+	if err := db.Ping(); err != nil {
+		log.Printf("[db] ping failed: %v — running without DB persistence\n", err)
+		db = nil
+		return
+	}
+	log.Printf("[db] connected with pool (maxOpen=5, maxIdle=3) ✓\n")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -371,33 +386,15 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
         completedJob.Report = report
         replaceJob(&completedJob)
 
-        // Persist official system test results to PostgreSQL database
-        dbAddr := os.Getenv("DB_ADDR")
-        if dbAddr == "" {
-            dbAddr = "postgres://postgres:postgres@postgres:5432/postgres?sslmode=disable"
-        }
-        db, err := sql.Open("postgres", dbAddr)
-        if err == nil {
-            defer db.Close()
-            
-            // Calculate latencyScore based on P99Us
-            latencyScore := 0.0
-            if report.P99Us <= 500.0 {
-                latencyScore = 100.0
-            } else if report.P99Us >= 5000.0 {
-                latencyScore = 0.0
-            } else {
-                latencyScore = 100.0 * (1.0 - (report.P99Us-500.0)/4500.0)
-            }
-
+        // Persist official system test results to PostgreSQL database using shared connection pool
+        if db != nil {
             failRate := 0.0
             if report.OrdersSent > 0 {
                 failRate = float64(report.OrdersFailed) / float64(report.OrdersSent)
             }
-            throughputScore := (1.0 - failRate) * 100.0
-
-            compositeScore := (throughputScore * 0.3) + (latencyScore * 0.3) + (report.CorrectnessScore * 0.4)
-            compositeScore = math.Round(compositeScore*100) / 100
+            latencyScore := scoring.LatencyScore(report.P99Us)
+            throughputScore := scoring.ThroughputScore(failRate)
+            compositeScore := scoring.CompositeScore(report.CorrectnessScore, latencyScore, throughputScore)
 
             // Deduce verdict based on correctness/latency/failures
             verdict := "Accepted"
@@ -422,7 +419,7 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
             }
             diagBytes, _ := json.Marshal(diag)
 
-            _, err = db.Exec(
+            _, err := db.ExecContext(context.Background(),
                 `UPDATE submissions 
                  SET status = $1, verdict = $2, composite_score = $3, correctness_score = $4,
                      p50_us = $5, p90_us = $6, p99_us = $7, actual_tps = $8, diagnostics = $9, updated_at = NOW()
@@ -435,8 +432,6 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
             } else {
                 log.Printf("[master] Successfully persisted official results for job %s to DB ✓\n", job.ID)
             }
-        } else {
-            log.Printf("[master] Failed to connect to DB to save results: %v\n", err)
         }
         
         jobCancel()
@@ -660,173 +655,5 @@ func rehydrateFromRedis() {
     log.Printf("[redis] rehydrated %d jobs (%d zombies sanitized)\n", rehydrated, zombies)
 }
 
-// calculatePerfScore: 100% at ≤500µs, 0% at ≥5ms, linear decay between
-func calculatePerfScore(p99Us float64) float64 {
-    const targetUs  = 500.0
-    const penaltyUs = 5000.0
-    if p99Us <= targetUs  { return 100.0 }
-    if p99Us >= penaltyUs { return 0.0 }
-    return 100.0 * (1.0 - ((p99Us - targetUs) / (penaltyUs - targetUs)))
-}
 
-// calculateCompositeScore executes the benchmark formula.
-func calculateCompositeScore(tps float64, p99Us float64, correctness float64) float64 {
-	if correctness <= 0 {
-		return 0.0
-	}
-
-	baseScore := tps
-	baselineP99 := 5000.0
-	latencyMultiplier := baselineP99 / p99Us
-	if latencyMultiplier > 10.0 {
-		latencyMultiplier = 10.0
-	}
-
-	correctnessRatio := correctness / 100.0
-	penaltyFactor := 20.0
-	correctnessMultiplier := math.Pow(correctnessRatio, penaltyFactor)
-
-	return baseScore * latencyMultiplier * correctnessMultiplier
-}
-
-// SSE hub — broadcaster for live leaderboard updates
-type sseHub struct {
-    mu          sync.Mutex
-    subscribers []chan string
-}
-
-var hub = &sseHub{}
-
-func (h *sseHub) subscribe() chan string {
-    ch := make(chan string, 4)
-    h.mu.Lock()
-    h.subscribers = append(h.subscribers, ch)
-    h.mu.Unlock()
-    return ch
-}
-
-func (h *sseHub) unsubscribe(ch chan string) {
-    h.mu.Lock()
-    defer h.mu.Unlock()
-    for i, s := range h.subscribers {
-        if s == ch {
-            h.subscribers = append(h.subscribers[:i], h.subscribers[i+1:]...)
-            return
-        }
-    }
-}
-
-func (h *sseHub) broadcast(payload string) {
-    h.mu.Lock()
-    defer h.mu.Unlock()
-    for _, ch := range h.subscribers {
-        select {
-        case ch <- payload:
-        default: // slow subscriber — skip, don't block
-        }
-    }
-}
-
-// buildLeaderboardJSON is the shared logic used by both endpoints
-func buildLeaderboardJSON() (string, error) {
-    jobStoreMu.RLock()
-    defer jobStoreMu.RUnlock()
-
-    bestRuns := make(map[string]LeaderboardEntry)
-
-    for _, job := range jobStore {
-        if job.Status != JobCompleted || job.Report == nil || job.ContestantID == "" {
-            continue
-        }
-
-				perf := calculatePerfScore(job.Report.P99Us)
-				composite := calculateCompositeScore(job.Report.TPS, job.Report.P99Us, job.Report.CorrectnessScore)
-
-        entry := LeaderboardEntry{
-            ContestantID:     job.ContestantID,
-            CompositeScore:   math.Round(composite*100) / 100,
-            CorrectnessScore: math.Round(job.Report.CorrectnessScore*100) / 100,
-            PerfScore:        math.Round(perf*100) / 100,
-            TPS:              math.Round(job.Report.TPS*10) / 10,
-            P50Us:            job.Report.P50Us,
-            P99Us:            job.Report.P99Us,
-            JobID:            job.ID,
-            SubmittedAt:      job.StartedAt,
-				KafkaUnavailable: job.Report.KafkaUnavailable,
-        }
-
-        existing, exists := bestRuns[job.ContestantID]
-        if !exists || entry.CompositeScore > existing.CompositeScore {
-            bestRuns[job.ContestantID] = entry
-        }
-    }
-
-    leaderboard := make([]LeaderboardEntry, 0, len(bestRuns))
-    for _, e := range bestRuns {
-        leaderboard = append(leaderboard, e)
-    }
-
-    sort.Slice(leaderboard, func(i, j int) bool {
-        a, b := leaderboard[i], leaderboard[j]
-        if a.CompositeScore != b.CompositeScore {
-            return a.CompositeScore > b.CompositeScore
-        }
-        if a.CorrectnessScore != b.CorrectnessScore {
-            return a.CorrectnessScore > b.CorrectnessScore
-        }
-        return a.TPS > b.TPS
-    })
-
-    // Assign ranks after sorting
-    for i := range leaderboard {
-        leaderboard[i].Rank = i + 1
-    }
-
-    data, err := json.Marshal(leaderboard)
-    return string(data), err
-}
-
-func handleLeaderboard(w http.ResponseWriter, r *http.Request) {
-    payload, err := buildLeaderboardJSON()
-    if err != nil {
-        http.Error(w, "failed to build leaderboard", http.StatusInternalServerError)
-        return
-    }
-    w.Header().Set("Content-Type", "application/json")
-    w.Header().Set("Access-Control-Allow-Origin", "*")
-    fmt.Fprint(w, payload)
-}
-
-func handleLeaderboardStream(w http.ResponseWriter, r *http.Request) {
-    // SSE requires these exact headers
-    w.Header().Set("Content-Type", "text/event-stream")
-    w.Header().Set("Cache-Control", "no-cache")
-    w.Header().Set("Connection", "keep-alive")
-    w.Header().Set("Access-Control-Allow-Origin", "*")
-
-    flusher, ok := w.(http.Flusher)
-    if !ok {
-        http.Error(w, "streaming unsupported", http.StatusInternalServerError)
-        return
-    }
-
-    // Send current state immediately on connect
-    if payload, err := buildLeaderboardJSON(); err == nil {
-        fmt.Fprintf(w, "data: %s\n\n", payload)
-        flusher.Flush()
-    }
-
-    ch := hub.subscribe()
-    defer hub.unsubscribe(ch)
-
-    for {
-        select {
-        case payload := <-ch:
-            fmt.Fprintf(w, "data: %s\n\n", payload)
-            flusher.Flush()
-        case <-r.Context().Done():
-            return // client disconnected
-        }
-    }
-}
 

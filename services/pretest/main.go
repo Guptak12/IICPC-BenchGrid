@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"database/sql"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,11 +10,14 @@ import (
 	"math"
 	"net/netip"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"iicpc-sandbox/services/common"
 
 	"github.com/google/uuid"
+	"github.com/minio/minio-go/v7"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/client"
@@ -26,6 +28,7 @@ var (
 	rdb          *redis.Client
 	db           *sql.DB
 	dockerClient *client.Client
+	s3Client     *minio.Client
 )
 
 func main() {
@@ -40,6 +43,16 @@ func main() {
 	// Connect to Redis
 	rdb = common.GetRedisClient()
 	defer rdb.Close()
+
+	// Connect to S3/MinIO
+	ctx := context.Background()
+	s3Client, err = common.GetS3Client()
+	if err != nil {
+		log.Fatalf("Failed to initialize S3 client: %v", err)
+	}
+	if err := common.EnsureS3Bucket(ctx, s3Client); err != nil {
+		log.Fatalf("Failed to ensure S3 bucket: %v", err)
+	}
 
 	// Connect to PostgreSQL
 	for i := 0; i < 5; i++ {
@@ -56,7 +69,6 @@ func main() {
 	defer db.Close()
 
 	// Initialize queues
-	ctx := context.Background()
 	if err := common.InitRedisQueues(ctx, rdb); err != nil {
 		log.Fatalf("Redis Stream initialization failed: %v", err)
 	}
@@ -64,18 +76,30 @@ func main() {
 	consumerName := "pretest-" + uuid.New().String()[:8]
 	log.Printf("Pretest Worker %s started, listening on pretest queue... ✓\n", consumerName)
 
+	// Trap shutdown signals
+	shutdownCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// Start PEL recovery for pretest group (claim messages idle > 2 minutes)
+	common.StartPELRecovery(shutdownCtx, rdb, common.PretestQueue, common.PretestGroup, consumerName, 2*time.Minute)
+
 	// Start background Docker container sweeper to garbage collect orphaned contestant containers
-	startDockerSweeper(ctx, dockerClient)
+	startDockerSweeper(shutdownCtx, dockerClient)
 
 	for {
 		// Read new messages from group
-		streams, err := rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+		streams, err := rdb.XReadGroup(shutdownCtx, &redis.XReadGroupArgs{
 			Group:    common.PretestGroup,
 			Consumer: consumerName,
 			Streams:  []string{common.PretestQueue, ">"},
 			Count:    1,
 			Block:    2 * time.Second,
 		}).Result()
+
+		if shutdownCtx.Err() != nil {
+			log.Println("Shutdown signal received, pretest worker shutting down...")
+			return
+		}
 
 		if err == redis.Nil {
 			continue
@@ -87,7 +111,7 @@ func main() {
 
 		for _, stream := range streams {
 			for _, message := range stream.Messages {
-				processPretestMessage(ctx, message)
+				processPretestMessage(shutdownCtx, message)
 			}
 		}
 	}
@@ -95,7 +119,7 @@ func main() {
 
 func processPretestMessage(ctx context.Context, message redis.XMessage) {
 	submissionID, ok1 := message.Values["submission_id"].(string)
-	base64Binary, ok2 := message.Values["binary_data"].(string)
+	binaryPath, ok2 := message.Values["binary_path"].(string)
 
 	if !ok1 || !ok2 {
 		log.Printf("Skipping invalid stream message: %v\n", message.ID)
@@ -114,12 +138,24 @@ func processPretestMessage(ctx context.Context, message redis.XMessage) {
 		log.Printf("Failed to update status to running: %v\n", err)
 	}
 
-	// Decode binary bytes from base64
-	binaryBytes, err := base64.StdEncoding.DecodeString(base64Binary)
+	// Download binary from S3
+	obj, err := s3Client.GetObject(ctx, common.S3Bucket, binaryPath, minio.GetObjectOptions{})
 	if err != nil {
-		log.Printf("[submission:%s] Failed to decode binary base64 payload: %v\n", submissionID[:8], err)
-		failPretest(ctx, submissionID, "Runtime Failure", "Failed to decode binary payload: "+err.Error())
-		rdb.XAck(ctx, common.PretestQueue, common.PretestGroup, message.ID)
+		log.Printf("[submission:%s] Failed to get binary from S3: %v\n", submissionID[:8], err)
+		if common.ShouldRetry(ctx, rdb, common.PretestQueue, common.PretestGroup, message.ID, message.Values, err) {
+			return
+		}
+		failPretest(ctx, submissionID, "Runtime Failure", "Failed to retrieve compiled binary from storage: "+err.Error())
+		return
+	}
+	defer obj.Close()
+	binaryBytes, err := io.ReadAll(obj)
+	if err != nil {
+		log.Printf("[submission:%s] Failed to read binary from S3 object: %v\n", submissionID[:8], err)
+		if common.ShouldRetry(ctx, rdb, common.PretestQueue, common.PretestGroup, message.ID, message.Values, err) {
+			return
+		}
+		failPretest(ctx, submissionID, "Runtime Failure", "Failed to read binary: "+err.Error())
 		return
 	}
 
@@ -149,8 +185,10 @@ func processPretestMessage(ctx context.Context, message redis.XMessage) {
 		containerID, endpoint, err := startContestantSandbox(ctx, submissionID, binaryBytes)
 		if err != nil {
 			log.Printf("[submission:%s] Run %d: Failed to spin up sandbox: %v\n", submissionID[:8], run+1, err)
+			if common.ShouldRetry(ctx, rdb, common.PretestQueue, common.PretestGroup, message.ID, message.Values, err) {
+				return
+			}
 			failPretest(ctx, submissionID, "Runtime Failure", "Failed to spin up runtime sandbox: "+err.Error())
-			rdb.XAck(ctx, common.PretestQueue, common.PretestGroup, message.ID)
 			return
 		}
 
@@ -174,8 +212,10 @@ func processPretestMessage(ctx context.Context, message redis.XMessage) {
 
 		if err != nil {
 			log.Printf("[submission:%s] Run %d: Error during pretest execution: %v\n", submissionID[:8], run+1, err)
+			if common.ShouldRetry(ctx, rdb, common.PretestQueue, common.PretestGroup, message.ID, message.Values, err) {
+				return
+			}
 			failPretest(ctx, submissionID, "Runtime Failure", "Pretest execution failed: "+err.Error())
-			rdb.XAck(ctx, common.PretestQueue, common.PretestGroup, message.ID)
 			return
 		}
 
@@ -297,7 +337,7 @@ func startContestantSandbox(ctx context.Context, submissionID string, binaryByte
 
 	port := "8080/tcp"
 	config := &container.Config{
-		Image:    common.SandboxImage,
+		Image:    common.RuntimeImage,
 		Cmd:      []string{"/usr/src/app"},
 		Tty:      false,
 		Hostname: containerName,
@@ -319,7 +359,7 @@ func startContestantSandbox(ctx context.Context, submissionID string, binaryByte
 		PortBindings: network.PortMap{
 			network.MustParsePort(port): []network.PortBinding{
 				{
-					HostIP:   netip.MustParseAddr("127.0.0.1"),
+					HostIP:   netip.MustParseAddr("0.0.0.0"),
 					HostPort: "0", // let Docker allocate a free host port
 				},
 			},
@@ -410,6 +450,11 @@ func startContestantSandbox(ctx context.Context, submissionID string, binaryByte
 	}
 
 	if endpoint == "" {
+		if inspectInfo, inspectErr := dockerClient.ContainerInspect(ctx, resp.ID, client.ContainerInspectOptions{}); inspectErr == nil {
+			log.Printf("[debug] startContestantSandbox failed. Inspect output: %+v\n", inspectInfo)
+		} else {
+			log.Printf("[debug] startContestantSandbox failed and inspect check failed: %v\n", inspectErr)
+		}
 		logBytes, logErr := dockerClient.ContainerLogs(ctx, resp.ID, client.ContainerLogsOptions{ShowStdout: true, ShowStderr: true})
 		if logErr == nil {
 			defer logBytes.Close()
