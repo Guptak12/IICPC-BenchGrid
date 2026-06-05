@@ -1,0 +1,4 @@
+FROM alpine:3.19
+RUN apk add --no-cache curl && \
+    curl -fsSL https://raw.githubusercontent.com/pressly/goose/master/install.sh | sh -s v3.20.0
+ENTRYPOINT ["/usr/local/bin/goose"]

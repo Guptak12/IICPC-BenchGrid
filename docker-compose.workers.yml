@@ -66,6 +66,7 @@ volumes:
   
 networks:
   iicpc-net:
-    external: true
+    driver: bridge
   sandbox-net:
-    external : true
+    driver: bridge
+    internal: true
