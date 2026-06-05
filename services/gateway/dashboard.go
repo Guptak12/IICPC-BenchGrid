@@ -931,7 +931,7 @@ const dashboardHTML = `<!DOCTYPE html>
         }
 
         // Open Telemetry Details Drawer
-        function openDrawer(sub) {
+        async function openDrawer(sub) {
             document.getElementById('det-id').textContent = sub.build_id;
             document.getElementById('det-contestant').textContent = sub.contestant_id;
             document.getElementById('det-status').textContent = sub.status;
@@ -940,13 +940,20 @@ const dashboardHTML = `<!DOCTYPE html>
             document.getElementById('det-time').textContent = new Date(sub.submitted_at).toLocaleString();
             document.getElementById('det-diagnostics').textContent = JSON.stringify(sub.diagnostics, null, 4);
 
-            // Fetch mock/source code snippet if available
             const codeSec = document.getElementById('drawer-code-section');
-            if (sub.source_code) {
-                codeSec.style.display = 'block';
-                document.getElementById('det-code').textContent = sub.source_code;
-            } else {
-                codeSec.style.display = 'none';
+            document.getElementById('det-code').textContent = "Loading source code...";
+            codeSec.style.display = 'block';
+
+            try {
+                const response = await fetch('/api/v1/submissions/' + sub.build_id + '/source');
+                if (response.ok) {
+                    const data = await response.json();
+                    document.getElementById('det-code').textContent = data.source_code;
+                } else {
+                    document.getElementById('det-code').textContent = "Source code not found.";
+                }
+            } catch (err) {
+                document.getElementById('det-code').textContent = "Failed to load source code: " + err.message;
             }
 
             document.getElementById('drawer').classList.add('open');
