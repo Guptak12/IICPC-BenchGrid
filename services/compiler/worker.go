@@ -77,7 +77,7 @@ func createCompileContainer(ctx context.Context, dockerClient *client.Client) (s
 	pidsLimit := int64(2048)
 
 	config := &container.Config{
-		Image: common.SandboxImage,
+		Image: common.CompileImage,
 		Cmd: []string{
 			"g++",
 			"-O3",

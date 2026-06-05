@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -8,6 +9,9 @@ import (
 	"io"
 	"log"
 	"math/rand"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -15,14 +19,17 @@ import (
 	"iicpc-sandbox/services/common"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/gofiber/fiber/v3/middleware/adaptor"
 	"github.com/gofiber/fiber/v3/middleware/static"
 	"github.com/google/uuid"
+	"github.com/minio/minio-go/v7"
 	"github.com/redis/go-redis/v9"
 )
 
 var (
-	rdb *redis.Client
-	db  *sql.DB
+	rdb      *redis.Client
+	db       *sql.DB
+	s3Client *minio.Client
 )
 
 func main() {
@@ -51,6 +58,33 @@ func main() {
 		log.Fatalf("Redis Stream initialization failed: %v", err)
 	}
 
+	// Connect to S3/MinIO
+	s3Client, err = common.GetS3Client()
+	if err != nil {
+		log.Fatalf("Failed to initialize S3 client: %v", err)
+	}
+	if err := common.EnsureS3Bucket(ctx, s3Client); err != nil {
+		log.Fatalf("Failed to ensure S3 bucket: %v", err)
+	}
+
+	// Setup Leaderboard Stream Reverse Proxy
+	leaderboardStreamURL := os.Getenv("LEADERBOARD_STREAM_URL")
+	if leaderboardStreamURL == "" {
+		leaderboardStreamURL = "http://localhost:3001/leaderboard/stream"
+	}
+	targetURL, err := url.Parse(leaderboardStreamURL)
+	if err != nil {
+		log.Fatalf("Invalid LEADERBOARD_STREAM_URL: %v", err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(targetURL)
+	proxy.Director = func(req *http.Request) {
+		req.URL.Scheme = targetURL.Scheme
+		req.URL.Host = targetURL.Host
+		req.URL.Path = targetURL.Path
+		req.URL.RawQuery = targetURL.RawQuery
+		req.Host = targetURL.Host
+	}
+
 	// Initialize Fiber app
 	app := fiber.New(fiber.Config{
 		BodyLimit: 10 * 1024 * 1024, // 10 MB limit
@@ -60,7 +94,9 @@ func main() {
 	app.Post("/api/v1/submit", handleSubmission)
 	app.Get("/api/v1/build/:id", handleBuildStatus)
 	app.Get("/api/v1/submissions/:id/diagnostics", handleBuildStatus)
+	app.Get("/api/v1/submissions/:id/source", handleGetSource)
 	app.Get("/api/v1/builds", handleListBuilds)
+	app.Get("/api/v1/leaderboard/stream", adaptor.HTTPHandler(proxy))
 
 	// Dashboard Routes
 	app.Get("/dashboard", handleDashboardPage)
@@ -131,22 +167,40 @@ func handleSubmission(c fiber.Ctx) error {
 
 	buildID := uuid.New().String()
 
-	// 4. Save to PostgreSQL
+	// 4. Upload to S3/MinIO
+	s3Path := fmt.Sprintf("submissions/%s/main.cpp", buildID)
+	_, err = s3Client.PutObject(ctx, common.S3Bucket, s3Path, bytes.NewReader(srcBytes), int64(len(srcBytes)), minio.PutObjectOptions{
+		ContentType: "text/x-c++src",
+	})
+	if err != nil {
+		log.Printf("Failed to upload submission %s to S3: %v\n", buildID, err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to store source code"})
+	}
+
+	// 5. Save to PostgreSQL
 	_, err = db.ExecContext(ctx,
-		"INSERT INTO submissions (id, contestant_id, status, verdict, source_code) VALUES ($1, $2, $3, $4, $5)",
-		buildID, contestantID, "queued", "Pending", sourceCode,
+		"INSERT INTO submissions (id, contestant_id, status, verdict, s3_path) VALUES ($1, $2, $3, $4, $5)",
+		buildID, contestantID, "queued", "Pending", s3Path,
 	)
 	if err != nil {
 		log.Printf("Failed to insert submission %s into DB: %v\n", buildID, err)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to save submission status"})
 	}
 
-	// 5. Push job to compilation queue via Redis Stream XADD
+	_, err = db.ExecContext(ctx,
+		"INSERT INTO submission_sources (submission_id, source_code) VALUES ($1, $2)",
+		buildID, sourceCode,
+	)
+	if err != nil {
+		log.Printf("Failed to save submission source %s to DB: %v\n", buildID, err)
+	}
+
+	// 6. Push job to compilation queue via Redis Stream XADD
 	err = rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: common.CompilationQueue,
 		Values: map[string]interface{}{
 			"submission_id": buildID,
-			"source_code":   sourceCode,
+			"s3_path":       s3Path,
 			"contestant_id": contestantID,
 		},
 	}).Err()
@@ -290,11 +344,11 @@ func handleDashboardMetrics(c fiber.Ctx) error {
 		pretestQueueDepth = rdb.XLen(ctx, common.PretestQueue).Val()
 	}
 
-	// 3. Recent submissions (including source code reading)
+	// 3. Recent submissions (excluding source code reading)
 	recentSubmissions := []fiber.Map{}
 	if dbHealthy {
 		rows, err := db.QueryContext(ctx,
-			"SELECT id, contestant_id, status, verdict, diagnostics, composite_score, COALESCE(source_code, ''), created_at FROM submissions ORDER BY created_at DESC LIMIT 30",
+			"SELECT id, contestant_id, status, verdict, diagnostics, composite_score, created_at FROM submissions ORDER BY created_at DESC LIMIT 30",
 		)
 		if err == nil {
 			defer rows.Close()
@@ -306,10 +360,9 @@ func handleDashboardMetrics(c fiber.Ctx) error {
 					verdict          string
 					diagnosticsBytes []byte
 					compositeScore   float64
-					sourceCode       string
 					createdAt        time.Time
 				)
-				if err := rows.Scan(&id, &contestantID, &status, &verdict, &diagnosticsBytes, &compositeScore, &sourceCode, &createdAt); err != nil {
+				if err := rows.Scan(&id, &contestantID, &status, &verdict, &diagnosticsBytes, &compositeScore, &createdAt); err != nil {
 					continue
 				}
 
@@ -324,7 +377,6 @@ func handleDashboardMetrics(c fiber.Ctx) error {
 					"diagnostics":     diagnostics,
 					"composite_score": compositeScore,
 					"submitted_at":    createdAt,
-					"source_code":     sourceCode,
 				})
 			}
 		}
@@ -380,23 +432,41 @@ public:
 IICPCEngine* global_engine_instance = new AckOnlyEngine();
 `
 
-	// 2. Save to database
+	// 2. Upload to S3/MinIO
+	s3Path := fmt.Sprintf("submissions/%s/main.cpp", buildID)
+	_, err := s3Client.PutObject(ctx, common.S3Bucket, s3Path, bytes.NewReader([]byte(mockCPP)), int64(len(mockCPP)), minio.PutObjectOptions{
+		ContentType: "text/x-c++src",
+	})
+	if err != nil {
+		log.Printf("[mock] Failed to upload mock to S3: %v\n", err)
+		return c.Status(fiber.StatusInternalServerError).SendString("failed to store mock source code")
+	}
+
+	// 3. Save to database
 	contestantID := fmt.Sprintf("mock-contestant-%d", rand.Intn(1000000))
-	_, err := db.ExecContext(ctx,
-		"INSERT INTO submissions (id, contestant_id, status, verdict, source_code) VALUES ($1, $2, $3, $4, $5)",
-		buildID, contestantID, "queued", "Pending", mockCPP,
+	_, err = db.ExecContext(ctx,
+		"INSERT INTO submissions (id, contestant_id, status, verdict, s3_path) VALUES ($1, $2, $3, $4, $5)",
+		buildID, contestantID, "queued", "Pending", s3Path,
 	)
 	if err != nil {
 		log.Printf("[mock] Failed to insert into PostgreSQL: %v\n", err)
 		return c.Status(fiber.StatusInternalServerError).SendString("failed to save mock submission status")
 	}
 
-	// 3. Push to compilation queue
+	_, err = db.ExecContext(ctx,
+		"INSERT INTO submission_sources (submission_id, source_code) VALUES ($1, $2)",
+		buildID, mockCPP,
+	)
+	if err != nil {
+		log.Printf("[mock] Failed to save mock submission source to DB: %v\n", err)
+	}
+
+	// 4. Push to compilation queue
 	err = rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: common.CompilationQueue,
 		Values: map[string]interface{}{
 			"submission_id": buildID,
-			"source_code":   mockCPP,
+			"s3_path":       s3Path,
 			"contestant_id": contestantID,
 		},
 	}).Err()
@@ -436,4 +506,20 @@ func handleCleanDB(c fiber.Ctx) error {
 
 	log.Println("Database cleaned and Redis streams flushed ✓")
 	return c.JSON(fiber.Map{"status": "ok"})
+}
+
+func handleGetSource(c fiber.Ctx) error {
+	ctx := context.Background()
+	id := c.Params("id")
+	var src string
+	err := db.QueryRowContext(ctx,
+		"SELECT source_code FROM submission_sources WHERE submission_id = $1", id,
+	).Scan(&src)
+	if err == sql.ErrNoRows {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "source not found"})
+	} else if err != nil {
+		log.Printf("Query error for submission source %s: %v\n", id, err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "internal database error"})
+	}
+	return c.JSON(fiber.Map{"source_code": src})
 }

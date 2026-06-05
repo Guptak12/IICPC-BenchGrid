@@ -4,10 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"io/ioutil"
+	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"iicpc-sandbox/services/common"
@@ -28,6 +30,79 @@ type LeaderboardEntry struct {
 	ThroughputScore  float64   `json:"throughput_score"`
 	EngineArchetype  string    `json:"engine_archetype"`
 	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+type sseHub struct {
+	mu          sync.Mutex
+	subscribers []chan string
+}
+
+var (
+	hub              = &sseHub{}
+	globalTargetPath string
+)
+
+func (h *sseHub) subscribe() chan string {
+	ch := make(chan string, 4)
+	h.mu.Lock()
+	h.subscribers = append(h.subscribers, ch)
+	h.mu.Unlock()
+	return ch
+}
+
+func (h *sseHub) unsubscribe(ch chan string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for i, s := range h.subscribers {
+		if s == ch {
+			h.subscribers = append(h.subscribers[:i], h.subscribers[i+1:]...)
+			return
+		}
+	}
+}
+
+func (h *sseHub) broadcast(payload string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, ch := range h.subscribers {
+		select {
+		case ch <- payload:
+		default: // non-blocking for slow/inactive clients
+		}
+	}
+}
+
+func handleLeaderboardStream(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	// Send current file content immediately on connection
+	data, err := os.ReadFile(globalTargetPath)
+	if err == nil {
+		fmt.Fprintf(w, "data: %s\n\n", string(data))
+		flusher.Flush()
+	}
+
+	ch := hub.subscribe()
+	defer hub.unsubscribe(ch)
+
+	for {
+		select {
+		case payload := <-ch:
+			fmt.Fprintf(w, "data: %s\n\n", payload)
+			flusher.Flush()
+		case <-r.Context().Done():
+			return
+		}
+	}
 }
 
 func main() {
@@ -60,6 +135,16 @@ func main() {
 	}
 
 	targetPath := filepath.Join(frontendDir, "leaderboard.json")
+	globalTargetPath = targetPath
+
+	// Start internal SSE HTTP server
+	go func() {
+		http.HandleFunc("/leaderboard/stream", handleLeaderboardStream)
+		log.Println("Leaderboard SSE server starting on :3001...")
+		if err := http.ListenAndServe(":3001", nil); err != nil {
+			log.Printf("Leaderboard SSE server exited: %v\n", err)
+		}
+	}()
 
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
@@ -134,7 +219,7 @@ func generateLeaderboard(db *sql.DB, targetPath string) {
 
 	// Write atomically using a temporary file to avoid partial read corruption
 	tmpPath := targetPath + ".tmp"
-	if err := ioutil.WriteFile(tmpPath, dataBytes, 0644); err != nil {
+	if err := os.WriteFile(tmpPath, dataBytes, 0644); err != nil {
 		log.Printf("[leaderboard] Failed to write temporary file: %v\n", err)
 		return
 	}
@@ -146,4 +231,7 @@ func generateLeaderboard(db *sql.DB, targetPath string) {
 	}
 
 	log.Printf("[leaderboard] Generated successfully with %d entries ✓\n", len(entries))
+
+	// Broadcast update to all live stream listeners
+	hub.broadcast(string(dataBytes))
 }

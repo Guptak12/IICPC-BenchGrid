@@ -24,6 +24,8 @@ const (
 // Sandbox Docker image and network names (dynamic via environment)
 var (
 	SandboxImage       = getEnv("SANDBOX_IMAGE", "iicpc-sandbox:v1")
+	CompileImage       = getEnv("COMPILE_IMAGE", "iicpc-sandbox:v1")
+	RuntimeImage       = getEnv("RUNTIME_IMAGE", "iicpc-runtime-sandbox:v1")
 	SandboxNetwork     = getEnv("SANDBOX_NET", "iicpc-net")       // workers, redpanda, master
 	SandboxIsolatedNet = getEnv("SANDBOX_ISOLATED_NET", "sandbox-net")     // contestant containers only
 )

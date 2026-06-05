@@ -1,18 +1,21 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
-	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log"
-	"os"
-	"path/filepath"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"iicpc-sandbox/services/common"
 
 	"github.com/google/uuid"
+	"github.com/minio/minio-go/v7"
 	"github.com/moby/moby/client"
 	"github.com/redis/go-redis/v9"
 )
@@ -21,6 +24,7 @@ var (
 	rdb          *redis.Client
 	db           *sql.DB
 	dockerClient *client.Client
+	s3Client     *minio.Client
 )
 
 func main() {
@@ -35,6 +39,16 @@ func main() {
 	// Connect to Redis
 	rdb = common.GetRedisClient()
 	defer rdb.Close()
+
+	// Connect to S3/MinIO
+	ctx := context.Background()
+	s3Client, err = common.GetS3Client()
+	if err != nil {
+		log.Fatalf("Failed to initialize S3 client: %v", err)
+	}
+	if err := common.EnsureS3Bucket(ctx, s3Client); err != nil {
+		log.Fatalf("Failed to ensure S3 bucket: %v", err)
+	}
 
 	// Connect to PostgreSQL
 	for i := 0; i < 5; i++ {
@@ -51,7 +65,6 @@ func main() {
 	defer db.Close()
 
 	// Initialize queues
-	ctx := context.Background()
 	if err := common.InitRedisQueues(ctx, rdb); err != nil {
 		log.Fatalf("Redis Stream initialization failed: %v", err)
 	}
@@ -59,9 +72,16 @@ func main() {
 	consumerName := "compiler-" + uuid.New().String()[:8]
 	log.Printf("Compilation Worker %s started, listening on queue... ✓\n", consumerName)
 
+	// Trap shutdown signals
+	shutdownCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// Start PEL recovery for compiler group (claim messages idle > 2 minutes)
+	common.StartPELRecovery(shutdownCtx, rdb, common.CompilationQueue, common.CompilationGroup, consumerName, 2*time.Minute)
+
 	for {
 		// Read new messages from group
-		streams, err := rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+		streams, err := rdb.XReadGroup(shutdownCtx, &redis.XReadGroupArgs{
 			Group:    common.CompilationGroup,
 			Consumer: consumerName,
 			Streams:  []string{common.CompilationQueue, ">"},
@@ -69,8 +89,12 @@ func main() {
 			Block:    2 * time.Second,
 		}).Result()
 
+		if shutdownCtx.Err() != nil {
+			log.Println("Shutdown signal received, compiler worker shutting down...")
+			return
+		}
+
 		if err == redis.Nil {
-			// No new messages
 			continue
 		} else if err != nil {
 			log.Printf("Error reading from stream: %v\n", err)
@@ -80,7 +104,7 @@ func main() {
 
 		for _, stream := range streams {
 			for _, message := range stream.Messages {
-				processMessage(ctx, message)
+				processMessage(shutdownCtx, message)
 			}
 		}
 	}
@@ -88,7 +112,7 @@ func main() {
 
 func processMessage(ctx context.Context, message redis.XMessage) {
 	submissionID, ok1 := message.Values["submission_id"].(string)
-	sourceCode, ok2 := message.Values["source_code"].(string)
+	s3Path, ok2 := message.Values["s3_path"].(string)
 	contestantID, _ := message.Values["contestant_id"].(string)
 
 	if !ok1 || !ok2 {
@@ -108,12 +132,35 @@ func processMessage(ctx context.Context, message redis.XMessage) {
 		log.Printf("Failed to update status to compiling: %v\n", err)
 	}
 
-	// 2. Perform compilation
-	success, stderr, binaryBytes, err := CompileCode(ctx, dockerClient, []byte(sourceCode))
+	// 2. Download source from S3
+	obj, err := s3Client.GetObject(ctx, common.S3Bucket, s3Path, minio.GetObjectOptions{})
+	if err != nil {
+		log.Printf("[submission:%s] Failed to get source from S3: %v\n", submissionID[:8], err)
+		if common.ShouldRetry(ctx, rdb, common.CompilationQueue, common.CompilationGroup, message.ID, message.Values, err) {
+			return
+		}
+		failSubmission(ctx, submissionID, "System Failure", "Failed to retrieve source code from storage: "+err.Error())
+		return
+	}
+	defer obj.Close()
+	srcBytes, err := io.ReadAll(obj)
+	if err != nil {
+		log.Printf("[submission:%s] Failed to read source from S3 object: %v\n", submissionID[:8], err)
+		if common.ShouldRetry(ctx, rdb, common.CompilationQueue, common.CompilationGroup, message.ID, message.Values, err) {
+			return
+		}
+		failSubmission(ctx, submissionID, "System Failure", "Failed to read source code: "+err.Error())
+		return
+	}
+
+	// 3. Perform compilation
+	success, stderr, binaryBytes, err := CompileCode(ctx, dockerClient, srcBytes)
 	if err != nil {
 		log.Printf("[submission:%s] System error during compilation: %v\n", submissionID[:8], err)
+		if common.ShouldRetry(ctx, rdb, common.CompilationQueue, common.CompilationGroup, message.ID, message.Values, err) {
+			return
+		}
 		failSubmission(ctx, submissionID, "Compilation Failure", "Internal compilation agent error: "+err.Error())
-		rdb.XAck(ctx, common.CompilationQueue, common.CompilationGroup, message.ID)
 		return
 	}
 
@@ -124,25 +171,23 @@ func processMessage(ctx context.Context, message redis.XMessage) {
 		return
 	}
 
-	// Encode compiled binary in base64
-	base64Binary := base64.StdEncoding.EncodeToString(binaryBytes)
-
-	// Write compiled binary to host filesystem for system tests / mounting
-	subDir := filepath.Join("submissions", "iicpc_"+submissionID)
-	if err := os.MkdirAll(subDir, 0755); err != nil {
-		log.Printf("[submission:%s] Failed to create submissions directory: %v\n", submissionID[:8], err)
-	} else {
-		binPath := filepath.Join(subDir, "app")
-		if err := os.WriteFile(binPath, binaryBytes, 0755); err != nil {
-			log.Printf("[submission:%s] Failed to write binary to host disk: %v\n", submissionID[:8], err)
-		} else {
-			log.Printf("[submission:%s] Saved compiled binary to %s\n", submissionID[:8], binPath)
+	// 4. Upload binary to S3
+	binaryPath := fmt.Sprintf("submissions/%s/app", submissionID)
+	_, err = s3Client.PutObject(ctx, common.S3Bucket, binaryPath, bytes.NewReader(binaryBytes), int64(len(binaryBytes)), minio.PutObjectOptions{
+		ContentType: "application/octet-stream",
+	})
+	if err != nil {
+		log.Printf("[submission:%s] Failed to upload binary to S3: %v\n", submissionID[:8], err)
+		if common.ShouldRetry(ctx, rdb, common.CompilationQueue, common.CompilationGroup, message.ID, message.Values, err) {
+			return
 		}
+		failSubmission(ctx, submissionID, "System Failure", "Failed to store compiled binary: "+err.Error())
+		return
 	}
 
 	log.Printf("[submission:%s] Compilation succeeded ✓\n", submissionID[:8])
 
-	// 3. Update PostgreSQL status to 'compiled'
+	// 5. Update PostgreSQL status to 'compiled'
 	_, err = db.ExecContext(ctx,
 		"UPDATE submissions SET status = $1, updated_at = NOW() WHERE id = $2",
 		"compiled", submissionID,
@@ -151,12 +196,12 @@ func processMessage(ctx context.Context, message redis.XMessage) {
 		log.Printf("Failed to update status to compiled: %v\n", err)
 	}
 
-	// 4. Push job to pretest queue via XADD
+	// 6. Push job to pretest queue via XADD
 	err = rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: common.PretestQueue,
 		Values: map[string]interface{}{
 			"submission_id": submissionID,
-			"binary_data":   base64Binary,
+			"binary_path":   binaryPath,
 			"contestant_id": contestantID,
 		},
 	}).Err()
