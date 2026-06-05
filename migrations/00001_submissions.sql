@@ -1,3 +1,4 @@
+-- +goose Up
 -- PostgreSQL schema for IICPC Scaled Benchmarking Platform
 
 CREATE TABLE IF NOT EXISTS submissions (
@@ -23,6 +24,7 @@ CREATE INDEX IF NOT EXISTS idx_submissions_leaderboard
 ON submissions (contest_id, contestant_id, composite_score DESC);
 
 -- Trigger to update updated_at automatically
+-- +goose StatementBegin
 CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -30,8 +32,14 @@ BEGIN
     RETURN NEW;
 END;
 $$ language 'plpgsql';
+-- +goose StatementEnd
 
 CREATE OR REPLACE TRIGGER update_submissions_updated_at
     BEFORE UPDATE ON submissions
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
+
+-- +goose Down
+DROP TRIGGER IF EXISTS update_submissions_updated_at ON submissions;
+DROP FUNCTION IF EXISTS update_updated_at_column;
+DROP TABLE IF EXISTS submissions;

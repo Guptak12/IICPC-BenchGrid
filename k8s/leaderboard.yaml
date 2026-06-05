@@ -38,3 +38,17 @@ spec:
       - name: public-html
         persistentVolumeClaim:
           claimName: public-html-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: leaderboard-generator
+  namespace: default
+spec:
+  ports:
+  - port: 3001
+    targetPort: 3001
+  selector:
+    app: leaderboard-generator
+  type: ClusterIP
+

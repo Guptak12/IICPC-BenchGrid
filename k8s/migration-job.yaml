@@ -8,23 +8,17 @@ spec:
     spec:
       containers:
       - name: migration
-        image: postgres:15-alpine
+        image: ghcr.io/pressly/goose:v3.20.0
         imagePullPolicy: IfNotPresent
         command:
         - sh
         - -c
         - |
-          export PGPASSWORD=iicpc_secret
-          echo "Connecting to PostgreSQL at host postgres..."
-          until pg_isready -h postgres -U iicpc -d iicpc_db; do
-            echo "Waiting for postgres to be ready..."
-            sleep 2
-          done
-          echo "Running migration scripts..."
-          for f in $(ls /migrations/*.sql | sort); do
-            echo "Applying migration: $f"
-            psql -h postgres -U iicpc -d iicpc_db -f "$f"
-          done
+          echo "Running Goose migrations..."
+          goose -dir /migrations postgres "$DB_ADDR" up
+        env:
+        - name: DB_ADDR
+          value: "postgres://iicpc:iicpc_secret@postgres:5432/iicpc_db?sslmode=disable"
         volumeMounts:
         - name: migration-volume
           mountPath: /migrations
