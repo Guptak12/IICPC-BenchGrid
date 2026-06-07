@@ -2,30 +2,30 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/HdrHistogram/hdrhistogram-go"
-	"github.com/coder/websocket"
-	gojson "github.com/goccy/go-json"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/proto"
 
 	pb "github.com/guptak12/bot-fleet/gen/fleet"
 	"github.com/guptak12/bot-fleet/telemetry"
+	protocol "iicpc-sandbox/pkg/protocol"
 )
 
 const (
-	// maxConcurrentBots caps simultaneous WebSocket connections
-	// Prevents exhausting file descriptors on a single machine
+	// maxConcurrentBots caps simultaneous connections
 	maxConcurrentBots = 500
 	dialTimeout       = 5 * time.Second
 	ackTimeout        = 5 * time.Second
@@ -47,10 +47,84 @@ var masterCfg = MasterConfig{
 	},
 }
 
+func mapOrderType(t OrderType) protocol.OrderType {
+	switch t {
+	case Limit:
+		return protocol.OrderType_LIMIT
+	case Market:
+		return protocol.OrderType_MARKET
+	case Cancel:
+		return protocol.OrderType_CANCEL
+	default:
+		return protocol.OrderType_LIMIT
+	}
+}
+
+func mapSide(s Side) protocol.Side {
+	switch s {
+	case Buy:
+		return protocol.Side_BUY
+	case Sell:
+		return protocol.Side_SELL
+	default:
+		return protocol.Side_BUY
+	}
+}
+
+func cleanEndpoint(endpoint string) string {
+	if strings.Contains(endpoint, "://") {
+		u, err := url.Parse(endpoint)
+		if err == nil {
+			return u.Host
+		}
+	}
+	return endpoint
+}
+
 // runFleet spawns all bots concurrently with a semaphore bound.
-// Change :- Using errgroup instead of WaitGroup to capture any unexpected panics in bot goroutines.
 func runFleet(ctx context.Context, bots []*Bot, cfg FleetConfig, producer *telemetry.Producer, jobID string, workerID string) []BotResult {
 	results := make([]BotResult, len(bots))
+
+	// Clean the endpoint and run a single TCP startup liveness probe/retry loop with exponential backoff
+	cleanedAddr := cleanEndpoint(cfg.Endpoint)
+	log.Printf("[debug] Dialing TCP liveness probe on %s...\n", cleanedAddr)
+	var probeConn net.Conn
+	var probeErr error
+	backoff := 50 * time.Millisecond
+	for start := time.Now(); time.Since(start) < 10*time.Second; {
+		probeConn, probeErr = net.DialTimeout("tcp", cleanedAddr, 500*time.Millisecond)
+		if probeErr == nil {
+			probeConn.Close()
+			break
+		}
+		select {
+		case <-ctx.Done():
+			probeErr = ctx.Err()
+			break
+		case <-time.After(backoff):
+		}
+		if probeErr == ctx.Err() {
+			break
+		}
+		backoff *= 2
+		if backoff > 1*time.Second {
+			backoff = 1 * time.Second
+		}
+	}
+	if probeErr != nil {
+		log.Printf("[error] Liveness probe failed on %s: %v\n", cleanedAddr, probeErr)
+		// Mark all bots as failed
+		for i, b := range bots {
+			results[i] = BotResult{
+				BotID:        b.config.StringID,
+				Strategy:     b.config.Strategy,
+				Histogram:    newHistogram(),
+				OrdersFailed: b.config.OrdersToSend,
+			}
+		}
+		return results
+	}
+	log.Printf("[debug] TCP liveness probe succeeded on %s ✓\n", cleanedAddr)
 
 	// Semaphore: bufferred channel limits concurrent bots
 	sem := make(chan struct{}, maxConcurrentBots)
@@ -83,14 +157,12 @@ func runFleet(ctx context.Context, bots []*Bot, cfg FleetConfig, producer *telem
 		idx, b := i, bot // capture loop variables for closure
 
 		// Acquire semaphore slot before launching goroutine
-		// Blocks here if maxConcurrentBots goroutines are already running
 		sem <- struct{}{}
 
 		g.Go(func() error {
 			defer func() { <-sem }() // release slot when done
 
 			// Build the strategy for this bot
-			// MarketMakerStrategy, MomentumStrategy, or NoiseStrategy
 			strategy := newStrategy(b)
 
 			results[idx] = runBot(gctx, b, cfg.Endpoint, strategy, &totalSent, producer, jobID, workerID)
@@ -171,7 +243,6 @@ func runDistributed(ctx context.Context, cfg FleetConfig, jobID string) (*FleetR
 			shardCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 			defer cancel()
 
-			// 1. Call the method, which now returns a STREAM, not a single result
 			stream, err := client.RunShard(shardCtx, &pb.ShardRequest{
 				JobId:          jobID,
 				Endpoint:       cfg.Endpoint,
@@ -192,12 +263,10 @@ func runDistributed(ctx context.Context, cfg FleetConfig, jobID string) (*FleetR
 				return
 			}
 
-			// 2. Loop and listen to the stream heartbeats
 			var finalResult *pb.ShardResult
 			for {
 				res, err := stream.Recv()
 				if err == io.EOF {
-					// The worker closed the stream successfully
 					break
 				}
 				if err != nil {
@@ -205,10 +274,6 @@ func runDistributed(ctx context.Context, cfg FleetConfig, jobID string) (*FleetR
 					return
 				}
 
-				// If you want to see live TPS from the workers, uncomment this:
-				// log.Printf("[Master] Worker %s alive | TPS: %.2f", workerAddr, res.CurrentTps)
-
-				// 3. Catch the final payload containing the heavy histogram bytes
 				if res.IsFinal {
 					finalResult = res
 				}
@@ -219,7 +284,6 @@ func runDistributed(ctx context.Context, cfg FleetConfig, jobID string) (*FleetR
 				return
 			}
 
-			// Send the final result back to the Master aggregation channel
 			resultCh <- shardResponse{result: finalResult, err: nil}
 		}()
 	}
@@ -264,37 +328,29 @@ func runDistributed(ctx context.Context, cfg FleetConfig, jobID string) (*FleetR
 	}, nil
 }
 
-// runBot is the single-bot execution loop with the real WebSocket send/receive loop.
+// runBot is the single-bot execution loop with the real raw TCP send/receive loop.
 func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, totalSent *atomic.Int64, producer *telemetry.Producer, jobID string, workerID string) BotResult {
 	result := BotResult{
 		BotID:    b.config.StringID,
 		Strategy: b.config.Strategy,
-		//  Allocate dynamic range bounds (1ns min up to 1hr max) with 3 significant digits
-		Histogram: hdrhistogram.New(1, 3600000000000, 3),
+		Histogram: newHistogram(),
 	}
 
-	// -----------------------------------------------------------------
-	// Phase 2 — Dial with a fail-fast timeout
-	// -----------------------------------------------------------------
+	cleanedAddr := cleanEndpoint(endpoint)
+
+	// Dial with a fail-fast timeout
 	dialCtx, dialCancel := context.WithTimeout(ctx, dialTimeout)
-	conn, _, err := websocket.Dial(dialCtx, endpoint, &websocket.DialOptions{
-		Subprotocols: []string{"trading"},
-	})
-	dialCancel() // always release immediately after dial attempt
+	var d net.Dialer
+	conn, err := d.DialContext(dialCtx, "tcp", cleanedAddr)
+	dialCancel()
 
 	if err != nil {
-		log.Printf("[%s] dial failed: %v\n", b.config.StringID, err)
+		log.Printf("[%s] TCP dial failed: %v\n", b.config.StringID, err)
 		result.OrdersFailed += b.config.OrdersToSend
 		return result
 	}
-	defer conn.Close(websocket.StatusNormalClosure, "bot done")
+	defer conn.Close()
 
-	// -----------------------------------------------------------------
-	// Phase 3 — Parallel sender + receiver
-	//
-	// The receiver reads the WebSocket independently of sends. Execution
-	// reports are not one-response-per-order: fills may arrive between acks.
-	// -----------------------------------------------------------------
 	type latResult struct {
 		latencyNs int64
 		failed    bool
@@ -370,13 +426,24 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 				return
 			}
 
-			// Pain Point 2 Fix: Generate and Marshal JSON right here on the hot path
 			msg := b.NextOrder()
-			payload, err := b.MarshalOrder(msg)
+			
+			// Map to protocol.Order
+			protoOrder := &protocol.Order{
+				BotId:    uint64(b.config.NumericID),
+				OrderId:  uint64(msg.OrderID),
+				Type:     mapOrderType(msg.Type),
+				Side:     mapSide(msg.Side),
+				Price:    msg.Price,
+				Quantity: uint64(msg.Quantity),
+			}
+
+			payload, err := proto.Marshal(protoOrder)
 			if err != nil {
 				latencyCh <- latResult{failed: true}
 				continue
 			}
+
 			seq := msg.OrderID & 0xFFFFFFFF
 			b.RecordSendTime(seq)
 
@@ -386,7 +453,15 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 				pendingMu.Unlock()
 			}
 
-			if err := conn.Write(ctx, websocket.MessageText, payload); err != nil {
+			lengthPrefix := make([]byte, 4)
+			binary.LittleEndian.PutUint32(lengthPrefix, uint32(len(payload)))
+
+			_, err = conn.Write(lengthPrefix)
+			if err == nil {
+				_, err = conn.Write(payload)
+			}
+
+			if err != nil {
 				removePending(msg.OrderID)
 				remaining := b.config.OrdersToSend - i
 				for j := 0; j < remaining; j++ {
@@ -394,9 +469,7 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 				}
 				return
 			}
-			// Order successfully written to socket
 
-			// Point A: non-blocking publish — bot never waits for Kafka
 			if producer != nil {
 				producer.PublishOrderAsync(telemetry.OrderEvent{
 					Type:      telemetry.EventOrderSent,
@@ -419,25 +492,32 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 		defer wg.Done()
 
 		for {
-			_, ackBytes, err := conn.Read(ctx)
-			 // Record receive time immediately — before ANY processing.
-			// This is what we're actually measuring: time from send to wire arrival.
-			// JSON parse time is our overhead, not the contestant's.
+			var length uint32
+			err := binary.Read(conn, binary.LittleEndian, &length)
 			receivedAt := time.Now().UnixNano()
+			if err != nil {
+				failAllPending()
+				return
+			}
+
+			payload := make([]byte, length)
+			_, err = io.ReadFull(conn, payload)
 			if err != nil {
 				failAllPending()
 				return
 			}
 			lastReportNs.Store(receivedAt)
 
-			var ack OrderAck
-			if err := gojson.Unmarshal(ackBytes, &ack); err != nil {
+			var report protocol.ExecutionReport
+			if err := proto.Unmarshal(payload, &report); err != nil {
 				continue
 			}
 
-			status := strings.ToLower(ack.Status)
+			status := strings.ToLower(report.Status.String())
+			orderID := int64(report.OrderId)
+
 			if isFillStatus(status) {
-				sendTime, ok := removePending(ack.OrderID)
+				sendTime, ok := removePending(orderID)
 				if ok {
 					latency := receivedAt - sendTime
 					latencyCh <- latResult{latencyNs: latency}
@@ -448,12 +528,12 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 							JobID:           jobID,
 							WorkerID:        workerID,
 							BotID:           b.config.StringID,
-							OrderID:         ack.OrderID,
+							OrderID:         orderID,
 							Status:          "accepted_and_filled",
 							LatencyNs:       latency,
 							ReceivedNs:      receivedAt,
-							EngineSeqID:     ack.EngineSeqID,
-							EngineLatencyNs: ack.ProcessingNs,
+							EngineSeqID:     int64(report.EngineSeqId),
+							EngineLatencyNs: int64(report.ProcessingNs),
 						})
 					}
 				}
@@ -463,11 +543,11 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 						Type:        telemetry.EventFill,
 						JobID:       jobID,
 						WorkerID:    workerID,
-						OrderID:     ack.OrderID,
-						FilledQty:   ack.FilledQty,
-						FilledPrice: ack.FilledPrice,
-						MatchedWith: ack.MatchedWith,
-						EngineSeqID: ack.EngineSeqID,
+						OrderID:     orderID,
+						FilledQty:   int64(report.FilledQty),
+						FilledPrice: report.FilledPrice,
+						MatchedWith: int64(report.MatchedWith),
+						EngineSeqID: int64(report.EngineSeqId),
 					})
 				}
 				continue
@@ -477,12 +557,12 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 				continue
 			}
 
-			sendTime, ok := removePending(ack.OrderID)
+			sendTime, ok := removePending(orderID)
 			if !ok {
 				continue
 			}
 
-			latency := receivedAt- sendTime
+			latency := receivedAt - sendTime
 			latencyCh <- latResult{latencyNs: latency}
 
 			if producer != nil {
@@ -491,16 +571,17 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 					JobID:       jobID,
 					WorkerID:    workerID,
 					BotID:       b.config.StringID,
-					OrderID:     ack.OrderID,
-					Status:      ack.Status,
+					OrderID:     orderID,
+					Status:      status,
 					LatencyNs:   latency,
-					EngineSeqID: ack.EngineSeqID,
-					EngineLatencyNs: ack.ProcessingNs,
+					EngineSeqID: int64(report.EngineSeqId),
+					EngineLatencyNs: int64(report.ProcessingNs),
 				})
 			}
 		}
 	}()
 
+	// --- Control goroutine ---
 	go func() {
 		defer wg.Done()
 
@@ -511,13 +592,11 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 			select {
 			case <-ctx.Done():
 				failAllPending()
-				_ = conn.Close(websocket.StatusGoingAway, "bot context done")
 				return
 			case <-ticker.C:
 				failExpiredPending(time.Now())
 				lastReport := time.Unix(0, lastReportNs.Load())
 				if senderDone.Load() && pendingLen() == 0 && time.Since(lastReport) >= fillDrainGrace {
-					_ = conn.Close(websocket.StatusNormalClosure, "bot ack stream complete")
 					return
 				}
 			}
@@ -526,15 +605,14 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 
 	go func() {
 		wg.Wait()
-		close(latencyCh) // now safe to close — all results are in
+		close(latencyCh)
 	}()
 
-	// --- Collector — runs in the main bot goroutine ---
+	// --- Collector ---
 	for lr := range latencyCh {
 		if lr.failed {
 			result.OrdersFailed++
 		} else {
-
 			_ = result.Histogram.RecordValue(lr.latencyNs)
 			result.OrdersSent++
 			totalSent.Add(1)
@@ -562,50 +640,27 @@ func isFillStatus(status string) bool {
 	}
 }
 
-// isTerminalError returns true for errors that mean the connection is dead.
-// Fix 2.1: on terminal errors we break out of the loop immediately instead
-// of continuing to iterate and hitting timeouts on every remaining order.
 func isTerminalError(err error) bool {
 	if err == nil {
 		return false
 	}
-	// EOF = server closed the connection
 	if errors.Is(err, io.EOF) {
 		return true
 	}
-	// Broken pipe / connection reset = network-level termination
 	var netErr *net.OpError
 	if errors.As(err, &netErr) {
 		return true
 	}
-	// WebSocket close frame received
-	var wsErr websocket.CloseError
-	if errors.As(err, &wsErr) {
-		return wsErr.Code != websocket.StatusNormalClosure
-	}
 	return false
 }
 
-// isContextError returns true if the error is a clean context shutdown.
 func isContextError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, context.Canceled) ||
-		errors.Is(err, context.DeadlineExceeded) {
-		return true
-	}
-	var wsErr websocket.CloseError
-	if errors.As(err, &wsErr) {
-		return wsErr.Code == websocket.StatusNormalClosure ||
-			wsErr.Code == websocket.StatusGoingAway
-	}
-	return false
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
-// debugLog writes only when debugLogs is true.
-// Fix 3.2: suppresses per-bot hot path logs at scale
-// Flip debugLogs = true during development only
 func debugLog(format string, args ...any) {
 	if debugLogs {
 		log.Printf(format, args...)

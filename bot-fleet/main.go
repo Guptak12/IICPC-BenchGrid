@@ -398,12 +398,16 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
 
             // Deduce verdict based on correctness/latency/failures
             verdict := "Accepted"
-            if report.CorrectnessScore < 50.0 {
-                verdict = "Wrong Answer"
-            } else if report.P99Us > 50000.0 {
-                verdict = "Time Limit Exceeded"
-            } else if failRate > 0.3 {
-                verdict = "Throughput Exceeded"
+            reason := "Optimal Execution (Passes all SLAs)"
+            if report.CorrectnessScore < 100.0 {
+                verdict = "Logic Violation (LV)"
+                reason = "Correctness < 100% (Order Book Math Mismatch)"
+            } else if report.P99Us > 5000.0 {
+                verdict = "Tail Latency Exceeded (TLE)"
+                reason = "P99 > 5000µs (Worst-case Tail Spikes)"
+            } else if failRate > 0.10 {
+                verdict = "Throughput Degradation"
+                reason = "Failure Rate > 10% (Dropped Orders)"
             }
 
             diag := map[string]interface{}{
@@ -416,6 +420,7 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
                 "tps":                 report.TPS,
                 "throughput_score":    throughputScore,
                 "latency_score":       latencyScore,
+                "reason":              reason,
             }
             diagBytes, _ := json.Marshal(diag)
 

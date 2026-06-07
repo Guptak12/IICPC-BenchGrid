@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/HdrHistogram/hdrhistogram-go"
-	gojson "github.com/goccy/go-json"
 )
 
 // StrategyType defines what kind of market participant this bot simulates
@@ -164,10 +163,6 @@ func (b *Bot) CalculateLatency(orderID int64) int64 {
 		return -1 // order was never sent — defensive check
 	}
 	return time.Now().UnixNano() - sendTime
-}
-
-func (b *Bot) MarshalOrder(msg OrderMessage) ([]byte, error) {
-	return gojson.Marshal(msg)
 }
 
 func (b *Bot) marketMakerOrder(orderID, seq int64) OrderMessage {

@@ -2,17 +2,15 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
+	"encoding/binary"
+	"io"
 	"net"
-	"net/http"
-	"net/http/httptest"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/coder/websocket"
+	"google.golang.org/protobuf/proto"
+	protocol "iicpc-sandbox/pkg/protocol"
 )
 
 type immediateStrategy struct{}
@@ -25,60 +23,80 @@ func TestRunBotDoesNotCountFillFramesAsAcks(t *testing.T) {
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Skipf("local socket listen unavailable: %v", err)
+		t.Fatalf("local socket listen failed: %v", err)
 	}
+	defer listener.Close()
 
-	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-			Subprotocols: []string{"trading"},
-		})
+	go func() {
+		conn, err := listener.Accept()
 		if err != nil {
-			t.Errorf("accept failed: %v", err)
 			return
 		}
-		defer conn.Close(websocket.StatusNormalClosure, "done")
-
-		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-		defer cancel()
+		defer conn.Close()
 
 		for i := 1; i <= 3; i++ {
-			_, payload, err := conn.Read(ctx)
+			// Read 4-byte length prefix
+			var length uint32
+			err := binary.Read(conn, binary.LittleEndian, &length)
 			if err != nil {
-				t.Errorf("read order %d failed: %v", i, err)
+				return
+			}
+
+			payload := make([]byte, length)
+			_, err = io.ReadFull(conn, payload)
+			if err != nil {
 				return
 			}
 			received.Add(1)
 
-			var msg OrderMessage
-			if err := json.Unmarshal(payload, &msg); err != nil {
-				t.Errorf("unmarshal order %d failed: %v", i, err)
+			var order protocol.Order
+			if err := proto.Unmarshal(payload, &order); err != nil {
 				return
 			}
 
-			status := "accepted"
+			// Send Ack: ACCEPTED
+			status := protocol.ExecutionStatus_ACCEPTED
 			if i == 3 {
-				status = "cancelled"
+				status = protocol.ExecutionStatus_CANCELLED
 			}
-			ack := fmt.Sprintf(`{"order_id":%d,"status":"%s","engine_seq_id":%d}`, msg.OrderID, status, i)
-			if err := conn.Write(ctx, websocket.MessageText, []byte(ack)); err != nil {
-				t.Errorf("write ack %d failed: %v", i, err)
+
+			ackReport := &protocol.ExecutionReport{
+				OrderId:     order.OrderId,
+				Status:      status,
+				EngineSeqId: uint64(i),
+			}
+			ackBytes, err := proto.Marshal(ackReport)
+			if err != nil {
 				return
 			}
 
+			lengthPrefix := make([]byte, 4)
+			binary.LittleEndian.PutUint32(lengthPrefix, uint32(len(ackBytes)))
+			_, _ = conn.Write(lengthPrefix)
+			_, _ = conn.Write(ackBytes)
+
+			// Interleave a Fill report on order 1
 			if i == 1 {
-				fill := `{"order_id":999999,"status":"filled","filled_qty":1,"filled_price":100,"matched_with":1,"engine_seq_id":99}`
-				if err := conn.Write(ctx, websocket.MessageText, []byte(fill)); err != nil {
-					t.Errorf("write interleaved fill failed: %v", err)
+				fillReport := &protocol.ExecutionReport{
+					OrderId:     order.OrderId,
+					Status:      protocol.ExecutionStatus_FILLED,
+					FilledQty:   1,
+					FilledPrice: 100,
+					MatchedWith: 1,
+					EngineSeqId: 99,
+				}
+				fillBytes, err := proto.Marshal(fillReport)
+				if err != nil {
 					return
 				}
+				binary.LittleEndian.PutUint32(lengthPrefix, uint32(len(fillBytes)))
+				_, _ = conn.Write(lengthPrefix)
+				_, _ = conn.Write(fillBytes)
 			}
 		}
-	}))
-	server.Listener = listener
-	server.Start()
-	defer server.Close()
+	}()
 
-	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
+	endpoint := listener.Addr().String()
 	cfg := NewBotConfig(1, "bot-1", StrategyType("PROGRESS_BASED"), 100.0, 0.10, 3, 1000.0, 42)
 	var totalSent atomic.Int64
 
