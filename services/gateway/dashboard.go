@@ -635,6 +635,16 @@ const dashboardHTML = `<!DOCTYPE html>
                     </div>
                 </div>
                 <div style="display: flex; flex-direction: column; gap: 15px;">
+                    <div style="margin-bottom: 5px;">
+                        <label for="mock-engine-select" style="font-size: 11px; text-transform: uppercase; color: var(--text-muted); display: block; margin-bottom: 8px;">Mock Engine Type</label>
+                        <select id="mock-engine-select" style="background-color: #0d1117; color: var(--text-color); border: 1px solid var(--border-color); border-radius: 6px; padding: 10px 12px; width: 100%; font-size: 13px; font-weight: 500; outline: none;">
+                            <option value="go_optimized">Go (Optimized - 100% correct)</option>
+                            <option value="python_slow">Python (Slow - 10ms delay)</option>
+                            <option value="rust_crash">Rust (Crash after 10 orders)</option>
+                            <option value="node_scammer">Node.js (Scammer/Anomalies)</option>
+                            <option value="cpp_basic">C++ (Basic/Normal)</option>
+                        </select>
+                    </div>
                     <button class="btn btn-primary" onclick="triggerMockSubmission()">
                         <i class="fa-solid fa-rocket"></i> Trigger Mock Submission
                     </button>
@@ -914,9 +924,18 @@ const dashboardHTML = `<!DOCTYPE html>
                         const p99 = diag.p99_us || 0;
                         const tps = diag.tps_end || diag.actual_tps || 0;
 
+                        let verdictColor = "var(--accent-red)";
+                        if (sub.verdict === 'Accepted') {
+                            verdictColor = "var(--accent-green)";
+                        } else if (sub.verdict === 'Tail Latency Exceeded (TLE)') {
+                            verdictColor = "var(--accent-amber)";
+                        } else if (sub.verdict === 'Pending') {
+                            verdictColor = "var(--text-secondary)";
+                        }
+
                         tr.innerHTML = "<td><strong>" + sub.contestant_id + "</strong></td>" +
                             "<td><span class=\"badge " + verdictClass + "\">" + sub.status + "</span></td>" +
-                            "<td><span style=\"font-weight:600; color:" + (sub.verdict === 'Accepted' ? 'var(--accent-green)' : (sub.verdict === 'Pending' ? 'var(--text-muted)' : 'var(--accent-red)')) + "\">" + sub.verdict + "</span></td>" +
+                            "<td><span style=\"font-weight:600; color:" + verdictColor + "\">" + sub.verdict + "</span></td>" +
                             "<td>" + sub.composite_score.toFixed(2) + "</td>" +
                             "<td>" + (p99 > 0 ? p99.toLocaleString() : '-') + "</td>" +
                             "<td>" + (tps > 0 ? Math.round(tps) : '-') + "</td>" +
@@ -968,12 +987,13 @@ const dashboardHTML = `<!DOCTYPE html>
 
         // Trigger Operations
         async function triggerMockSubmission() {
-            addLog('Sending request to dispatch mock submission...');
+            const engine = document.getElementById('mock-engine-select').value;
+            addLog('Sending request to dispatch mock submission (' + engine + ')...');
             try {
-                const res = await fetch('/api/v1/dashboard/actions/mock-submission', { method: 'POST' });
+                const res = await fetch('/api/v1/dashboard/actions/mock-submission?engine=' + encodeURIComponent(engine), { method: 'POST' });
                 if (!res.ok) throw new Error(await res.text());
                 const data = await res.json();
-                addLog("Mock submission successfully accepted! BuildID: " + data.build_id, 'warning');
+                addLog("Mock submission (" + engine + ") successfully accepted! BuildID: " + data.build_id, 'warning');
                 pollMetrics();
             } catch (err) {
                 addLog("Failed to trigger mock submission: " + err.message, 'error');
