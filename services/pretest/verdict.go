@@ -18,7 +18,10 @@ type StrategyMetrics struct {
 // PretestResults represents the raw measurements from a pretest execution
 type PretestResults struct {
 	Correctness      float64 // 0 to 100
-	P99Us            int64   // p99 latency in microseconds
+	P50Us            int64   // p50 latency in microseconds (client RTT)
+	P90Us            int64   // p90 latency in microseconds (client RTT)
+	P99Us            int64   // p99 latency in microseconds (client RTT)
+	EngineP99Us      int64   // p99 engine-reported latency in microseconds
 	OrdersSent       int64
 	OrdersFailed     int64
 	TpsStart         float64 // starting TPS
@@ -47,33 +50,39 @@ func EvaluateVerdict(res PretestResults) (string, float64, map[string]interface{
 		}
 	}
 
-	// --- Determine Verdict ---
+	// --- Determine Verdict and Reason ---
 	verdict := "Accepted"
-	if res.Correctness < 50.0 {
-		verdict = "Wrong Answer"
-	} else if res.Correctness < 85.0 {
-		verdict = "Partial — Correctness"
-	} else if res.P99Us > 50000 {
-		verdict = "Time Limit Exceeded"
-	} else if res.P99Us > 10000 {
-		verdict = "Partial — Latency"
-	} else if failRate > 0.30 || degradation > 0.60 {
-		verdict = "Throughput Exceeded"
+	reason := "Optimal Execution (Passes all SLAs)"
+	if res.Correctness < 100.0 {
+		verdict = "Logic Violation (LV)"
+		reason = "Correctness < 100% (Order Book Math Mismatch)"
+	} else if res.P99Us > 5000 {
+		verdict = "Tail Latency Exceeded (TLE)"
+		reason = "P99 > 5000µs (Worst-case Tail Spikes)"
 	} else if failRate > 0.10 || degradation > 0.30 {
-		verdict = "Partial — Throughput"
+		verdict = "Throughput Degradation"
+		if failRate > 0.10 {
+			reason = "Failure Rate > 10% (Dropped Orders)"
+		} else {
+			reason = "TPS Degradation > 30% (Severe Contention)"
+		}
 	}
 
 	diagnostics := map[string]interface{}{
-		"correctness":          res.Correctness,
-		"p99_us":              res.P99Us,
-		"orders_sent":         res.OrdersSent,
-		"orders_failed":       res.OrdersFailed,
-		"tps_start":           res.TpsStart,
-		"tps_end":             res.TpsEnd,
-		"failure_rate_pct":    failRate * 100.0,
-		"tps_degradation_pct": degradation * 100.0,
-		"phantom_fills":       res.PhantomFills,
-		"priority_violations": res.PriorityViolations,
+		"correctness":            res.Correctness,
+		"p50_us":                res.P50Us,
+		"p90_us":                res.P90Us,
+		"p99_us":                res.P99Us,
+		"engine_reported_p99_us": res.EngineP99Us,
+		"orders_sent":           res.OrdersSent,
+		"orders_failed":         res.OrdersFailed,
+		"tps_start":             res.TpsStart,
+		"tps_end":               res.TpsEnd,
+		"failure_rate_pct":      failRate * 100.0,
+		"tps_degradation_pct":   degradation * 100.0,
+		"phantom_fills":         res.PhantomFills,
+		"priority_violations":   res.PriorityViolations,
+		"reason":                reason,
 	}
 
 	// --- Per-Strategy Breakdown (inspired by PolyBench strategy utilization) ---
@@ -114,7 +123,7 @@ func EvaluateVerdict(res PretestResults) (string, float64, map[string]interface{
 
 	// --- Calculate Scores ---
 	throughputScore := scoring.ThroughputScore(failRate)
-	latencyScore := scoring.LatencyScore(float64(res.P99Us))
+	latencyScore := scoring.LatencyScore(float64(res.P50Us), float64(res.P90Us), float64(res.P99Us))
 	compositeScore := scoring.CompositeScore(res.Correctness, latencyScore, throughputScore)
 
 	diagnostics["warnings"] = warnings

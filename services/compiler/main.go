@@ -1,14 +1,12 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
-	"fmt"
-	"io"
 	"log"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -112,96 +110,66 @@ func main() {
 
 func processMessage(ctx context.Context, message redis.XMessage) {
 	submissionID, ok1 := message.Values["submission_id"].(string)
-	s3Path, ok2 := message.Values["s3_path"].(string)
+	s3Path, _ := message.Values["s3_path"].(string)
+	githubURL, _ := message.Values["github_url"].(string)
 	contestantID, _ := message.Values["contestant_id"].(string)
 
-	if !ok1 || !ok2 {
+	if !ok1 || (s3Path == "" && githubURL == "") {
 		log.Printf("Skipping invalid stream message: %v\n", message.ID)
 		rdb.XAck(ctx, common.CompilationQueue, common.CompilationGroup, message.ID)
 		return
 	}
 
-	log.Printf("[submission:%s] Starting compilation...\n", submissionID[:8])
+	log.Printf("[submission:%s] Starting image build...\n", submissionID[:8])
 
-	// 1. Update PostgreSQL status to 'compiling'
+	// 1. Update PostgreSQL status to 'building'
 	_, err := db.ExecContext(ctx,
 		"UPDATE submissions SET status = $1, updated_at = NOW() WHERE id = $2",
-		"compiling", submissionID,
+		"building", submissionID,
 	)
 	if err != nil {
-		log.Printf("Failed to update status to compiling: %v\n", err)
+		log.Printf("Failed to update status to building: %v\n", err)
 	}
 
-	// 2. Download source from S3
-	obj, err := s3Client.GetObject(ctx, common.S3Bucket, s3Path, minio.GetObjectOptions{})
+	// 2. Perform Docker/Kaniko build
+	success, imageTag, stderr, err := BuildImage(ctx, s3Client, s3Path, githubURL, submissionID)
 	if err != nil {
-		log.Printf("[submission:%s] Failed to get source from S3: %v\n", submissionID[:8], err)
+		log.Printf("[submission:%s] System error during build: %v\n", submissionID[:8], err)
 		if common.ShouldRetry(ctx, rdb, common.CompilationQueue, common.CompilationGroup, message.ID, message.Values, err) {
 			return
 		}
-		failSubmission(ctx, submissionID, "System Failure", "Failed to retrieve source code from storage: "+err.Error())
-		return
-	}
-	defer obj.Close()
-	srcBytes, err := io.ReadAll(obj)
-	if err != nil {
-		log.Printf("[submission:%s] Failed to read source from S3 object: %v\n", submissionID[:8], err)
-		if common.ShouldRetry(ctx, rdb, common.CompilationQueue, common.CompilationGroup, message.ID, message.Values, err) {
-			return
-		}
-		failSubmission(ctx, submissionID, "System Failure", "Failed to read source code: "+err.Error())
-		return
-	}
-
-	// 3. Perform compilation
-	success, stderr, binaryBytes, err := CompileCode(ctx, dockerClient, srcBytes)
-	if err != nil {
-		log.Printf("[submission:%s] System error during compilation: %v\n", submissionID[:8], err)
-		if common.ShouldRetry(ctx, rdb, common.CompilationQueue, common.CompilationGroup, message.ID, message.Values, err) {
-			return
-		}
-		failSubmission(ctx, submissionID, "Compilation Failure", "Internal compilation agent error: "+err.Error())
+		failSubmission(ctx, submissionID, "System Failure", "Internal build agent error: "+err.Error())
 		return
 	}
 
 	if !success {
-		log.Printf("[submission:%s] Compilation failed\n", submissionID[:8])
-		failSubmission(ctx, submissionID, "Compilation Error", stderr)
+		log.Printf("[submission:%s] Image build failed\n", submissionID[:8])
+		verdict := "Build Error"
+		if strings.Contains(stderr, "Build Timeout") {
+			verdict = "Build Timeout"
+		}
+		failSubmission(ctx, submissionID, verdict, stderr)
 		rdb.XAck(ctx, common.CompilationQueue, common.CompilationGroup, message.ID)
 		return
 	}
 
-	// 4. Upload binary to S3
-	binaryPath := fmt.Sprintf("submissions/%s/app", submissionID)
-	_, err = s3Client.PutObject(ctx, common.S3Bucket, binaryPath, bytes.NewReader(binaryBytes), int64(len(binaryBytes)), minio.PutObjectOptions{
-		ContentType: "application/octet-stream",
-	})
-	if err != nil {
-		log.Printf("[submission:%s] Failed to upload binary to S3: %v\n", submissionID[:8], err)
-		if common.ShouldRetry(ctx, rdb, common.CompilationQueue, common.CompilationGroup, message.ID, message.Values, err) {
-			return
-		}
-		failSubmission(ctx, submissionID, "System Failure", "Failed to store compiled binary: "+err.Error())
-		return
-	}
+	log.Printf("[submission:%s] Build succeeded (Tag: %s) ✓\n", submissionID[:8], imageTag)
 
-	log.Printf("[submission:%s] Compilation succeeded ✓\n", submissionID[:8])
-
-	// 5. Update PostgreSQL status to 'compiled'
+	// 3. Update PostgreSQL status to 'built'
 	_, err = db.ExecContext(ctx,
 		"UPDATE submissions SET status = $1, updated_at = NOW() WHERE id = $2",
-		"compiled", submissionID,
+		"built", submissionID,
 	)
 	if err != nil {
-		log.Printf("Failed to update status to compiled: %v\n", err)
+		log.Printf("Failed to update status to built: %v\n", err)
 	}
 
-	// 6. Push job to pretest queue via XADD
+	// 4. Push job to pretest queue via XADD
 	err = rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: common.PretestQueue,
 		Values: map[string]interface{}{
 			"submission_id": submissionID,
-			"binary_path":   binaryPath,
+			"image_tag":     imageTag,
 			"contestant_id": contestantID,
 		},
 	}).Err()
@@ -215,6 +183,8 @@ func processMessage(ctx context.Context, message redis.XMessage) {
 }
 
 func failSubmission(ctx context.Context, submissionID, verdict, stderr string) {
+	stderr = strings.ReplaceAll(stderr, "\x00", "")
+	stderr = strings.ToValidUTF8(stderr, "")
 	diag := map[string]string{
 		"error": stderr,
 	}

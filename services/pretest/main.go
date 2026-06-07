@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -119,7 +120,7 @@ func main() {
 
 func processPretestMessage(ctx context.Context, message redis.XMessage) {
 	submissionID, ok1 := message.Values["submission_id"].(string)
-	binaryPath, ok2 := message.Values["binary_path"].(string)
+	imageTag, ok2 := message.Values["image_tag"].(string)
 
 	if !ok1 || !ok2 {
 		log.Printf("Skipping invalid stream message: %v\n", message.ID)
@@ -138,34 +139,16 @@ func processPretestMessage(ctx context.Context, message redis.XMessage) {
 		log.Printf("Failed to update status to running: %v\n", err)
 	}
 
-	// Download binary from S3
-	obj, err := s3Client.GetObject(ctx, common.S3Bucket, binaryPath, minio.GetObjectOptions{})
-	if err != nil {
-		log.Printf("[submission:%s] Failed to get binary from S3: %v\n", submissionID[:8], err)
-		if common.ShouldRetry(ctx, rdb, common.PretestQueue, common.PretestGroup, message.ID, message.Values, err) {
-			return
-		}
-		failPretest(ctx, submissionID, "Runtime Failure", "Failed to retrieve compiled binary from storage: "+err.Error())
-		return
-	}
-	defer obj.Close()
-	binaryBytes, err := io.ReadAll(obj)
-	if err != nil {
-		log.Printf("[submission:%s] Failed to read binary from S3 object: %v\n", submissionID[:8], err)
-		if common.ShouldRetry(ctx, rdb, common.PretestQueue, common.PretestGroup, message.ID, message.Values, err) {
-			return
-		}
-		failPretest(ctx, submissionID, "Runtime Failure", "Failed to read binary: "+err.Error())
-		return
-	}
-
 	// 2. Run k=3 iterations (AlphaForgeBench K-Run stability requirement)
 	k := 3
 	var runResults []PretestResults
 	var runScores []float64
 
 	var totalCorrectness float64
+	var totalP50Us int64
+	var totalP90Us int64
 	var totalP99Us int64
+	var totalEngineP99Us int64
 	var totalTpsEnd float64
 	var totalSent, totalFailed int64
 	var totalPhantomFills, totalPriorityViolations int64
@@ -177,36 +160,36 @@ func processPretestMessage(ctx context.Context, message redis.XMessage) {
 	}
 
 	baseSeed := int64(42424242)
+	var accumulatedLogs string
 
 	for run := 0; run < k; run++ {
 		log.Printf("[submission:%s] Starting pretest run %d/%d...\n", submissionID[:8], run+1, k)
 
-		// Start sandboxed contestant container
-		containerID, endpoint, err := startContestantSandbox(ctx, submissionID, binaryBytes)
+		// Start sandboxed contestant container directly using their image
+		containerID, endpoint, err := startContestantSandbox(ctx, submissionID, imageTag)
 		if err != nil {
 			log.Printf("[submission:%s] Run %d: Failed to spin up sandbox: %v\n", submissionID[:8], run+1, err)
 			if common.ShouldRetry(ctx, rdb, common.PretestQueue, common.PretestGroup, message.ID, message.Values, err) {
 				return
 			}
-			failPretest(ctx, submissionID, "Runtime Failure", "Failed to spin up runtime sandbox: "+err.Error())
+			failPretest(ctx, submissionID, "Runtime Failure", "Failed to spin up runtime sandbox: "+err.Error(), accumulatedLogs)
 			return
 		}
-
-		// Give sandbox engine a tiny window to bind to port 8080 and listen
-		time.Sleep(1 * time.Second)
 
 		// Execute pretest fleet with run-specific seed
 		seedForRun := baseSeed + int64(run*1000)
 		results, err := RunPretestFleet(ctx, endpoint, seedForRun)
 
-		// Clean up container immediately after this run
+		// Clean up container immediately after this run and extract logs (Edge Case 3)
 		log.Printf("[submission:%s] Run %d: Cleaning up contestant sandbox...\n", submissionID[:8], run+1)
 		reader, logErr := dockerClient.ContainerLogs(context.Background(), containerID, client.ContainerLogsOptions{ShowStdout: true, ShowStderr: true})
 		if logErr == nil {
 			logData, _ := io.ReadAll(reader)
+			accumulatedLogs += fmt.Sprintf("=== RUN %d LOGS ===\n%s\n", run+1, string(logData))
 			log.Printf("[submission:%s] Run %d Sandbox Logs:\n%s\n", submissionID[:8], run+1, string(logData))
 			reader.Close()
 		}
+
 		_, _ = dockerClient.ContainerStop(context.Background(), containerID, client.ContainerStopOptions{})
 		_, _ = dockerClient.ContainerRemove(context.Background(), containerID, client.ContainerRemoveOptions{Force: true})
 
@@ -215,7 +198,7 @@ func processPretestMessage(ctx context.Context, message redis.XMessage) {
 			if common.ShouldRetry(ctx, rdb, common.PretestQueue, common.PretestGroup, message.ID, message.Values, err) {
 				return
 			}
-			failPretest(ctx, submissionID, "Runtime Failure", "Pretest execution failed: "+err.Error())
+			failPretest(ctx, submissionID, "Runtime Failure", "Pretest execution failed: "+err.Error(), accumulatedLogs)
 			return
 		}
 
@@ -226,7 +209,10 @@ func processPretestMessage(ctx context.Context, message redis.XMessage) {
 
 		// Accumulate
 		totalCorrectness += results.Correctness
+		totalP50Us += results.P50Us
+		totalP90Us += results.P90Us
 		totalP99Us += results.P99Us
+		totalEngineP99Us += results.EngineP99Us
 		totalTpsEnd += results.TpsEnd
 		totalSent += results.OrdersSent
 		totalFailed += results.OrdersFailed
@@ -247,7 +233,10 @@ func processPretestMessage(ctx context.Context, message redis.XMessage) {
 
 	// Compute averages
 	avgCorrectness := totalCorrectness / float64(k)
+	avgP50Us := totalP50Us / int64(k)
+	avgP90Us := totalP90Us / int64(k)
 	avgP99Us := totalP99Us / int64(k)
+	avgEngineP99Us := totalEngineP99Us / int64(k)
 	avgTpsEnd := totalTpsEnd / float64(k)
 	avgSent := totalSent / int64(k)
 	avgFailed := totalFailed / int64(k)
@@ -275,7 +264,10 @@ func processPretestMessage(ctx context.Context, message redis.XMessage) {
 	// Evaluate final aggregated verdict using the average metrics
 	aggregatedResults := PretestResults{
 		Correctness:        avgCorrectness,
+		P50Us:              avgP50Us,
+		P90Us:              avgP90Us,
 		P99Us:              avgP99Us,
+		EngineP99Us:        avgEngineP99Us,
 		OrdersSent:         avgSent,
 		OrdersFailed:       avgFailed,
 		TpsStart:           runResults[0].TpsStart, // baseline TPS start
@@ -301,6 +293,8 @@ func processPretestMessage(ctx context.Context, message redis.XMessage) {
 	diagnostics["stability_std_dev"] = math.Round(stdDev*100) / 100
 	diagnostics["stability_bonus"] = stabilityBonus
 	diagnostics["run_scores"] = runScores
+	// Save sandboxed logs snippet in diagnostics for frontend rendering (Edge Case 3)
+	diagnostics["sandbox_logs"] = tailLogs(accumulatedLogs, 100)
 
 	log.Printf("[submission:%s] Pretest Finished! Verdict: %s | Score: %.2f (Mean: %.2f, StdDev: %.2f) ✓\n",
 		submissionID[:8], verdict, compositeScore, meanScore, stdDev)
@@ -313,7 +307,7 @@ func processPretestMessage(ctx context.Context, message redis.XMessage) {
 		     p50_us = $5, p90_us = $6, p99_us = $7, actual_tps = $8, diagnostics = $9, updated_at = NOW() 
 		 WHERE id = $10`,
 		"completed", verdict, compositeScore, avgCorrectness,
-		avgP99Us/2, avgP99Us*9/10, avgP99Us, avgTpsEnd, diagBytes, submissionID,
+		avgP50Us, avgP90Us, avgP99Us, avgTpsEnd, diagBytes, submissionID,
 	)
 	if err != nil {
 		log.Printf("Failed to write final submission results to DB: %v\n", err)
@@ -323,8 +317,8 @@ func processPretestMessage(ctx context.Context, message redis.XMessage) {
 	rdb.XAck(ctx, common.PretestQueue, common.PretestGroup, message.ID)
 }
 
-func startContestantSandbox(ctx context.Context, submissionID string, binaryBytes []byte) (string, string, error) {
-	log.Printf("[debug] startContestantSandbox: dynamic port mapping configuration initialized")
+func startContestantSandbox(ctx context.Context, submissionID string, imageTag string) (string, string, error) {
+	log.Printf("[debug] startContestantSandbox: dynamic port mapping configuration initialized (Port 8000)")
 	containerName := "contestant-" + submissionID
 	pidsLimit := int64(2048)
 
@@ -335,10 +329,9 @@ func startContestantSandbox(ctx context.Context, submissionID string, binaryByte
 
 	cpuset := os.Getenv("SANDBOX_CPUSET")
 
-	port := "8080/tcp"
+	port := "8000/tcp" // Port contract is Port 8000 TCP
 	config := &container.Config{
-		Image:    common.RuntimeImage,
-		Cmd:      []string{"/usr/src/app"},
+		Image:    imageTag,
 		Tty:      false,
 		Hostname: containerName,
 		ExposedPorts: network.PortSet{
@@ -346,8 +339,11 @@ func startContestantSandbox(ctx context.Context, submissionID string, binaryByte
 		},
 	}
 
+	sandboxRuntime := os.Getenv("SANDBOX_RUNTIME")
+
 	hostConfig := &container.HostConfig{
 		NetworkMode: container.NetworkMode(sandboxNet),
+		Runtime:     sandboxRuntime,
 		Resources: container.Resources{
 			Memory:     256 * 1024 * 1024, // 256MB memory cap
 			NanoCPUs:   int64(1 * 1e9),     // 1 CPU
@@ -391,11 +387,15 @@ func startContestantSandbox(ctx context.Context, submissionID string, binaryByte
 		return "", "", fmt.Errorf("failed to create contestant sandbox: %v", err)
 	}
 
-	// Copy binary payload to /usr/src/app in the container with executable permission
-	err = common.CopyFileToContainer(ctx, dockerClient, resp.ID, "/usr/src", "app", binaryBytes, 0755)
-	if err != nil {
-		_, _ = dockerClient.ContainerRemove(ctx, resp.ID, client.ContainerRemoveOptions{Force: true})
-		return "", "", fmt.Errorf("failed to copy binary to contestant sandbox: %v", err)
+	// Pull image in production distributed environment if needed
+	registryURL := os.Getenv("REGISTRY_URL")
+	if registryURL != "" && strings.Contains(imageTag, registryURL) {
+		log.Printf("[debug] Pulling contestant image: %s\n", imageTag)
+		reader, err := dockerClient.ImagePull(ctx, imageTag, client.ImagePullOptions{})
+		if err == nil {
+			_, _ = io.Copy(io.Discard, reader)
+			reader.Close()
+		}
 	}
 
 	// Start contestant container
@@ -414,7 +414,7 @@ func startContestantSandbox(ctx context.Context, submissionID string, binaryByte
 		}
 
 		if sandboxNet == "host" {
-			endpoint = "ws://127.0.0.1:8080/ws"
+			endpoint = "127.0.0.1:8000"
 			break
 		}
 
@@ -427,7 +427,7 @@ func startContestantSandbox(ctx context.Context, submissionID string, binaryByte
 				if bindings, ok := info.Container.NetworkSettings.Ports[network.MustParsePort(port)]; ok && len(bindings) > 0 {
 					hostPort := bindings[0].HostPort
 					if hostPort != "" {
-						endpoint = fmt.Sprintf("ws://127.0.0.1:%s/ws", hostPort)
+						endpoint = fmt.Sprintf("127.0.0.1:%s", hostPort)
 						log.Printf("[debug] Resolved endpoint via mapped host port: %s\n", endpoint)
 						break
 					}
@@ -438,7 +438,7 @@ func startContestantSandbox(ctx context.Context, submissionID string, binaryByte
 			if i > 15 {
 				if netSettings, ok := info.Container.NetworkSettings.Networks[sandboxNet]; ok && netSettings != nil {
 					if netSettings.IPAddress.IsValid() {
-						endpoint = fmt.Sprintf("ws://%s:8080/ws", netSettings.IPAddress.String())
+						endpoint = fmt.Sprintf("%s:8000", netSettings.IPAddress.String())
 						log.Printf("[debug] Resolved endpoint via container IP fallback: %s\n", endpoint)
 						break
 					}
@@ -471,9 +471,14 @@ func startContestantSandbox(ctx context.Context, submissionID string, binaryByte
 	return resp.ID, endpoint, nil
 }
 
-func failPretest(ctx context.Context, submissionID, verdict, stderr string) {
+func failPretest(ctx context.Context, submissionID, verdict, stderr string, sandboxLogs string) {
+	stderr = strings.ReplaceAll(stderr, "\x00", "")
+	stderr = strings.ToValidUTF8(stderr, "")
 	diag := map[string]string{
 		"error": stderr,
+	}
+	if sandboxLogs != "" {
+		diag["sandbox_logs"] = tailLogs(sandboxLogs, 100)
 	}
 	diagBytes, _ := json.Marshal(diag)
 
@@ -484,6 +489,16 @@ func failPretest(ctx context.Context, submissionID, verdict, stderr string) {
 	if err != nil {
 		log.Printf("Failed to mark submission as failed: %v\n", err)
 	}
+}
+
+func tailLogs(logs string, maxLines int) string {
+	logs = strings.ReplaceAll(logs, "\x00", "")
+	logs = strings.ToValidUTF8(logs, "")
+	lines := strings.Split(logs, "\n")
+	if len(lines) <= maxLines {
+		return logs
+	}
+	return strings.Join(lines[len(lines)-maxLines:], "\n")
 }
 
 func startDockerSweeper(ctx context.Context, dockerClient *client.Client) {

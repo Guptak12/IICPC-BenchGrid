@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -30,6 +31,11 @@ type LeaderboardEntry struct {
 	ThroughputScore  float64   `json:"throughput_score"`
 	EngineArchetype  string    `json:"engine_archetype"`
 	UpdatedAt        time.Time `json:"updated_at"`
+	
+	// Deltas & Actionable Reasons
+	DeltaScore       float64   `json:"delta_score"`
+	DeltaP99         int64     `json:"delta_p99"`
+	Reason           string    `json:"reason"`
 }
 
 type sseHub struct {
@@ -159,19 +165,16 @@ func generateLeaderboard(db *sql.DB, targetPath string) {
 	defer cancel()
 
 	query := `
-		SELECT contestant_id, id, verdict, composite_score, correctness_score, p50_us, p90_us, p99_us, actual_tps,
-		       COALESCE((diagnostics->>'latency_score')::double precision, 0.0) AS latency_score,
-		       COALESCE((diagnostics->>'throughput_score')::double precision, 0.0) AS throughput_score,
-		       COALESCE(diagnostics->>'engine_archetype', 'Unclassified') AS engine_archetype,
-		       updated_at
-		FROM (
-			SELECT DISTINCT ON (contestant_id) 
-			       contestant_id, id, verdict, composite_score, correctness_score, p50_us, p90_us, p99_us, actual_tps, diagnostics, updated_at
+		WITH ranked_submissions AS (
+			SELECT contestant_id, id, verdict, composite_score, correctness_score, p50_us, p90_us, p99_us, actual_tps, diagnostics, updated_at,
+			       ROW_NUMBER() OVER (PARTITION BY contestant_id ORDER BY composite_score DESC, updated_at ASC) as rank_score
 			FROM submissions
 			WHERE status = 'completed'
-			ORDER BY contestant_id, composite_score DESC, updated_at ASC
-		) AS sub
-		ORDER BY composite_score DESC, updated_at ASC
+		)
+		SELECT contestant_id, id, verdict, composite_score, correctness_score, p50_us, p90_us, p99_us, actual_tps, diagnostics, updated_at, rank_score
+		FROM ranked_submissions
+		WHERE rank_score <= 2
+		ORDER BY contestant_id, rank_score ASC
 	`
 
 	rows, err := db.QueryContext(ctx, query)
@@ -181,33 +184,112 @@ func generateLeaderboard(db *sql.DB, targetPath string) {
 	}
 	defer rows.Close()
 
-	entries := []LeaderboardEntry{}
-	rank := 1
+	type rawRow struct {
+		contestantID     string
+		submissionID     string
+		verdict          string
+		compositeScore   float64
+		correctnessScore float64
+		p50Us            int64
+		p90Us            int64
+		p99Us            int64
+		actualTps        float64
+		diagnosticsRaw   []byte
+		updatedAt        time.Time
+		rankScore        int
+	}
 
+	contestantMap := make(map[string][]rawRow)
 	for rows.Next() {
-		var entry LeaderboardEntry
+		var r rawRow
 		err := rows.Scan(
-			&entry.ContestantID,
-			&entry.SubmissionID,
-			&entry.Verdict,
-			&entry.CompositeScore,
-			&entry.CorrectnessScore,
-			&entry.P50Us,
-			&entry.P90Us,
-			&entry.P99Us,
-			&entry.ActualTps,
-			&entry.LatencyScore,
-			&entry.ThroughputScore,
-			&entry.EngineArchetype,
-			&entry.UpdatedAt,
+			&r.contestantID,
+			&r.submissionID,
+			&r.verdict,
+			&r.compositeScore,
+			&r.correctnessScore,
+			&r.p50Us,
+			&r.p90Us,
+			&r.p99Us,
+			&r.actualTps,
+			&r.diagnosticsRaw,
+			&r.updatedAt,
+			&r.rankScore,
 		)
 		if err != nil {
 			log.Printf("[leaderboard] Scan row error: %v\n", err)
 			continue
 		}
-		entry.Rank = rank
+		contestantMap[r.contestantID] = append(contestantMap[r.contestantID], r)
+	}
+
+	entries := []LeaderboardEntry{}
+
+	for _, subs := range contestantMap {
+		if len(subs) == 0 {
+			continue
+		}
+		
+		// rank_score = 1 is the first entry due to ORDER BY rank_score ASC
+		best := subs[0]
+
+		var diag map[string]interface{}
+		if len(best.diagnosticsRaw) > 0 {
+			_ = json.Unmarshal(best.diagnosticsRaw, &diag)
+		}
+		if diag == nil {
+			diag = make(map[string]interface{})
+		}
+
+		latScore, _ := diag["latency_score"].(float64)
+		tpScore, _ := diag["throughput_score"].(float64)
+		archetype, _ := diag["engine_archetype"].(string)
+		if archetype == "" {
+			archetype = "Unclassified"
+		}
+		reason, _ := diag["reason"].(string)
+		if reason == "" {
+			reason = "Optimal Execution (Passes all SLAs)"
+		}
+
+		entry := LeaderboardEntry{
+			ContestantID:     best.contestantID,
+			SubmissionID:     best.submissionID,
+			Verdict:          best.verdict,
+			CompositeScore:   best.compositeScore,
+			CorrectnessScore: best.correctnessScore,
+			P50Us:            best.p50Us,
+			P90Us:            best.p90Us,
+			P99Us:            best.p99Us,
+			ActualTps:        best.actualTps,
+			LatencyScore:     latScore,
+			ThroughputScore:  tpScore,
+			EngineArchetype:  archetype,
+			UpdatedAt:        best.updatedAt,
+			Reason:           reason,
+		}
+
+		// Calculate Deltas if the personal best high score is fresh (updated in the last 10 minutes)
+		if time.Since(best.updatedAt) <= 10*time.Minute && len(subs) > 1 {
+			secondBest := subs[1]
+			entry.DeltaScore = best.compositeScore - secondBest.compositeScore
+			entry.DeltaP99 = best.p99Us - secondBest.p99Us
+		}
+
 		entries = append(entries, entry)
-		rank++
+	}
+
+	// Sort leaderboard: best score first, tie-breaker oldest updatedAt first
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].CompositeScore != entries[j].CompositeScore {
+			return entries[i].CompositeScore > entries[j].CompositeScore
+		}
+		return entries[i].UpdatedAt.Before(entries[j].UpdatedAt)
+	})
+
+	// Assign Ranks
+	for i := range entries {
+		entries[i].Rank = i + 1
 	}
 
 	// Marshalling JSON

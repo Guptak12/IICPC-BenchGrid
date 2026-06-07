@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"database/sql"
@@ -143,44 +144,52 @@ func handleSubmission(c fiber.Ctx) error {
 		})
 	}
 
-	// 3. Parse file
-	fileHeader, err := c.FormFile("source_code")
-	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "missing source_code"})
-	}
-
-	if filepath.Ext(fileHeader.Filename) != ".cpp" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Only .cpp files accepted"})
-	}
-
-	file, err := fileHeader.Open()
-	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to open source_code"})
-	}
-	defer file.Close()
-
-	srcBytes, err := io.ReadAll(file)
-	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read source_code"})
-	}
-	sourceCode := string(srcBytes)
+	githubURL := c.FormValue("github_url")
+	var s3Path string
+	var sourceCode string
 
 	buildID := uuid.New().String()
 
-	// 4. Upload to S3/MinIO
-	s3Path := fmt.Sprintf("submissions/%s/main.cpp", buildID)
-	_, err = s3Client.PutObject(ctx, common.S3Bucket, s3Path, bytes.NewReader(srcBytes), int64(len(srcBytes)), minio.PutObjectOptions{
-		ContentType: "text/x-c++src",
-	})
-	if err != nil {
-		log.Printf("Failed to upload submission %s to S3: %v\n", buildID, err)
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to store source code"})
+	if githubURL != "" {
+		sourceCode = fmt.Sprintf("[GitHub URL: %s]", githubURL)
+	} else {
+		// Expect ZIP file upload via form field "source_code"
+		fileHeader, err := c.FormFile("source_code")
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "missing source_code ZIP file or github_url"})
+		}
+
+		if filepath.Ext(fileHeader.Filename) != ".zip" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Only .zip files accepted for multi-file submissions"})
+		}
+
+		file, err := fileHeader.Open()
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to open uploaded file"})
+		}
+		defer file.Close()
+
+		srcBytes, err := io.ReadAll(file)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read uploaded file"})
+		}
+		sourceCode = "[ZIP Submission]"
+
+		// Upload ZIP to S3
+		s3Path = fmt.Sprintf("submissions/%s/submission.zip", buildID)
+		_, err = s3Client.PutObject(ctx, common.S3Bucket, s3Path, bytes.NewReader(srcBytes), int64(len(srcBytes)), minio.PutObjectOptions{
+			ContentType: "application/zip",
+		})
+		if err != nil {
+			log.Printf("Failed to upload submission %s to S3: %v\n", buildID, err)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to store submission ZIP"})
+		}
 	}
 
 	// 5. Save to PostgreSQL
 	_, err = db.ExecContext(ctx,
-		"INSERT INTO submissions (id, contestant_id, status, verdict, s3_path) VALUES ($1, $2, $3, $4, $5)",
-		buildID, contestantID, "queued", "Pending", s3Path,
+		"INSERT INTO submissions (id, contestant_id, status, verdict, s3_path, github_url) VALUES ($1, $2, $3, $4, $5, $6)",
+		buildID, contestantID, "queued", "Pending", s3Path, githubURL,
 	)
 	if err != nil {
 		log.Printf("Failed to insert submission %s into DB: %v\n", buildID, err)
@@ -196,22 +205,28 @@ func handleSubmission(c fiber.Ctx) error {
 	}
 
 	// 6. Push job to compilation queue via Redis Stream XADD
+	redisValues := map[string]interface{}{
+		"submission_id": buildID,
+		"contestant_id": contestantID,
+	}
+	if githubURL != "" {
+		redisValues["github_url"] = githubURL
+	} else {
+		redisValues["s3_path"] = s3Path
+	}
+
 	err = rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: common.CompilationQueue,
-		Values: map[string]interface{}{
-			"submission_id": buildID,
-			"s3_path":       s3Path,
-			"contestant_id": contestantID,
-		},
+		Values: redisValues,
 	}).Err()
 	if err != nil {
-		log.Printf("Failed to queue compilation job for %s: %v\n", buildID, err)
+		log.Printf("Failed to queue build job for %s: %v\n", buildID, err)
 		// Update DB status to failed
 		db.ExecContext(ctx, "UPDATE submissions SET status = $1, verdict = $2, diagnostics = $3 WHERE id = $4", "failed", "Queue Failure", `{"error":"failed to queue job"}`, buildID)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to queue submission"})
 	}
 
-	log.Printf("Submission %s for %s accepted and queued for compilation ✓\n", buildID, contestantID)
+	log.Printf("Submission %s for %s accepted and queued for building ✓\n", buildID, contestantID)
 
 	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
 		"build_id": buildID,
@@ -232,12 +247,13 @@ func handleBuildStatus(c fiber.Ctx) error {
 		diagnosticsBytes []byte
 		compositeScore   float64
 		createdAt        time.Time
+		githubURL        sql.NullString
 	)
 
 	err := db.QueryRowContext(ctx,
-		"SELECT id, contestant_id, status, verdict, diagnostics, composite_score, created_at FROM submissions WHERE id = $1",
+		"SELECT id, contestant_id, status, verdict, diagnostics, composite_score, created_at, github_url FROM submissions WHERE id = $1",
 		id,
-	).Scan(&buildID, &contestantID, &status, &verdict, &diagnosticsBytes, &compositeScore, &createdAt)
+	).Scan(&buildID, &contestantID, &status, &verdict, &diagnosticsBytes, &compositeScore, &createdAt, &githubURL)
 
 	if err == sql.ErrNoRows {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "build not found"})
@@ -251,7 +267,7 @@ func handleBuildStatus(c fiber.Ctx) error {
 		diagnostics = map[string]interface{}{}
 	}
 
-	return c.JSON(fiber.Map{
+	resMap := fiber.Map{
 		"build_id":        buildID,
 		"contestant_id":   contestantID,
 		"status":          status,
@@ -259,14 +275,21 @@ func handleBuildStatus(c fiber.Ctx) error {
 		"diagnostics":     diagnostics,
 		"composite_score": compositeScore,
 		"submitted_at":    createdAt,
-	})
+	}
+	if githubURL.Valid {
+		resMap["github_url"] = githubURL.String
+	} else {
+		resMap["github_url"] = ""
+	}
+
+	return c.JSON(resMap)
 }
 
 func handleListBuilds(c fiber.Ctx) error {
 	ctx := context.Background()
 
 	rows, err := db.QueryContext(ctx,
-		"SELECT id, contestant_id, status, verdict, diagnostics, composite_score, created_at FROM submissions ORDER BY created_at DESC LIMIT 50",
+		"SELECT id, contestant_id, status, verdict, diagnostics, composite_score, created_at, github_url FROM submissions ORDER BY created_at DESC LIMIT 50",
 	)
 	if err != nil {
 		log.Printf("Query error listing builds: %v\n", err)
@@ -284,16 +307,17 @@ func handleListBuilds(c fiber.Ctx) error {
 			diagnosticsBytes []byte
 			compositeScore   float64
 			createdAt        time.Time
+			githubURL        sql.NullString
 		)
 
-		if err := rows.Scan(&buildID, &contestantID, &status, &verdict, &diagnosticsBytes, &compositeScore, &createdAt); err != nil {
+		if err := rows.Scan(&buildID, &contestantID, &status, &verdict, &diagnosticsBytes, &compositeScore, &createdAt, &githubURL); err != nil {
 			continue
 		}
 
 		var diagnostics map[string]interface{}
 		json.Unmarshal(diagnosticsBytes, &diagnostics)
 
-		builds = append(builds, fiber.Map{
+		resMap := fiber.Map{
 			"build_id":        buildID,
 			"contestant_id":   contestantID,
 			"status":          status,
@@ -301,7 +325,14 @@ func handleListBuilds(c fiber.Ctx) error {
 			"diagnostics":     diagnostics,
 			"composite_score": compositeScore,
 			"submitted_at":    createdAt,
-		})
+		}
+		if githubURL.Valid {
+			resMap["github_url"] = githubURL.String
+		} else {
+			resMap["github_url"] = ""
+		}
+
+		builds = append(builds, resMap)
 	}
 
 	return c.JSON(builds)
@@ -415,31 +446,81 @@ func handleDashboardMetrics(c fiber.Ctx) error {
 	})
 }
 
+func zipDirToBytes(dirPath string) ([]byte, error) {
+	var zipBuf bytes.Buffer
+	zipWriter := zip.NewWriter(&zipBuf)
+
+	err := filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		relPath, err := filepath.Rel(dirPath, path)
+		if err != nil {
+			return err
+		}
+		f, err := zipWriter.Create(relPath)
+		if err != nil {
+			return err
+		}
+		fileBytes, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		_, err = f.Write(fileBytes)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	err = zipWriter.Close()
+	if err != nil {
+		return nil, err
+	}
+	return zipBuf.Bytes(), nil
+}
+
 func handleMockSubmission(c fiber.Ctx) error {
 	ctx := context.Background()
 	buildID := uuid.New().String()
 
-	// 1. Define simple C++ payload
-	mockCPP := `#include "iicpc_engine.hpp"
+	engine := c.Query("engine")
+	if engine == "" {
+		engine = "go_optimized"
+	}
 
-class AckOnlyEngine : public IICPCEngine {
-public:
-    void on_order(const Order& order) override {
-        emit_ack(order.order_id);
-    }
-};
+	allowedEngines := map[string]bool{
+		"go_optimized": true,
+		"python_slow":  true,
+		"rust_crash":   true,
+		"node_scammer": true,
+		"cpp_basic":    true,
+	}
+	if !allowedEngines[engine] {
+		return c.Status(fiber.StatusBadRequest).SendString("Invalid engine name")
+	}
 
-IICPCEngine* global_engine_instance = new AckOnlyEngine();
-`
+	dirPath := filepath.Join("test_payloads", engine)
+	if _, err := os.Stat(dirPath); os.IsNotExist(err) {
+		return c.Status(fiber.StatusBadRequest).SendString("Engine directory not found")
+	}
+
+	zipBytes, err := zipDirToBytes(dirPath)
+	if err != nil {
+		log.Printf("[mock] Failed to zip directory %s: %v\n", dirPath, err)
+		return c.Status(fiber.StatusInternalServerError).SendString("failed to package mock engine")
+	}
 
 	// 2. Upload to S3/MinIO
-	s3Path := fmt.Sprintf("submissions/%s/main.cpp", buildID)
-	_, err := s3Client.PutObject(ctx, common.S3Bucket, s3Path, bytes.NewReader([]byte(mockCPP)), int64(len(mockCPP)), minio.PutObjectOptions{
-		ContentType: "text/x-c++src",
+	s3Path := fmt.Sprintf("submissions/%s/submission.zip", buildID)
+	_, err = s3Client.PutObject(ctx, common.S3Bucket, s3Path, bytes.NewReader(zipBytes), int64(len(zipBytes)), minio.PutObjectOptions{
+		ContentType: "application/zip",
 	})
 	if err != nil {
 		log.Printf("[mock] Failed to upload mock to S3: %v\n", err)
-		return c.Status(fiber.StatusInternalServerError).SendString("failed to store mock source code")
+		return c.Status(fiber.StatusInternalServerError).SendString("failed to store mock submission ZIP")
 	}
 
 	// 3. Save to database
@@ -455,7 +536,7 @@ IICPCEngine* global_engine_instance = new AckOnlyEngine();
 
 	_, err = db.ExecContext(ctx,
 		"INSERT INTO submission_sources (submission_id, source_code) VALUES ($1, $2)",
-		buildID, mockCPP,
+		buildID, fmt.Sprintf("[ZIP Mock Submission: %s]", engine),
 	)
 	if err != nil {
 		log.Printf("[mock] Failed to save mock submission source to DB: %v\n", err)
@@ -502,6 +583,11 @@ func handleCleanDB(c fiber.Ctx) error {
 	// Flush Redis Streams
 	if err := rdb.Del(ctx, common.CompilationQueue, common.PretestQueue, common.SystestQueue).Err(); err != nil {
 		log.Printf("Failed to delete Redis streams: %v\n", err)
+	}
+
+	// Reinitialize consumer groups/streams
+	if err := common.InitRedisQueues(ctx, rdb); err != nil {
+		log.Printf("Failed to reinitialize Redis streams/groups: %v\n", err)
 	}
 
 	log.Println("Database cleaned and Redis streams flushed ✓")
