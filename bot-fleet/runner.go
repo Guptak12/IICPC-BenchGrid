@@ -94,8 +94,25 @@ func runFleet(ctx context.Context, bots []*Bot, cfg FleetConfig, producer *telem
 	for start := time.Now(); time.Since(start) < 10*time.Second; {
 		probeConn, probeErr = net.DialTimeout("tcp", cleanedAddr, 500*time.Millisecond)
 		if probeErr == nil {
+			// Set a short read deadline to detect false positives from pre-emptive proxies (e.g. Docker Desktop)
+			probeConn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+			oneByte := make([]byte, 1)
+			_, readErr := probeConn.Read(oneByte)
+			if readErr != nil {
+				if netErr, ok := readErr.(net.Error); ok && netErr.Timeout() {
+					// Timeout is expected and indicates the container's matching engine has accepted the connection and is waiting for data
+					probeConn.Close()
+					probeErr = nil
+					break
+				}
+				probeErr = readErr
+			} else {
+				// Read returned data successfully, also implies active container connection
+				probeConn.Close()
+				probeErr = nil
+				break
+			}
 			probeConn.Close()
-			break
 		}
 		select {
 		case <-ctx.Done():

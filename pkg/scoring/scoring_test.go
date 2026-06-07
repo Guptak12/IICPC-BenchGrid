@@ -5,9 +5,9 @@ import (
 	"testing"
 )
 
-func TestLatencyScore(t *testing.T) {
+func TestLatencyBucket(t *testing.T) {
 	tests := []struct {
-		p99  float64
+		us   float64
 		want float64
 	}{
 		{0, 100},
@@ -17,10 +17,42 @@ func TestLatencyScore(t *testing.T) {
 		{10000, 0},
 	}
 	for _, tt := range tests {
-		got := LatencyScore(tt.p99)
+		got := latencyBucket(tt.us)
 		if math.Abs(got-tt.want) > 0.01 {
-			t.Errorf("LatencyScore(%v) = %v, want %v", tt.p99, got, tt.want)
+			t.Errorf("latencyBucket(%v) = %v, want %v", tt.us, got, tt.want)
 		}
+	}
+}
+
+func TestLatencyScoreWeighted(t *testing.T) {
+	// All perfect: 100 across all buckets → 100
+	got := LatencyScore(100, 100, 100)
+	if math.Abs(got-100.0) > 0.01 {
+		t.Errorf("LatencyScore(100,100,100) = %v, want 100", got)
+	}
+
+	// All terrible: 0 across all buckets → 0
+	got = LatencyScore(10000, 10000, 10000)
+	if math.Abs(got-0.0) > 0.01 {
+		t.Errorf("LatencyScore(10000,10000,10000) = %v, want 0", got)
+	}
+
+	// p50=perfect(100), p90=mid(50), p99=terrible(0) → 0.20*100 + 0.30*50 + 0.50*0 = 35
+	got = LatencyScore(100, 2750, 10000)
+	if math.Abs(got-35.0) > 0.01 {
+		t.Errorf("LatencyScore(100,2750,10000) = %v, want 35", got)
+	}
+
+	// p50=perfect(100), p90=perfect(100), p99=mid(50) → 0.20*100 + 0.30*100 + 0.50*50 = 75
+	got = LatencyScore(100, 100, 2750)
+	if math.Abs(got-75.0) > 0.01 {
+		t.Errorf("LatencyScore(100,100,2750) = %v, want 75", got)
+	}
+
+	// All at midpoint (2750µs → each bucket scores 50) → 50
+	got = LatencyScore(2750, 2750, 2750)
+	if math.Abs(got-50.0) > 0.01 {
+		t.Errorf("LatencyScore(2750,2750,2750) = %v, want 50", got)
 	}
 }
 
@@ -33,7 +65,7 @@ func TestCompositeScore(t *testing.T) {
 
 	// Dynamic calculation check
 	got = CompositeScore(95.0, 80.0, 90.0)
-	want := (90.0 * 0.3) + (80.0 * 0.3) + (95.0 * 0.4) // 27 + 24 + 38 = 89.00
+	want := math.Round(((90.0 * 0.3) + (80.0 * 0.3) + (95.0 * 0.4)) * 100) / 100
 	if got != want {
 		t.Errorf("CompositeScore(95, 80, 90) = %v, want %v", got, want)
 	}

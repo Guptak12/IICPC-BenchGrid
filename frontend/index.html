@@ -59,15 +59,28 @@
                         <label class="form-label" for="contestant-id-input">Contestant ID</label>
                         <input class="form-control" type="text" id="contestant-id-input" placeholder="e.g. cpp_ninja_42" required autocomplete="off">
                     </div>
-                    
+
                     <div class="form-group">
-                        <label class="form-label">Matching Engine Source (.cpp)</label>
+                        <label class="form-label">Submission Method</label>
+                        <div style="display: flex; gap: 10px; margin-bottom: 15px;">
+                            <button type="button" class="btn btn-outline" id="method-zip-btn" style="flex: 1; background-color: rgba(255, 255, 255, 0.1); border-color: var(--accent-cyan); color: #fff;" onclick="switchMethod('zip')">ZIP Archive</button>
+                            <button type="button" class="btn btn-outline" id="method-git-btn" style="flex: 1;" onclick="switchMethod('git')">GitHub Repository</button>
+                        </div>
+                    </div>
+                    
+                    <div class="form-group" id="zip-input-section">
+                        <label class="form-label">ZIP Archive & Dockerfile (.zip)</label>
                         <div class="file-dropzone" id="dropzone" onclick="document.getElementById('file-input').click()">
-                            <i class="fa-solid fa-code"></i>
-                            <p>Drag and drop your matching engine C++ file here, or click to browse</p>
-                            <input type="file" id="file-input" accept=".cpp" onchange="handleFileSelect(event)">
+                            <i class="fa-solid fa-file-archive"></i>
+                            <p>Drag and drop your ZIP archive here, or click to browse</p>
+                            <input type="file" id="file-input" accept=".zip" onchange="handleFileSelect(event)">
                             <div class="file-name-preview" id="file-name-preview"></div>
                         </div>
+                    </div>
+
+                    <div class="form-group" id="git-input-section" style="display: none;">
+                        <label class="form-label" for="github-url-input">GitHub Repository URL</label>
+                        <input class="form-control" type="url" id="github-url-input" placeholder="https://github.com/user/repo" autocomplete="off">
                     </div>
                     
                     <button class="btn btn-primary" type="submit" id="submit-btn">
@@ -218,6 +231,7 @@
                 <div class="meta-rows">
                     <div class="meta-row"><span class="label">Submission ID</span><span class="value" id="det-sub-id">-</span></div>
                     <div class="meta-row"><span class="label">Contestant ID</span><span class="value" id="det-contestant-id">-</span></div>
+                    <div class="meta-row" id="det-source-row" style="display: none;"><span class="label">GitHub URL</span><span class="value" id="det-source-value">-</span></div>
                     <div class="meta-row"><span class="label">Execution Verdict</span><span class="value" id="det-verdict-badge">-</span></div>
                     <div class="meta-row"><span class="label">Sandbox Host CPU/Cores</span><span class="value" id="det-cores">-</span></div>
                     <div class="meta-row"><span class="label">Memory Alloc limit</span><span class="value" id="det-mem">-</span></div>

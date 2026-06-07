@@ -350,6 +350,7 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
         return
     }
 
+		var engineP99Us float64
 		if consumer != nil {
 			wg.Wait()
 			if telErr == nil && telResult != nil {
@@ -359,6 +360,9 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
 				report.P99Us = float64(telResult.Histogram.ValueAtQuantile(99)) / 1000.0
 				report.MaxUs = float64(telResult.Histogram.Max()) / 1000.0
 				report.CorrectnessScore = telResult.Correctness
+				if telResult.EngineHistogram != nil {
+					engineP99Us = float64(telResult.EngineHistogram.ValueAtQuantile(99)) / 1000.0
+				}
 
 				log.Printf("[job:%s] Kafka: %d orders, %d fills processed, Correctness: %.2f%%\n",
 					job.ID[:8], telResult.OrdersProcessed, telResult.FillsProcessed, telResult.Correctness)
@@ -392,7 +396,7 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
             if report.OrdersSent > 0 {
                 failRate = float64(report.OrdersFailed) / float64(report.OrdersSent)
             }
-            latencyScore := scoring.LatencyScore(report.P99Us)
+            latencyScore := scoring.LatencyScore(report.P50Us, report.P90Us, report.P99Us)
             throughputScore := scoring.ThroughputScore(failRate)
             compositeScore := scoring.CompositeScore(report.CorrectnessScore, latencyScore, throughputScore)
 
@@ -411,16 +415,17 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
             }
 
             diag := map[string]interface{}{
-                "correctness":          report.CorrectnessScore,
-                "p50_us":              report.P50Us,
-                "p90_us":              report.P90Us,
-                "p99_us":              report.P99Us,
-                "orders_sent":         report.OrdersSent,
-                "orders_failed":       report.OrdersFailed,
-                "tps":                 report.TPS,
-                "throughput_score":    throughputScore,
-                "latency_score":       latencyScore,
-                "reason":              reason,
+                "correctness":            report.CorrectnessScore,
+                "p50_us":                report.P50Us,
+                "p90_us":                report.P90Us,
+                "p99_us":                report.P99Us,
+                "engine_reported_p99_us": engineP99Us,
+                "orders_sent":           report.OrdersSent,
+                "orders_failed":         report.OrdersFailed,
+                "tps":                   report.TPS,
+                "throughput_score":      throughputScore,
+                "latency_score":         latencyScore,
+                "reason":                reason,
             }
             diagBytes, _ := json.Marshal(diag)
 

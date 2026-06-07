@@ -1,0 +1,42 @@
+syntax = "proto3";
+package iicpc;
+
+option go_package = "iicpc-sandbox/pkg/protocol";
+
+enum OrderType {
+    LIMIT = 0;
+    MARKET = 1;
+    CANCEL = 2;
+}
+
+enum Side {
+    BUY = 0;
+    SELL = 1;
+}
+
+message Order {
+    uint64 bot_id = 1;        // Changed from string to uint64 for zero-allocation
+    uint64 order_id = 2;      // Changed to unsigned (IDs shouldn't be negative)
+    OrderType type = 3;
+    Side side = 4;
+    int64 price = 5;          // Scaled by 100
+    uint64 quantity = 6;      // Scaled by 100, unsigned
+}
+
+enum ExecutionStatus {
+    ACCEPTED = 0;
+    FILLED = 1;
+    PARTIAL = 2;
+    REJECTED = 3;
+    CANCELLED = 4;
+}
+
+message ExecutionReport {
+    uint64 order_id = 1;
+    ExecutionStatus status = 2;
+    uint64 filled_qty = 3;
+    int64 filled_price = 4;
+    uint64 engine_seq_id = 5; // Monotonically increasing sequence ID
+    uint64 processing_ns = 6; // Engine latency telemetry (excluding network I/O)
+    uint64 matched_with = 7;  // Counterparty order ID for shadow book priority check
+}

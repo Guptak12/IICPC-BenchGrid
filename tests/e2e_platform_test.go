@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -33,6 +34,146 @@ type BuildStatusResponse struct {
 	SubmittedAt    time.Time         `json:"submitted_at"`
 }
 
+func createMockSubmissionZip() ([]byte, error) {
+	buf := new(bytes.Buffer)
+	zipWriter := zip.NewWriter(buf)
+
+	// Add main.py
+	pyFile, err := zipWriter.Create("main.py")
+	if err != nil {
+		return nil, err
+	}
+	mockPythonServer := `import socket
+import struct
+import threading
+
+def decode_varint(data, index):
+    result = 0
+    shift = 0
+    while True:
+        b = data[index]
+        result |= (b & 0x7f) << shift
+        if not (b & 0x80):
+            return result, index + 1
+        shift += 7
+        index += 1
+
+def encode_varint(value):
+    res = bytearray()
+    while True:
+        towrite = value & 0x7f
+        value >>= 7
+        if value > 0:
+            res.append(towrite | 0x80)
+        else:
+            res.append(towrite)
+            break
+    return bytes(res)
+
+def handle_client(conn):
+    print("Python thread: accepted new connection")
+    try:
+        while True:
+            len_bytes = conn.recv(4)
+            if not len_bytes:
+                print("Python thread: EOF received from client")
+                break
+            if len(len_bytes) < 4:
+                print("Python thread: received partial length prefix:", len_bytes)
+                break
+            length = struct.unpack('<I', len_bytes)[0]
+            
+            payload = bytearray()
+            while len(payload) < length:
+                chunk = conn.recv(length - len(payload))
+                if not chunk:
+                    break
+                payload.extend(chunk)
+            if len(payload) < length:
+                print("Python thread: incomplete payload received:", len(payload), "expected:", length)
+                break
+            print("Python thread: read order payload of length:", len(payload))
+                
+            order_id = 0
+            idx = 0
+            while idx < len(payload):
+                key = payload[idx]
+                idx += 1
+                wire_type = key & 0x7
+                field_number = key >> 3
+                if wire_type == 0:
+                    val, next_idx = decode_varint(payload, idx)
+                    if field_number == 2:
+                        order_id = val
+                    idx = next_idx
+                elif wire_type == 2:
+                    length_field, next_idx = decode_varint(payload, idx)
+                    idx = next_idx + length_field
+                else:
+                    idx += 1
+
+            # Prepare ExecutionReport protobuf response:
+            # uint64 order_id = 1 -> key 0x08
+            # ExecutionStatus status = 2 -> key 0x10 (ACCEPTED = 0)
+            # uint64 engine_seq_id = 5 -> key 0x28
+            # uint64 processing_ns = 6 -> key 0x30
+            resp_payload = b""
+            resp_payload += bytes([0x08]) + encode_varint(order_id)
+            resp_payload += bytes([0x10]) + encode_varint(0) 
+            resp_payload += bytes([0x28]) + encode_varint(1) 
+            resp_payload += bytes([0x30]) + encode_varint(500) 
+            
+            length_prefix = struct.pack('<I', len(resp_payload))
+            conn.sendall(length_prefix + resp_payload)
+            print("Python thread: sent ER ack for order:", order_id)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+    finally:
+        conn.close()
+
+def main():
+    print("Python matching engine starting up on port 8000...")
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(('0.0.0.0', 8000))
+    s.listen(128)
+    while True:
+        conn, addr = s.accept()
+        t = threading.Thread(target=handle_client, args=(conn,))
+        t.daemon = True
+        t.start()
+
+if __name__ == '__main__':
+    main()
+`
+	if _, err := pyFile.Write([]byte(mockPythonServer)); err != nil {
+		return nil, err
+	}
+
+	// Add Dockerfile
+	dfFile, err := zipWriter.Create("Dockerfile")
+	if err != nil {
+		return nil, err
+	}
+	mockDockerfile := `FROM python:3.11-slim
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY main.py .
+EXPOSE 8000
+CMD ["python", "-u", "main.py"]
+`
+	if _, err := dfFile.Write([]byte(mockDockerfile)); err != nil {
+		return nil, err
+	}
+
+	if err := zipWriter.Close(); err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
+}
+
 func TestE2EPlatformFullWorkflow(t *testing.T) {
 	// Step 1: Connect to infrastructure to verify and setup testing credentials
 	rdb := common.GetRedisClient()
@@ -52,29 +193,23 @@ func TestE2EPlatformFullWorkflow(t *testing.T) {
 
 	// Setup unique contestant test payload
 	contestantID := fmt.Sprintf("e2e-tester-%d", time.Now().UnixNano())
-	payloadPath := filepath.Join("..", "test_payloads", "main.cpp")
-	absPayloadPath, err := filepath.Abs(payloadPath)
+
+	zipBytes, err := createMockSubmissionZip()
 	if err != nil {
-		t.Fatalf("Failed to resolve payload path: %v", err)
+		t.Fatalf("Failed to create mock submission ZIP: %v", err)
 	}
 
 	// Step 2: Construct HTTP Multipart upload request
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
 
-	file, err := os.Open(absPayloadPath)
-	if err != nil {
-		t.Fatalf("Failed to open contestant test payload file at %s: %v", absPayloadPath, err)
-	}
-	defer file.Close()
-
-	part, err := writer.CreateFormFile("source_code", filepath.Base(absPayloadPath))
+	part, err := writer.CreateFormFile("source_code", "submission.zip")
 	if err != nil {
 		t.Fatalf("Failed to create form file parameter: %v", err)
 	}
-	_, err = io.Copy(part, file)
+	_, err = part.Write(zipBytes)
 	if err != nil {
-		t.Fatalf("Failed to copy source file contents to multipart body: %v", err)
+		t.Fatalf("Failed to write source ZIP contents to multipart body: %v", err)
 	}
 
 	err = writer.WriteField("contestant_id", contestantID)
@@ -190,6 +325,27 @@ func TestE2EPlatformFullWorkflow(t *testing.T) {
 		if diag["orders_sent"] == nil {
 			t.Errorf("DB diagnostics did not contain 'orders_sent'")
 		}
+
+		// Verify RTT vs engine-reported latency tracking
+		p99Us, ok1 := diag["p99_us"].(float64)
+		engineP99Us, ok2 := diag["engine_reported_p99_us"].(float64)
+		if !ok1 {
+			t.Errorf("DB diagnostics did not contain valid RTT p99_us")
+		} else if p99Us <= 0 {
+			t.Errorf("Expected positive RTT p99_us (client-side latency), got %f", p99Us)
+		} else {
+			t.Logf("✓ Verified: Client-side RTT p99 latency recorded: %.2fµs", p99Us)
+		}
+
+		if !ok2 {
+			t.Errorf("DB diagnostics did not contain valid engine_reported_p99_us")
+		} else {
+			t.Logf("✓ Verified: Engine-reported p99 latency recorded: %.2fµs", engineP99Us)
+			if p99Us == engineP99Us && engineP99Us == 0 {
+				t.Errorf("RTT latency was identical to hardcoded 0us engine latency, meaning scoring failed to measure client RTT")
+			}
+		}
+
 		t.Logf("✓ Database state is completely consistent with execution logs!")
 	})
 

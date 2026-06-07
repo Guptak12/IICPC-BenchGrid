@@ -28,7 +28,7 @@ echo "Created network: sandbox-net"
 
 SANDBOX_IMAGE="${SANDBOX_IMAGE:-iicpc-sandbox:v1}"
 RUNTIME_IMAGE="${RUNTIME_IMAGE:-iicpc-runtime-sandbox:v1}"
-PAYLOAD="${PAYLOAD:-test_payloads/main.cpp}"
+PAYLOAD="${PAYLOAD:-submission.zip}"
 
 if ! docker image inspect "$SANDBOX_IMAGE" >/dev/null 2>&1; then
   echo "=== 1. Sandbox image not found. Building it... ==="
@@ -80,6 +80,16 @@ docker wait iicpc-init-db >/dev/null || true
 mkdir -p submissions
 chmod 777 submissions
 
+ENGINE_NAME="${1:-go_optimized}"
+echo "=== Packaging Mock Submission: $ENGINE_NAME ==="
+if [ ! -d "test_payloads/$ENGINE_NAME" ]; then
+  echo "Error: test_payloads/$ENGINE_NAME directory does not exist"
+  exit 1
+fi
+
+rm -f "$ROOT_DIR/submission.zip"
+(cd "test_payloads/$ENGINE_NAME" && zip -q -r "$ROOT_DIR/submission.zip" .)
+
 echo "=== 5. Compiling Microservices ==="
 mkdir -p bin
 go build -o bin/gateway services/gateway/*.go
@@ -106,6 +116,7 @@ cleanup() {
   for pid in "${PIDS[@]}"; do
     kill "$pid" >/dev/null 2>&1 || true
   done
+  rm -f "$ROOT_DIR/submission.zip"
   # docker compose down
 }
 trap cleanup EXIT

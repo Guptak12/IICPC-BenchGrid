@@ -97,9 +97,12 @@ function renderLeaderboard(data) {
         
         let badgeClass = 'badge-pending';
         let verdict = entry.verdict || 'Pending';
-        if (verdict.includes('Accepted')) badgeClass = 'badge-accepted';
-        else if (verdict.includes('Partial')) badgeClass = 'badge-partial';
-        else if (verdict.includes('Wrong') || verdict.includes('Limit') || verdict.includes('Exceeded')) badgeClass = 'badge-failed';
+        if (verdict === 'Accepted') badgeClass = 'badge-accepted';
+        else if (verdict === 'Tail Latency Exceeded (TLE)') badgeClass = 'badge-warning';
+        else if (verdict === 'Logic Violation (LV)' || verdict === 'Throughput Degradation') badgeClass = 'badge-failed';
+        else if (verdict.includes('Accepted')) badgeClass = 'badge-accepted';
+        else if (verdict.includes('Partial') || verdict.includes('TLE')) badgeClass = 'badge-warning';
+        else if (verdict.includes('Wrong') || verdict.includes('Limit') || verdict.includes('Exceeded') || verdict.includes('LV') || verdict.includes('Degradation')) badgeClass = 'badge-failed';
         
         const rankValue = entry.rank || '-';
         const displayRank = (rankValue <= 3) 
@@ -123,6 +126,21 @@ function renderLeaderboard(data) {
             archetypeBadge = `<span class="badge ${archClass}" style="margin-left: 8px; font-size: 10px; font-weight: normal; text-transform: uppercase;">${entry.engine_archetype}</span>`;
         }
 
+        // Render Deltas
+        let deltaScoreHtml = '';
+        if (entry.delta_score > 0) {
+            deltaScoreHtml = `<span class="delta-badge delta-positive">▲ +${entry.delta_score.toFixed(2)}</span>`;
+        }
+
+        let deltaP99Html = '';
+        if (entry.delta_p99 < 0) {
+            // Improved (shorter latency) -> render green down arrow
+            deltaP99Html = `<span class="delta-badge delta-positive">▼ -${Math.abs(entry.delta_p99).toLocaleString()}µs</span>`;
+        } else if (entry.delta_p99 > 0) {
+            // Worsened (higher latency) -> render red up arrow
+            deltaP99Html = `<span class="delta-badge delta-negative">▲ +${entry.delta_p99.toLocaleString()}µs</span>`;
+        }
+
         tr.innerHTML = `
             <td>${displayRank}</td>
             <td style="font-family: var(--font-mono); font-weight: 500;">
@@ -132,9 +150,19 @@ function renderLeaderboard(data) {
                 </div>
             </td>
             <td><span class="badge ${badgeClass}">${verdict}</span></td>
-            <td style="text-align: right; font-weight: 600; color: var(--accent-cyan); font-family: var(--font-mono);">${entry.composite_score.toFixed(2)}</td>
+            <td style="text-align: right; font-weight: 600; color: var(--accent-cyan); font-family: var(--font-mono);">
+                <div style="display: inline-block;">
+                    <span>${entry.composite_score.toFixed(2)}</span>
+                    ${deltaScoreHtml}
+                </div>
+            </td>
             <td style="text-align: right; font-family: var(--font-mono);">${correctness}%</td>
-            <td style="text-align: right; font-family: var(--font-mono);">${latency}</td>
+            <td style="text-align: right; font-family: var(--font-mono);">
+                <div style="display: inline-block;">
+                    <span>${latency}</span>
+                    ${deltaP99Html}
+                </div>
+            </td>
             <td style="text-align: right; font-family: var(--font-mono);">${tps}</td>
         `;
         
@@ -227,29 +255,83 @@ function filterScoreboard() {
     sortAndRender();
 }
 
+let activeSubmissionMethod = 'zip';
+
+function switchMethod(method) {
+    activeSubmissionMethod = method;
+    const zipBtn = document.getElementById('method-zip-btn');
+    const gitBtn = document.getElementById('method-git-btn');
+    const zipSection = document.getElementById('zip-input-section');
+    const gitSection = document.getElementById('git-input-section');
+    const fileInput = document.getElementById('file-input');
+    const gitInput = document.getElementById('github-url-input');
+
+    if (method === 'zip') {
+        zipBtn.style.backgroundColor = 'rgba(255, 255, 255, 0.1)';
+        zipBtn.style.borderColor = 'var(--accent-cyan)';
+        zipBtn.style.color = '#fff';
+
+        gitBtn.style.backgroundColor = 'transparent';
+        gitBtn.style.borderColor = 'rgba(255, 255, 255, 0.1)';
+        gitBtn.style.color = 'var(--text-primary)';
+
+        zipSection.style.display = 'block';
+        gitSection.style.display = 'none';
+        gitInput.required = false;
+        gitInput.value = '';
+    } else {
+        gitBtn.style.backgroundColor = 'rgba(255, 255, 255, 0.1)';
+        gitBtn.style.borderColor = 'var(--accent-cyan)';
+        gitBtn.style.color = '#fff';
+
+        zipBtn.style.backgroundColor = 'transparent';
+        zipBtn.style.borderColor = 'rgba(255, 255, 255, 0.1)';
+        zipBtn.style.color = 'var(--text-primary)';
+
+        zipSection.style.display = 'none';
+        gitSection.style.display = 'block';
+        gitInput.required = true;
+        
+        fileInput.value = '';
+        document.getElementById('file-name-preview').textContent = '';
+    }
+}
+window.switchMethod = switchMethod;
+
 // Handle code submission
 async function submitEngine(event) {
     event.preventDefault();
     
     const contestantId = document.getElementById('contestant-id-input').value.trim();
     const fileInput = document.getElementById('file-input');
+    const gitInput = document.getElementById('github-url-input');
     const submitBtn = document.getElementById('submit-btn');
     
     if (!contestantId) {
         alert('Please specify a valid Contestant ID');
         return;
     }
-    if (fileInput.files.length === 0) {
-        alert('Please choose or drag-and-drop a C++ engine file (.cpp)');
-        return;
+    
+    const formData = new FormData();
+    formData.append('contestant_id', contestantId);
+    
+    if (activeSubmissionMethod === 'zip') {
+        if (fileInput.files.length === 0) {
+            alert('Please choose or drag-and-drop a ZIP matching engine file (.zip)');
+            return;
+        }
+        formData.append('source_code', fileInput.files[0]);
+    } else {
+        const githubUrl = gitInput.value.trim();
+        if (!githubUrl) {
+            alert('Please specify a valid GitHub Repository URL');
+            return;
+        }
+        formData.append('github_url', githubUrl);
     }
     
     submitBtn.disabled = true;
     submitBtn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> Initializing...`;
-    
-    const formData = new FormData();
-    formData.append('contestant_id', contestantId);
-    formData.append('source_code', fileInput.files[0]);
     
     try {
         const response = await fetch('/api/v1/submit', {
@@ -266,6 +348,7 @@ async function submitEngine(event) {
         
         // Reset file preview and input
         fileInput.value = '';
+        gitInput.value = '';
         document.getElementById('file-name-preview').textContent = '';
         
         // Open live progress monitor
@@ -411,13 +494,29 @@ function populateDrawerDetails(build) {
     document.getElementById('det-sub-id').textContent = build.build_id;
     document.getElementById('det-contestant-id').textContent = build.contestant_id;
     
+    const sourceRow = document.getElementById('det-source-row');
+    const sourceValue = document.getElementById('det-source-value');
+    if (build.github_url) {
+        sourceRow.style.display = 'flex';
+        sourceValue.innerHTML = `<a href="${build.github_url}" target="_blank" style="color: var(--accent-cyan); text-decoration: underline;">${build.github_url}</a>`;
+    } else {
+        sourceRow.style.display = 'none';
+        sourceValue.textContent = '';
+    }
+    
     // Verdict Badge in Metadata
     let badgeClass = 'badge-pending';
     let verdict = build.verdict || 'Pending';
-    if (verdict.includes('Accepted')) badgeClass = 'badge-accepted';
-    else if (verdict.includes('Partial')) badgeClass = 'badge-partial';
-    else if (verdict.includes('Wrong') || verdict.includes('Limit') || verdict.includes('Exceeded')) badgeClass = 'badge-failed';
-    document.getElementById('det-verdict-badge').innerHTML = `<span class="badge ${badgeClass}">${verdict}</span>`;
+    if (verdict === 'Accepted') badgeClass = 'badge-accepted';
+    else if (verdict === 'Tail Latency Exceeded (TLE)') badgeClass = 'badge-warning';
+    else if (verdict === 'Logic Violation (LV)' || verdict === 'Throughput Degradation') badgeClass = 'badge-failed';
+    else if (verdict.includes('Accepted')) badgeClass = 'badge-accepted';
+    else if (verdict.includes('Partial') || verdict.includes('TLE')) badgeClass = 'badge-warning';
+    else if (verdict.includes('Wrong') || verdict.includes('Limit') || verdict.includes('Exceeded') || verdict.includes('LV') || verdict.includes('Degradation')) badgeClass = 'badge-failed';
+    
+    const reason = diag.reason || '';
+    const reasonHtml = reason ? `<div style="font-size: 12px; color: var(--text-secondary); margin-top: 4px;">${reason}</div>` : '';
+    document.getElementById('det-verdict-badge').innerHTML = `<span class="badge ${badgeClass}">${verdict}</span>${reasonHtml}`;
     
     // Cores & memory constraints
     document.getElementById('det-cores').textContent = '1 Core (Pinning enabled)';

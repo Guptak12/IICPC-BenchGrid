@@ -25,6 +25,7 @@ type TelemetryResult struct {
 	OrdersProcessed int64
 	FillsProcessed  int64
 	Histogram       *hdr.Histogram
+	EngineHistogram *hdr.Histogram
 	WorkersDone     int
 	Correctness     float64
 }
@@ -37,6 +38,7 @@ type Consumer struct {
 
 	mu          sync.Mutex // Point C: keep lock scope minimal
 	hist        *hdr.Histogram
+	engineHist  *hdr.Histogram
 	orderCount  int64
 	fillCount   int64
 	workersDone int
@@ -63,6 +65,7 @@ func NewConsumer(brokers []string, jobID string, numWorkers int) (*Consumer, err
 		jobID:        jobID,
 		numWorkers:   numWorkers,
 		hist:         hdr.New(1, 3_600_000_000_000, 3),
+		engineHist:   hdr.New(1, 3_600_000_000_000, 3),
 		validator:    shadow.NewValidator(),
 		nextSeqID:    1, // C++ Engine sequence starts at 1
 		jitterBuffer: make(map[int64]interface{}),
@@ -113,6 +116,7 @@ func (c *Consumer) Consume(ctx context.Context) (*TelemetryResult, error) {
 		OrdersProcessed: c.orderCount,
 		FillsProcessed:  c.fillCount,
 		Histogram:       c.hist,
+		EngineHistogram: c.engineHist,
 		WorkersDone:     c.workersDone,
 		Correctness:     c.validator.GetCorrectnessScore(),
 	}, nil
@@ -190,6 +194,9 @@ func (c *Consumer) drainJitterBuffer() {
 		switch e := event.(type) {
 		case AckEvent:
 			c.hist.RecordValue(e.LatencyNs)
+			if e.EngineLatencyNs > 0 {
+				c.engineHist.RecordValue(e.EngineLatencyNs)
+			}
 			c.orderCount++
 			c.validator.ProcessAck(e.OrderID, e.Status) // Validator runs matching here!
 		case FillEvent:
@@ -233,6 +240,9 @@ func (c *Consumer) flushRemainingBuffer() {
         switch e := event.(type) {
         case AckEvent:
             c.hist.RecordValue(e.LatencyNs)
+            if e.EngineLatencyNs > 0 {
+                c.engineHist.RecordValue(e.EngineLatencyNs)
+            }
             c.orderCount++
             c.validator.ProcessAck(e.OrderID, e.Status)
         case FillEvent:
