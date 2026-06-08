@@ -261,3 +261,86 @@ To validate the robustness of the grading pipeline under various execution condi
 * **Observed Verdict**: `Partial — Latency` (Score: 70)
 * **Diagnostics**: Evaluated as correct and reliable, but local host TCP context switching latency triggered the latency warning threshold.
 
+---
+
+## 11. Bring Your Own Server (BYOS) & Protobuf/TCP Migration
+
+We migrated the platform from the SDK model to the **Bring Your Own Server (BYOS)** strategy, enhancing realism and testing real-world systems engineering capabilities.
+
+### Key Implementation Details:
+1. **Contestant Submission & Ephemeral Image Builds**:
+   - Instead of submitting a single `main.cpp`, contestants submit a **ZIP file** (containing their code and a `Dockerfile`) or a **GitHub Repository URL**.
+   - Decoupled asynchronously via Redis `compilation_queue` stream. The Builder worker (formerly Compiler worker) extracts the ZIP or clones the git repo, running `docker build` under a **strict 5-minute timeout** to prevent DoS.
+   - Successful builds are tagged and pushed to the local or cluster-registry as `contestant-<submission_id>`.
+
+2. **Isolated gVisor/Bridge Networking & Port 8000 Contract**:
+   - The Pretest worker spins up the contestant's container image directly in an isolated bridge network with no egress access.
+   - Enforces a strict port contract: contestant containers **must listen on Port 8000** for incoming connections.
+   - Implements a **10-second exponential backoff liveness probe** in the runner before load testing starts to resolve container startup races.
+
+3. **Hardware-Optimized Little-Endian Protobuf Framing**:
+   - Swapped high-overhead JSON/WebSocket communication for low-latency **raw TCP connections**.
+   - Messages are serialized as **Little-Endian 4-byte length-prefixed Protobuf frames** using `pkg/protocol/trading.proto`.
+   - The Bot Fleet and Pretest runners map outgoing `Order` and incoming `ExecutionReport` frames using fast binary serialization.
+
+4. **Container Log Diagnostics**:
+   - On exit or crash of the sandbox container, the Pretest worker scrapes up to 100 lines of standard output/error (`docker logs contestant-<id>`) and saves it to the PostgreSQL `submissions.diagnostics` field under the `sandbox_logs` key, making it viewable on the Developer Dashboard.
+
+### Verification Success:
+We validated the entire BYOS implementation:
+- **Go Unit Tests**: The bot-fleet unit tests (`bot-fleet/runner_test.go`) compiled and passed successfully, validating non-WebSocket raw TCP/Protobuf order processing.
+- **End-to-End Tests**: Run using `./scripts/run_e2e_tests.sh`, compiling a Python mock TCP server in a ZIP, executing the microservices loop, and saving correct results.
+- **Local Smoke Test**: Run via `./scripts/local_smoke.sh` and completed with 100% success.
+
+---
+
+## 12. Multiple Mock Contestant Submissions & Frontend Regime Update
+
+To verify and stress-test the grading system across a wide spectrum of contestant behaviors, languages, and error conditions, we implemented several key components:
+
+### 1. Multi-Language Mock Engine Suite (`test_payloads/`)
+We developed 5 mock matching engines under `test_payloads/` configured for the raw TCP/Protobuf Little-Endian Port 8000 contract:
+1. `go_optimized`: Fully correct, high-performance Go engine with zero allocations and price-time priority.
+2. `python_slow`: Correct Python engine that injects an artificial 10ms delay per order to test latency warning thresholds and TLE verdicts.
+3. `rust_crash`: Rust engine configured to panic and exit with status 101/159 after handling 10 orders to test sandbox crash log collection.
+4. `node_scammer`: Node.js engine that deliberately matches orders incorrectly (generating phantom fills and priority violations) to test verification correctness grading.
+5. `cpp_basic`: A baseline C++ engine utilizing simple structures.
+
+### 2. Upgraded Contestant Arena Form (`frontend/`)
+We revamped the frontend submission form (`frontend/index.html` & `frontend/app.js`):
+- Added a **Submission Method** toggle to let contestants choose between uploading a **ZIP Archive** (which accepts `.zip` files containing code and a `Dockerfile`) or providing a **GitHub Repository URL**.
+- Enhanced request parsing to transmit `github_url` or `source_code` appropriately to the Gateway.
+- Added a new metadata row in the Telemetry drawer that dynamically displays the contestant's submitted GitHub Repository URL when available.
+
+### 3. Real-Time Developer Diagnostics Selector
+We updated the Developer Dashboard (`services/gateway/dashboard.go` & `services/gateway/main.go`):
+- Added a dropdown selector allowing developer testing of specific mock engines (`go_optimized`, `python_slow`, `rust_crash`, `node_scammer`, `cpp_basic`).
+- Updated the `/api/v1/dashboard/actions/mock-submission` gateway endpoint to parse the selected `engine` parameter, locate the corresponding folder in `test_payloads/`, and package it into a zip archive on the fly using `zipDirToBytes`.
+
+### 4. Database Unicode Sanitization Safeguard
+During container execution runs, standard error or docker logs can contain null bytes (`\x00`) or invalid binary headers which trigger a PostgreSQL `pq: unsupported Unicode escape sequence (22P05)` insertion error.
+- We added sanitization filters using `strings.ReplaceAll` and `strings.ToValidUTF8` in both the compiler (`services/compiler/main.go`) and pretest (`services/pretest/main.go`) workers. This ensures all logs are safe for JSON serialization and DB storage.
+
+---
+
+## 13. Resolution of Matching Engine Correctness & Latency Scoring
+
+We resolved the latency benchmarking startup lag and fixed the correctness mismatch/logic violations in the Go optimized matching engine (`test_payloads/go_optimized/main.go`) to achieve `Accepted` with a **100% correctness score**.
+
+### Key Fixes:
+1. **Removed Mapped Side Bit from Pretest Order ID**:
+   - The pretest runner (`services/pretest/runner.go`) was shifting the bot's `NumericID` by 1 and OR'ing it with the order side bit (BUY/SELL) to form the upper 32 bits of `OrderID`. This broke the validator's self-crossing checks (`botID(incomingID) == botID(restingID)`), as opposite-side orders from the same bot had different upper 32 bits.
+   - We updated the pretest runner's `OrderID` generation to format it as `(int64(b.NumericID) << 32) | sequence`, matching the production bot fleet and allowing `isSelfCross` in the validator to work properly.
+2. **Robust Self-Crossing Checks in Go Engine**:
+   - Updated the Go optimized matching engine to perform self-crossing checks via `(ro.OrderID >> 32) == (o.OrderID >> 32)`, aligning perfectly with the validator's logic.
+3. **Consumer Next Sequence ID Initialization**:
+   - Initialized the pretest runner consumer's `nextSeqID` to `1` instead of `0`. This aligns with the engine's starting sequence number (`1`), eliminating a 50-event startup gap where matching ACKs were queued in the jitter buffer, thereby preventing out-of-order execution states.
+4. **TCP Frame Interleaving Optimization in Go Engine**:
+   - Redesigned `writeReport` in `test_payloads/go_optimized/main.go` to construct a single byte buffer containing both the 4-byte length prefix and the payload before calling `conn.Write(buf)`. This guarantees atomicity of the message write operations and completely eliminates any risk of byte stream corruption due to interleaved writes.
+
+### Verification Success:
+- **Go Optimized Engine**: Running `./scripts/local_smoke.sh go_optimized` completed successfully with a **100% correctness score (0 phantom fills, 0 priority violations)**. It successfully mapped client RTT P99 (~114ms local simulation) and captured the correct internal matching processing P99 (~605µs).
+- **Python Slow Engine**: Running `./scripts/local_smoke.sh python_slow` completed successfully. The system correctly measured an actual client-side RTT of ~2.1s and captured the engine's reported processing latency of ~10ms (due to the injected sleep), triggering severe latency/performance warnings.
+- **Node Scammer Engine**: Running `./scripts/local_smoke.sh node_scammer` verified the correctness pipeline. The platform successfully caught priority violations, resulting in a low correctness score of ~9.3% and a verdict of `Logic Violation (LV)`.
+- **Go E2E Suite**: Running `./scripts/run_e2e_tests.sh` successfully passed all DB consistency, static leaderboard, and database cleanup tests.
+- **Development Environment**: Persistent developer microservices were successfully restarted using `scripts/start_dev_services.sh` to allow real-time dashboard testing.
