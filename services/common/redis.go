@@ -13,21 +13,17 @@ import (
 
 // Shared Constants for Redis Queues
 const (
-	CompilationQueue  = "compilation_queue"
-	CompilationGroup  = "compiler_group"
-	PretestQueue      = "pretest_queue"
-	PretestGroup      = "pretest_group"
-	SystestQueue      = "systest_queue"
-	SystestGroup      = "systest_group"
+	CompilationQueue = "compilation_queue"
+	CompilationGroup = "compiler_group"
+	PretestQueue     = "pretest_queue"
+	PretestGroup     = "pretest_group"
+	SystestQueue     = "systest_queue"
+	SystestGroup     = "systest_group"
 )
 
 // Sandbox Docker image and network names (dynamic via environment)
 var (
-	SandboxImage       = getEnv("SANDBOX_IMAGE", "iicpc-sandbox:v1")
-	CompileImage       = getEnv("COMPILE_IMAGE", "iicpc-sandbox:v1")
-	RuntimeImage       = getEnv("RUNTIME_IMAGE", "iicpc-runtime-sandbox:v1")
-	SandboxNetwork     = getEnv("SANDBOX_NET", "iicpc-net")       // workers, redpanda, master
-	SandboxIsolatedNet = getEnv("SANDBOX_ISOLATED_NET", "sandbox-net")     // contestant containers only
+	SandboxIsolatedNet = GetEnv("SANDBOX_ISOLATED_NET", "sandbox-net") // contestant containers only
 )
 
 // Shared Constants for Environment Overrides
@@ -36,7 +32,8 @@ const (
 	EnvDBAddr    = "DB_ADDR"
 )
 
-func getEnv(key, fallback string) string {
+// GetEnv returns the value of the environment variable key, or fallback if unset.
+func GetEnv(key, fallback string) string {
 	if val := os.Getenv(key); val != "" {
 		return val
 	}

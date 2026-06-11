@@ -186,11 +186,6 @@ func (b *PretestBot) zipfQuantity() int64 {
 	return raw
 }
 
-// RunPretestFleet executes a small deterministic pretest suite (5 bots, 100 orders each) over raw TCP
-func RunPretestFleet(ctx context.Context, endpoint string, baseSeed int64) (PretestResults, error) {
-	return RunFleet(ctx, endpoint, baseSeed, 5, 100)
-}
-
 // RunFleet executes a customizable deterministic bot fleet over raw TCP
 func RunFleet(ctx context.Context, endpoint string, baseSeed int64, numBots int, ordersPerBot int) (PretestResults, error) {
 	// Edge Case 2: TCP Liveness Probe/Retry Loop with exponential backoff
@@ -541,7 +536,7 @@ func RunFleet(ctx context.Context, endpoint string, baseSeed int64, numBots int,
 	}
 
 	// Print all percentile metrics in the log
-	log.Printf("[RunPretestFleet] Finished: RTT P50: %dµs | P90: %dµs | P99: %dµs | Engine Reported P99: %dµs\n", p50Us, p90Us, p99Us, engineP99Us)
+	log.Printf("[RunFleet] Finished: RTT P50: %dµs | P90: %dµs | P99: %dµs | Engine Reported P99: %dµs\n", p50Us, p90Us, p99Us, engineP99Us)
 
 	correctnessScore := validator.GetCorrectnessScore()
 

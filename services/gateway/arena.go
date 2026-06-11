@@ -367,7 +367,7 @@ func triggerSystemTestsForArena(arenaID string) {
 		// Push to system test queue Redis stream
 		redisValues := map[string]interface{}{
 			"submission_id": subID.String,
-			"image_tag":     fmt.Sprintf("submission-%s:latest", subID.String),
+			"image_tag":     fmt.Sprintf("contestant-%s", subID.String),
 			"contestant_id": contestantID.String,
 		}
 

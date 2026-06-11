@@ -10,11 +10,11 @@ import (
 )
 
 var (
-	S3Endpoint  = getEnv("S3_ENDPOINT", "localhost:9000")
-	S3AccessKey = getEnv("S3_ACCESS_KEY", "minioadmin")
-	S3SecretKey = getEnv("S3_SECRET_KEY", "minioadmin")
-	S3Bucket    = getEnv("S3_BUCKET", "submissions")
-	S3UseSSL    = getEnv("S3_USE_SSL", "false") == "true"
+	S3Endpoint  = GetEnv("S3_ENDPOINT", "localhost:9000")
+	S3AccessKey = GetEnv("S3_ACCESS_KEY", "minioadmin")
+	S3SecretKey = GetEnv("S3_SECRET_KEY", "minioadmin")
+	S3Bucket    = GetEnv("S3_BUCKET", "submissions")
+	S3UseSSL    = GetEnv("S3_USE_SSL", "false") == "true"
 )
 
 func GetS3Client() (*minio.Client, error) {

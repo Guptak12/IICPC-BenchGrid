@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"iicpc-sandbox/services/common"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/golang-jwt/jwt/v5"
@@ -19,20 +20,13 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-var jwtSecret = []byte(getEnv("JWT_SECRET", "benchgrid_super_secret_key_12345"))
+var jwtSecret = []byte(common.GetEnv("JWT_SECRET", "benchgrid_super_secret_key_12345"))
 
 type Claims struct {
 	UserID string `json:"user_id"`
 	Handle string `json:"handle"`
 	Role   string `json:"role"`
 	jwt.RegisteredClaims
-}
-
-func getEnv(key, defaultVal string) string {
-	if val := os.Getenv(key); val != "" {
-		return val
-	}
-	return defaultVal
 }
 
 func generateToken(userID, handle, role string) (string, error) {

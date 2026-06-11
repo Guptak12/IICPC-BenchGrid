@@ -8,9 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -20,7 +17,6 @@ import (
 	"iicpc-sandbox/services/common"
 
 	"github.com/gofiber/fiber/v3"
-	"github.com/gofiber/fiber/v3/middleware/adaptor"
 	"github.com/gofiber/fiber/v3/middleware/static"
 	"github.com/gofiber/fiber/v3/middleware/sse"
 	"github.com/google/uuid"
@@ -112,24 +108,6 @@ func main() {
 		log.Fatalf("Failed to ensure S3 bucket: %v", err)
 	}
 
-	// Setup Leaderboard Stream Reverse Proxy for fallback
-	leaderboardStreamURL := os.Getenv("LEADERBOARD_STREAM_URL")
-	if leaderboardStreamURL == "" {
-		leaderboardStreamURL = "http://localhost:3001/leaderboard/stream"
-	}
-	targetURL, err := url.Parse(leaderboardStreamURL)
-	if err != nil {
-		log.Fatalf("Invalid LEADERBOARD_STREAM_URL: %v", err)
-	}
-	proxy := httputil.NewSingleHostReverseProxy(targetURL)
-	proxy.Director = func(req *http.Request) {
-		req.URL.Scheme = targetURL.Scheme
-		req.URL.Host = targetURL.Host
-		req.URL.Path = targetURL.Path
-		req.URL.RawQuery = targetURL.RawQuery
-		req.Host = targetURL.Host
-	}
-
 	// Initialize Fiber app
 	app := fiber.New(fiber.Config{
 		BodyLimit: 10 * 1024 * 1024, // 10 MB limit
@@ -170,9 +148,6 @@ func main() {
 	// Leaderboards API
 	app.Get("/api/v1/leaderboard/:arena_id", handleGetLeaderboard)
 	app.Get("/api/v1/leaderboard/:arena_id/stream", handleGetLeaderboardStream)
-
-	// Fallback/Legacy endpoints for backwards compatibility
-	app.Get("/api/v1/leaderboard/stream", adaptor.HTTPHandler(proxy))
 
 	// Admin Console API
 	app.Post("/api/v1/admin/arena", requireAuth, requireAdmin, handleCreateArena)
