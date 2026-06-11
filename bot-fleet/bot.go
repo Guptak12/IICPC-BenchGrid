@@ -77,24 +77,82 @@ type BotResult struct {
 	Reconnects   int
 }
 
+type ringBuf struct {
+	buf  []int64
+	head int
+	tail int
+	size int
+}
+
+func newRingBuf(capacity int) *ringBuf {
+	if capacity <= 0 {
+		capacity = 1024
+	}
+	return &ringBuf{
+		buf: make([]int64, capacity),
+	}
+}
+
+func (r *ringBuf) push(val int64) {
+	r.buf[r.tail] = val
+	r.tail = (r.tail + 1) % len(r.buf)
+	if r.size < len(r.buf) {
+		r.size++
+	} else {
+		r.head = (r.head + 1) % len(r.buf)
+	}
+}
+
+func (r *ringBuf) pop() (int64, bool) {
+	if r.size == 0 {
+		return 0, false
+	}
+	val := r.buf[r.head]
+	r.head = (r.head + 1) % len(r.buf)
+	r.size--
+	return val, true
+}
+
+func (r *ringBuf) len() int {
+	return r.size
+}
+
 // Bot is a single simulated market participant
 type Bot struct {
-	config       BotConfig
-	rng          *rand.Rand   // per-bot RNG — not shared, so no mutex needed
-	seqNum       atomic.Int64 // order sequence number, unique per bot
-	ordersSent   int
-	activeOrders []int64
-	SendTimes    []int64
+	config     BotConfig
+	rng        *rand.Rand   // per-bot RNG — not shared, so no mutex needed
+	seqNum     atomic.Int64 // order sequence number, unique per bot
+	ordersSent int
+	activeRing *ringBuf
+	SendTimes  []int64
 }
 
 func NewBot(cfg BotConfig) *Bot {
-	return &Bot{
+	b := &Bot{
 		config: cfg,
 		rng:       rand.New(rand.NewSource(cfg.Seed)),
 		// Pre-allocate SendTimes for all orders this bot will send
 		// Index = seq & 0xFFFFFFFF — safe because OrdersToSend << 2^32
 		SendTimes: make([]int64, cfg.OrdersToSend+1),
 	}
+	b.initRingBuffer()
+	return b
+}
+
+func (b *Bot) initRingBuffer() {
+	rate := b.config.RatePerSec
+	if rate <= 0 {
+		rate = 100.0
+	}
+	timeoutSec := 5.0
+	capacity := int(rate * timeoutSec * 2)
+	if capacity < 1024 {
+		capacity = 1024
+	}
+	if capacity > 65536 {
+		capacity = 65536
+	}
+	b.activeRing = newRingBuf(capacity)
 }
 
 func (b *Bot) NextOrder() OrderMessage {
@@ -129,7 +187,7 @@ func (b *Bot) progressBasedOrder(orderID, seq int64) OrderMessage {
 			price = b.config.MidPrice + 1 + int64(b.rng.Intn(10))
 		}
 
-		b.activeOrders = append(b.activeOrders, orderID)
+		b.activeRing.push(orderID)
 		return OrderMessage{BotID: b.config.StringID, OrderID: orderID, Type: Limit, Side: side, Price: price, Quantity: 100}
 	}
 
@@ -142,9 +200,7 @@ func (b *Bot) progressBasedOrder(orderID, seq int64) OrderMessage {
 		return OrderMessage{BotID: b.config.StringID, OrderID: orderID, Type: Market, Side: side, Quantity: 5000}
 	}
 
-	if len(b.activeOrders) > 0 {
-		cancelID := b.activeOrders[0]
-		b.activeOrders = b.activeOrders[1:]
+	if cancelID, ok := b.activeRing.pop(); ok {
 		return OrderMessage{BotID: b.config.StringID, OrderID: cancelID, Type: Cancel}
 	}
 

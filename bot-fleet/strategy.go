@@ -46,7 +46,7 @@ type MomentumStrategy struct {
 	baseSleepMs int64
 }
 
-func NewMomentumStrategy(ratePerSec float64, botNumericID int64) *MomentumStrategy {
+func NewMomentumStrategy(ratePerSec float64, botNumericID int64, seed int64) *MomentumStrategy {
 	burst := 16
 
 	// Fix 1: Calculate the exact time required to refill 'burst' amount of tokens
@@ -56,7 +56,7 @@ func NewMomentumStrategy(ratePerSec float64, botNumericID int64) *MomentumStrate
 	return &MomentumStrategy{
 		limiter: rate.NewLimiter(rate.Limit(ratePerSec), burst),
 		// Fix 3: Multiply ID by a prime number to guarantee massive PRNG separation
-		rng:         rand.New(rand.NewSource(time.Now().UnixNano() + (botNumericID * 7919))),
+		rng:         rand.New(rand.NewSource(seed + (botNumericID * 7919))),
 		burstSize:   burst,
 		burstFired:  0,
 		inBurst:     false,
@@ -102,7 +102,7 @@ type NoiseStrategy struct {
 	maxSleepMs int64
 }
 
-func NewNoiseStrategy(ratePerSec float64, botNumericID int64) *NoiseStrategy {
+func NewNoiseStrategy(ratePerSec float64, botNumericID int64, seed int64) *NoiseStrategy {
 	// Fix 2: Calculate dynamic sleep bounds based on the requested rate
 	avgSleepMs := int64(1000.0 / ratePerSec)
 	if avgSleepMs < 2 {
@@ -113,7 +113,7 @@ func NewNoiseStrategy(ratePerSec float64, botNumericID int64) *NoiseStrategy {
 		// A higher burst (10) allows the bot to fire rapidly after a long sleep,
 		// maintaining the overall average TPS configuration requested by the orchestrator.
 		limiter:    rate.NewLimiter(rate.Limit(ratePerSec), 10),
-		rng:        rand.New(rand.NewSource(time.Now().UnixNano() + (botNumericID * 104729))),
+		rng:        rand.New(rand.NewSource(seed + (botNumericID * 104729))),
 		minSleepMs: avgSleepMs / 4,
 		maxSleepMs: avgSleepMs + (avgSleepMs / 2),
 	}
@@ -165,9 +165,9 @@ func newStrategy(b *Bot) Strategy {
 	case MarketMaker:
 		return NewMarketMakerStrategy(b.config.RatePerSec)
 	case MomentumTrader:
-		return NewMomentumStrategy(b.config.RatePerSec, b.config.NumericID)
+		return NewMomentumStrategy(b.config.RatePerSec, b.config.NumericID, b.config.Seed)
 	case NoiseTrader:
-		return NewNoiseStrategy(b.config.RatePerSec, b.config.NumericID)
+		return NewNoiseStrategy(b.config.RatePerSec, b.config.NumericID, b.config.Seed)
 	default:
 		return NewDefaultStrategy(b.config.RatePerSec, b.config.Strategy)
 	}

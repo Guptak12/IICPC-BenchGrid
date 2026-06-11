@@ -76,6 +76,7 @@ type Validator struct {
 	ackViolations      int64
 	duplicateOrders    int64
 	unknownAcks        int64
+	printedMismatches  int
 }
 
 func int64DescComparator(a, b interface{}) int {
@@ -85,12 +86,13 @@ func int64DescComparator(a, b interface{}) int {
 // NewValidator creates a new shadow global Validator
 func NewValidator() *Validator {
 	return &Validator{
-		pendingOrders: make(map[int64]*Order),
-		orderMap:      make(map[int64]*list.Element),
-		bids:          redblacktree.NewWith(int64DescComparator),
-		asks:          redblacktree.NewWith(utils.Int64Comparator),
-		expectedFills: make(map[int64][]Fill),
-		actualFills:   make(map[int64][]Fill),
+		pendingOrders:     make(map[int64]*Order),
+		orderMap:          make(map[int64]*list.Element),
+		bids:              redblacktree.NewWith(int64DescComparator),
+		asks:              redblacktree.NewWith(utils.Int64Comparator),
+		expectedFills:     make(map[int64][]Fill),
+		actualFills:       make(map[int64][]Fill),
+		printedMismatches: 0,
 	}
 }
 
@@ -430,13 +432,19 @@ func (v *Validator) GetCorrectnessScore() float64 {
 		priorityCorrectQty += v.priorityMatchedQty(expectedList, actualList)
 
 		if totalExpQty != totalActQty || expValue != actValue {
-			fmt.Printf("[Validator] Mismatch Order %d (Bot %d): Expected Qty=%d Value=%d, Actual Qty=%d Value=%d\n",
-				orderID, botID(orderID), totalExpQty, expValue, totalActQty, actValue)
-			for _, f := range expectedList {
-				fmt.Printf("   -> Expected Fill: Qty=%d Price=%d MatchedWith=%d\n", f.FilledQty, f.FilledPrice, f.MatchedWith)
-			}
-			for _, f := range actualList {
-				fmt.Printf("   -> Actual Fill: Qty=%d Price=%d MatchedWith=%d\n", f.FilledQty, f.FilledPrice, f.MatchedWith)
+			if v.printedMismatches < 50 {
+				v.printedMismatches++
+				fmt.Printf("[Validator] Mismatch Order %d (Bot %d): Expected Qty=%d Value=%d, Actual Qty=%d Value=%d\n",
+					orderID, botID(orderID), totalExpQty, expValue, totalActQty, actValue)
+				for _, f := range expectedList {
+					fmt.Printf("   -> Expected Fill: Qty=%d Price=%d MatchedWith=%d\n", f.FilledQty, f.FilledPrice, f.MatchedWith)
+				}
+				for _, f := range actualList {
+					fmt.Printf("   -> Actual Fill: Qty=%d Price=%d MatchedWith=%d\n", f.FilledQty, f.FilledPrice, f.MatchedWith)
+				}
+				if v.printedMismatches == 50 {
+					fmt.Println("[Validator] Maximum mismatch logs reached (50). Suppressing further logging.")
+				}
 			}
 		}
 	}

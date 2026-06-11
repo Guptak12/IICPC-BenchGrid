@@ -9,6 +9,8 @@ import (
 	"log"
 	"net"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,9 +26,16 @@ import (
 	protocol "iicpc-sandbox/pkg/protocol"
 )
 
+var maxConcurrentBots = func() int {
+	if v := os.Getenv("MAX_CONCURRENT_BOTS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 500
+}()
+
 const (
-	// maxConcurrentBots caps simultaneous connections
-	maxConcurrentBots = 500
 	dialTimeout       = 5 * time.Second
 	ackTimeout        = 5 * time.Second
 	readPollInterval  = 100 * time.Millisecond
@@ -345,6 +354,24 @@ func runDistributed(ctx context.Context, cfg FleetConfig, jobID string) (*FleetR
 	}, nil
 }
 
+var orderPool = sync.Pool{
+	New: func() any { return &protocol.Order{} },
+}
+
+var payloadBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 256)
+		return &b
+	},
+}
+
+var ackBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 512)
+		return &b
+	},
+}
+
 // runBot is the single-bot execution loop with the real raw TCP send/receive loop.
 func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, totalSent *atomic.Int64, producer *telemetry.Producer, jobID string, workerID string) BotResult {
 	result := BotResult{
@@ -372,55 +399,33 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 		latencyNs int64
 		failed    bool
 	}
-	latencyCh := make(chan latResult, b.config.OrdersToSend)
+	latencyCh := make(chan latResult, 1024)
 
 	var senderDone atomic.Bool
 	var lastReportNs atomic.Int64
 	lastReportNs.Store(time.Now().UnixNano())
 
-	pendingMu := sync.Mutex{}
-	pendingAcks := make(map[int64]int64, b.config.OrdersToSend) // orderID -> send time ns
+	pendingAcks := newPendingTable()
 
 	removePending := func(orderID int64) (int64, bool) {
-		pendingMu.Lock()
-		defer pendingMu.Unlock()
-		sendTime, ok := pendingAcks[orderID]
-		if ok {
-			delete(pendingAcks, orderID)
-		}
-		return sendTime, ok
+		return pendingAcks.remove(orderID)
 	}
 
 	pendingLen := func() int {
-		pendingMu.Lock()
-		defer pendingMu.Unlock()
-		return len(pendingAcks)
+		return pendingAcks.len()
 	}
 
 	failExpiredPending := func(now time.Time) {
 		deadlineNs := now.Add(-ackTimeout).UnixNano()
-		var expired int
-
-		pendingMu.Lock()
-		for orderID, sentAt := range pendingAcks {
-			if sentAt <= deadlineNs {
-				delete(pendingAcks, orderID)
-				expired++
-			}
-		}
-		pendingMu.Unlock()
-
-		for i := 0; i < expired; i++ {
+		expiredIDs := pendingAcks.getExpiredAndRemove(deadlineNs)
+		for range expiredIDs {
 			latencyCh <- latResult{failed: true}
 		}
 	}
 
 	failAllPending := func() {
-		pendingMu.Lock()
-		n := len(pendingAcks)
-		pendingAcks = make(map[int64]int64)
-		pendingMu.Unlock()
-
+		n := pendingAcks.len()
+		pendingAcks.clear()
 		for i := 0; i < n; i++ {
 			latencyCh <- latResult{failed: true}
 		}
@@ -445,18 +450,19 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 
 			msg := b.NextOrder()
 			
-			// Map to protocol.Order
-			protoOrder := &protocol.Order{
-				BotId:    uint64(b.config.NumericID),
-				OrderId:  uint64(msg.OrderID),
-				Type:     mapOrderType(msg.Type),
-				Side:     mapSide(msg.Side),
-				Price:    msg.Price,
-				Quantity: uint64(msg.Quantity),
-			}
+			protoOrder := orderPool.Get().(*protocol.Order)
+			protoOrder.BotId = uint64(b.config.NumericID)
+			protoOrder.OrderId = uint64(msg.OrderID)
+			protoOrder.Type = mapOrderType(msg.Type)
+			protoOrder.Side = mapSide(msg.Side)
+			protoOrder.Price = msg.Price
+			protoOrder.Quantity = uint64(msg.Quantity)
 
-			payload, err := proto.Marshal(protoOrder)
+			payloadBufPtr := payloadBufPool.Get().(*[]byte)
+			payload, err := proto.MarshalOptions{}.MarshalAppend(*payloadBufPtr, protoOrder)
 			if err != nil {
+				orderPool.Put(protoOrder)
+				payloadBufPool.Put(payloadBufPtr)
 				latencyCh <- latResult{failed: true}
 				continue
 			}
@@ -465,18 +471,18 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 			b.RecordSendTime(seq)
 
 			if msg.Type != Cancel {
-				pendingMu.Lock()
-				pendingAcks[msg.OrderID] = b.SendTimes[seq]
-				pendingMu.Unlock()
+				pendingAcks.set(msg.OrderID, b.SendTimes[seq])
 			}
 
-			lengthPrefix := make([]byte, 4)
-			binary.LittleEndian.PutUint32(lengthPrefix, uint32(len(payload)))
+			var lengthPrefix [4]byte
+			binary.LittleEndian.PutUint32(lengthPrefix[:], uint32(len(payload)))
 
-			_, err = conn.Write(lengthPrefix)
-			if err == nil {
-				_, err = conn.Write(payload)
-			}
+			buffers := net.Buffers{lengthPrefix[:], payload}
+			_, err = buffers.WriteTo(conn)
+
+			*payloadBufPtr = payload[:0]
+			orderPool.Put(protoOrder)
+			payloadBufPool.Put(payloadBufPtr)
 
 			if err != nil {
 				removePending(msg.OrderID)
@@ -517,18 +523,27 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 				return
 			}
 
-			payload := make([]byte, length)
-			_, err = io.ReadFull(conn, payload)
+			ackBufPtr := ackBufPool.Get().(*[]byte)
+			if cap(*ackBufPtr) < int(length) {
+				*ackBufPtr = make([]byte, length)
+			} else {
+				*ackBufPtr = (*ackBufPtr)[:length]
+			}
+
+			_, err = io.ReadFull(conn, *ackBufPtr)
 			if err != nil {
+				ackBufPool.Put(ackBufPtr)
 				failAllPending()
 				return
 			}
 			lastReportNs.Store(receivedAt)
 
 			var report protocol.ExecutionReport
-			if err := proto.Unmarshal(payload, &report); err != nil {
+			if err := proto.Unmarshal(*ackBufPtr, &report); err != nil {
+				ackBufPool.Put(ackBufPtr)
 				continue
 			}
+			ackBufPool.Put(ackBufPtr)
 
 			status := strings.ToLower(report.Status.String())
 			orderID := int64(report.OrderId)
@@ -609,11 +624,13 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 			select {
 			case <-ctx.Done():
 				failAllPending()
+				conn.Close()
 				return
 			case <-ticker.C:
 				failExpiredPending(time.Now())
 				lastReport := time.Unix(0, lastReportNs.Load())
 				if senderDone.Load() && pendingLen() == 0 && time.Since(lastReport) >= fillDrainGrace {
+					conn.Close()
 					return
 				}
 			}
@@ -625,7 +642,6 @@ func runBot(ctx context.Context, b *Bot, endpoint string, strategy Strategy, tot
 		close(latencyCh)
 	}()
 
-	// --- Collector ---
 	for lr := range latencyCh {
 		if lr.failed {
 			result.OrdersFailed++
