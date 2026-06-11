@@ -188,6 +188,11 @@ func (b *PretestBot) zipfQuantity() int64 {
 
 // RunPretestFleet executes a small deterministic pretest suite (5 bots, 100 orders each) over raw TCP
 func RunPretestFleet(ctx context.Context, endpoint string, baseSeed int64) (PretestResults, error) {
+	return RunFleet(ctx, endpoint, baseSeed, 5, 100)
+}
+
+// RunFleet executes a customizable deterministic bot fleet over raw TCP
+func RunFleet(ctx context.Context, endpoint string, baseSeed int64, numBots int, ordersPerBot int) (PretestResults, error) {
 	// Edge Case 2: TCP Liveness Probe/Retry Loop with exponential backoff
 	log.Printf("[debug] Dialing TCP liveness probe on %s...\n", endpoint)
 	var probeConn net.Conn
@@ -227,18 +232,16 @@ func RunPretestFleet(ctx context.Context, endpoint string, baseSeed int64) (Pret
 	}
 	log.Printf("[debug] TCP liveness probe succeeded on %s ✓\n", endpoint)
 
-	numBots := 5
-	ordersPerBot := 100
-
 	// Create deterministic bots
 	bots := make([]*PretestBot, numBots)
-	strategies := []StrategyType{MarketMaker, MarketMaker, MomentumTrader, MomentumTrader, NoiseTrader}
+	strategies := []StrategyType{MarketMaker, MomentumTrader, NoiseTrader}
 
 	for i := 0; i < numBots; i++ {
+		strat := strategies[i % len(strategies)]
 		bots[i] = NewPretestBot(
 			int64(i+1),
-			fmt.Sprintf("pretest-bot-%d", i+1),
-			strategies[i],
+			fmt.Sprintf("bot-%d", i+1),
+			strat,
 			100.0, // Mid Price
 			0.10,  // Spread
 			ordersPerBot,

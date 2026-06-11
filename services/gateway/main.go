@@ -1,7 +1,6 @@
 package main
 
 import (
-	"archive/zip"
 	"bytes"
 	"context"
 	"database/sql"
@@ -9,12 +8,13 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
+	"sync"
 	"time"
 
 	"iicpc-sandbox/services/common"
@@ -22,6 +22,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/middleware/adaptor"
 	"github.com/gofiber/fiber/v3/middleware/static"
+	"github.com/gofiber/fiber/v3/middleware/sse"
 	"github.com/google/uuid"
 	"github.com/minio/minio-go/v7"
 	"github.com/redis/go-redis/v9"
@@ -32,6 +33,46 @@ var (
 	db       *sql.DB
 	s3Client *minio.Client
 )
+
+type ArenaSSEHub struct {
+	mu          sync.Mutex
+	subscribers map[string][]chan string // arena_id -> list of subscriber channels
+}
+
+var gatewayLeaderboardHub = &ArenaSSEHub{
+	subscribers: make(map[string][]chan string),
+}
+
+func (h *ArenaSSEHub) subscribe(arenaID string) chan string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	ch := make(chan string, 4)
+	h.subscribers[arenaID] = append(h.subscribers[arenaID], ch)
+	return ch
+}
+
+func (h *ArenaSSEHub) unsubscribe(arenaID string, ch chan string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	subs := h.subscribers[arenaID]
+	for i, s := range subs {
+		if s == ch {
+			h.subscribers[arenaID] = append(subs[:i], subs[i+1:]...)
+			break
+		}
+	}
+}
+
+func (h *ArenaSSEHub) broadcast(arenaID string, payload string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, ch := range h.subscribers[arenaID] {
+		select {
+		case ch <- payload:
+		default:
+		}
+	}
+}
 
 func main() {
 	// Connect to Redis
@@ -53,6 +94,9 @@ func main() {
 	}
 	defer db.Close()
 
+	// Bootstrap Default Arena
+	bootstrapDefaultArena()
+
 	// Initialize Redis Streams and groups
 	ctx := context.Background()
 	if err := common.InitRedisQueues(ctx, rdb); err != nil {
@@ -68,7 +112,7 @@ func main() {
 		log.Fatalf("Failed to ensure S3 bucket: %v", err)
 	}
 
-	// Setup Leaderboard Stream Reverse Proxy
+	// Setup Leaderboard Stream Reverse Proxy for fallback
 	leaderboardStreamURL := os.Getenv("LEADERBOARD_STREAM_URL")
 	if leaderboardStreamURL == "" {
 		leaderboardStreamURL = "http://localhost:3001/leaderboard/stream"
@@ -91,21 +135,58 @@ func main() {
 		BodyLimit: 10 * 1024 * 1024, // 10 MB limit
 	})
 
-	// Routes
-	app.Post("/api/v1/submit", handleSubmission)
+	// Start periodic gateway leaderboard generator to broadcast active updates
+	go func() {
+		ticker := time.NewTicker(3 * time.Second)
+		for range ticker.C {
+			broadcastActiveLeaderboards()
+		}
+	}()
+
+	// Auth API
+	app.Post("/api/v1/auth/register", handleRegister)
+	app.Post("/api/v1/auth/login", handleLogin)
+	app.Post("/api/v1/auth/logout", handleLogout)
+	app.Get("/api/v1/auth/me", optionalAuth, handleMe)
+	app.Get("/api/v1/auth/github", handleGitHubLogin)
+	app.Get("/api/v1/auth/github/callback", handleGitHubCallback)
+
+	// User Profile
+	app.Get("/api/v1/profile/:id", handleGetProfile)
+
+	// Arenas API
+	app.Get("/api/v1/arena", handleListArenas)
+	app.Get("/api/v1/arena/:id", handleGetArena)
+	app.Post("/api/v1/arena/:id/register", requireAuth, handleRegisterArena)
+	app.Get("/api/v1/arena/:id/registrations", requireAuth, handleGetRegistrations)
+
+	// Submissions API
+	app.Post("/api/v1/submit", optionalAuth, handleSubmission)
 	app.Get("/api/v1/build/:id", handleBuildStatus)
 	app.Get("/api/v1/submissions/:id/diagnostics", handleBuildStatus)
-	app.Get("/api/v1/submissions/:id/source", handleGetSource)
+	app.Get("/api/v1/submissions/:id/source", optionalAuth, handleGetSource)
 	app.Get("/api/v1/builds", handleListBuilds)
+
+	// Leaderboards API
+	app.Get("/api/v1/leaderboard/:arena_id", handleGetLeaderboard)
+	app.Get("/api/v1/leaderboard/:arena_id/stream", handleGetLeaderboardStream)
+
+	// Fallback/Legacy endpoints for backwards compatibility
 	app.Get("/api/v1/leaderboard/stream", adaptor.HTTPHandler(proxy))
 
-	// Dashboard Routes
+	// Admin Console API
+	app.Post("/api/v1/admin/arena", requireAuth, requireAdmin, handleCreateArena)
+	app.Put("/api/v1/admin/arena/:id", requireAuth, requireAdmin, handleUpdateArena)
+	app.Post("/api/v1/admin/arena/:id/rejudge", requireAuth, requireAdmin, handleRejudgeArena)
+	app.Get("/api/v1/admin/workers", requireAuth, requireAdmin, handleGetWorkersTelemetry)
+
+	// Dashboard
 	app.Get("/dashboard", handleDashboardPage)
 	app.Get("/api/v1/dashboard/metrics", handleDashboardMetrics)
 	app.Post("/api/v1/dashboard/actions/mock-submission", handleMockSubmission)
 	app.Post("/api/v1/dashboard/actions/clean-db", handleCleanDB)
 
-	// Serve Leaderboard JSON from custom path if overridden (Kubernetes volume support)
+	// Serve Leaderboard JSON
 	leaderboardJSONPath := os.Getenv("LEADERBOARD_JSON_PATH")
 	if leaderboardJSONPath == "" {
 		leaderboardJSONPath = "./frontend/leaderboard.json"
@@ -122,19 +203,61 @@ func main() {
 	log.Fatal(app.Listen(":3000"))
 }
 
+func bootstrapDefaultArena() {
+	var err error
+	for i := 0; i < 5; i++ {
+		var exists bool
+		err = db.QueryRow("SELECT EXISTS(SELECT 1 FROM arenas WHERE id = 'default')").Scan(&exists)
+		if err == nil {
+			if !exists {
+				_, err = db.Exec(
+					`INSERT INTO arenas (id, title, description, status, start_time, end_time) 
+					 VALUES ('default', 'Default Arena', 'Default competitive programming sandbox arena.', 'active', NOW(), NOW() + INTERVAL '30 days')`,
+				)
+				if err != nil {
+					log.Printf("Failed to bootstrap default arena: %v\n", err)
+				} else {
+					log.Println("Bootstrapped default arena ✓")
+				}
+			}
+			break
+		}
+		log.Printf("Waiting for Postgres to bootstrap... %v\n", err)
+		time.Sleep(1 * time.Second)
+	}
+}
+
 func handleSubmission(c fiber.Ctx) error {
 	ctx := context.Background()
 
-	// 1. Extract contestant_id
+	// 1. Extract credentials
 	contestantID := c.FormValue("contestant_id")
 	if contestantID == "" {
 		contestantID = "anonymous"
 	}
 
-	// 2. Redis Rate Limiter: 1 sub per minute
-	allowed, retryAfter, err := CheckRateLimit(ctx, rdb, contestantID)
+	var userID sql.NullString
+	if c.Locals("user_id") != nil {
+		userID.Valid = true
+		userID.String = c.Locals("user_id").(string)
+		if c.Locals("handle") != nil {
+			contestantID = c.Locals("handle").(string)
+		}
+	}
+
+	arenaID := c.FormValue("arena_id")
+	if arenaID == "" {
+		arenaID = "default"
+	}
+
+	// 2. Redis Rate Limiter
+	rateLimitKey := contestantID
+	if userID.Valid {
+		rateLimitKey = userID.String
+	}
+	allowed, retryAfter, err := CheckRateLimit(ctx, rdb, rateLimitKey)
 	if err != nil {
-		log.Printf("Rate limit check failed for %s: %v\n", contestantID, err)
+		log.Printf("Rate limit check failed for %s: %v\n", rateLimitKey, err)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Internal server error checking rate limit"})
 	}
 	if !allowed {
@@ -188,8 +311,9 @@ func handleSubmission(c fiber.Ctx) error {
 
 	// 5. Save to PostgreSQL
 	_, err = db.ExecContext(ctx,
-		"INSERT INTO submissions (id, contestant_id, status, verdict, s3_path, github_url) VALUES ($1, $2, $3, $4, $5, $6)",
-		buildID, contestantID, "queued", "Pending", s3Path, githubURL,
+		`INSERT INTO submissions (id, contestant_id, status, verdict, s3_path, github_url, user_id, arena_id) 
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		buildID, contestantID, "queued", "Pending", s3Path, githubURL, userID, arenaID,
 	)
 	if err != nil {
 		log.Printf("Failed to insert submission %s into DB: %v\n", buildID, err)
@@ -204,7 +328,7 @@ func handleSubmission(c fiber.Ctx) error {
 		log.Printf("Failed to save submission source %s to DB: %v\n", buildID, err)
 	}
 
-	// 6. Push job to compilation queue via Redis Stream XADD
+	// 6. Push job to compilation queue
 	redisValues := map[string]interface{}{
 		"submission_id": buildID,
 		"contestant_id": contestantID,
@@ -221,7 +345,6 @@ func handleSubmission(c fiber.Ctx) error {
 	}).Err()
 	if err != nil {
 		log.Printf("Failed to queue build job for %s: %v\n", buildID, err)
-		// Update DB status to failed
 		db.ExecContext(ctx, "UPDATE submissions SET status = $1, verdict = $2, diagnostics = $3 WHERE id = $4", "failed", "Queue Failure", `{"error":"failed to queue job"}`, buildID)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to queue submission"})
 	}
@@ -248,12 +371,13 @@ func handleBuildStatus(c fiber.Ctx) error {
 		compositeScore   float64
 		createdAt        time.Time
 		githubURL        sql.NullString
+		arenaID          sql.NullString
 	)
 
 	err := db.QueryRowContext(ctx,
-		"SELECT id, contestant_id, status, verdict, diagnostics, composite_score, created_at, github_url FROM submissions WHERE id = $1",
+		"SELECT id, contestant_id, status, verdict, diagnostics, composite_score, created_at, github_url, arena_id FROM submissions WHERE id = $1",
 		id,
-	).Scan(&buildID, &contestantID, &status, &verdict, &diagnosticsBytes, &compositeScore, &createdAt, &githubURL)
+	).Scan(&buildID, &contestantID, &status, &verdict, &diagnosticsBytes, &compositeScore, &createdAt, &githubURL, &arenaID)
 
 	if err == sql.ErrNoRows {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "build not found"})
@@ -281,16 +405,35 @@ func handleBuildStatus(c fiber.Ctx) error {
 	} else {
 		resMap["github_url"] = ""
 	}
+	if arenaID.Valid {
+		resMap["arena_id"] = arenaID.String
+	} else {
+		resMap["arena_id"] = "default"
+	}
 
 	return c.JSON(resMap)
 }
 
 func handleListBuilds(c fiber.Ctx) error {
 	ctx := context.Background()
+	arenaID := c.Query("arena_id")
 
-	rows, err := db.QueryContext(ctx,
-		"SELECT id, contestant_id, status, verdict, diagnostics, composite_score, created_at, github_url FROM submissions ORDER BY created_at DESC LIMIT 50",
-	)
+	var rows *sql.Rows
+	var err error
+
+	if arenaID != "" {
+		rows, err = db.QueryContext(ctx,
+			`SELECT id, contestant_id, status, verdict, diagnostics, composite_score, created_at, github_url, arena_id 
+			 FROM submissions WHERE arena_id = $1 ORDER BY created_at DESC LIMIT 50`,
+			arenaID,
+		)
+	} else {
+		rows, err = db.QueryContext(ctx,
+			`SELECT id, contestant_id, status, verdict, diagnostics, composite_score, created_at, github_url, arena_id 
+			 FROM submissions ORDER BY created_at DESC LIMIT 50`,
+		)
+	}
+
 	if err != nil {
 		log.Printf("Query error listing builds: %v\n", err)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "internal database error"})
@@ -308,9 +451,10 @@ func handleListBuilds(c fiber.Ctx) error {
 			compositeScore   float64
 			createdAt        time.Time
 			githubURL        sql.NullString
+			arenaID          sql.NullString
 		)
 
-		if err := rows.Scan(&buildID, &contestantID, &status, &verdict, &diagnosticsBytes, &compositeScore, &createdAt, &githubURL); err != nil {
+		if err := rows.Scan(&buildID, &contestantID, &status, &verdict, &diagnosticsBytes, &compositeScore, &createdAt, &githubURL, &arenaID); err != nil {
 			continue
 		}
 
@@ -331,6 +475,11 @@ func handleListBuilds(c fiber.Ctx) error {
 		} else {
 			resMap["github_url"] = ""
 		}
+		if arenaID.Valid {
+			resMap["arena_id"] = arenaID.String
+		} else {
+			resMap["arena_id"] = "default"
+		}
 
 		builds = append(builds, resMap)
 	}
@@ -338,267 +487,43 @@ func handleListBuilds(c fiber.Ctx) error {
 	return c.JSON(builds)
 }
 
-func handleDashboardPage(c fiber.Ctx) error {
-	c.Set("Content-Type", "text/html")
-	return c.SendString(dashboardHTML)
-}
-
-func handleDashboardMetrics(c fiber.Ctx) error {
-	ctx := context.Background()
-
-	// 1. Health checks
-	dbHealthy := true
-	if err := db.PingContext(ctx); err != nil {
-		dbHealthy = false
-	}
-
-	redisHealthy := true
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		redisHealthy = false
-	}
-
-	// 2. Metrics
-	var totalSubs int
-	var activeSubs int
-	var maxScore float64
-
-	if dbHealthy {
-		_ = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM submissions").Scan(&totalSubs)
-		_ = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM submissions WHERE status IN ('queued', 'compiling', 'running')").Scan(&activeSubs)
-		_ = db.QueryRowContext(ctx, "SELECT COALESCE(MAX(composite_score), 0.0) FROM submissions").Scan(&maxScore)
-	}
-
-	var compileQueueDepth int64
-	var pretestQueueDepth int64
-	if redisHealthy {
-		compileQueueDepth = rdb.XLen(ctx, common.CompilationQueue).Val()
-		pretestQueueDepth = rdb.XLen(ctx, common.PretestQueue).Val()
-	}
-
-	// 3. Recent submissions (excluding source code reading)
-	recentSubmissions := []fiber.Map{}
-	if dbHealthy {
-		rows, err := db.QueryContext(ctx,
-			"SELECT id, contestant_id, status, verdict, diagnostics, composite_score, created_at FROM submissions ORDER BY created_at DESC LIMIT 30",
-		)
-		if err == nil {
-			defer rows.Close()
-			for rows.Next() {
-				var (
-					id               string
-					contestantID     string
-					status           string
-					verdict          string
-					diagnosticsBytes []byte
-					compositeScore   float64
-					createdAt        time.Time
-				)
-				if err := rows.Scan(&id, &contestantID, &status, &verdict, &diagnosticsBytes, &compositeScore, &createdAt); err != nil {
-					continue
-				}
-
-				var diagnostics map[string]interface{}
-				_ = json.Unmarshal(diagnosticsBytes, &diagnostics)
-
-				recentSubmissions = append(recentSubmissions, fiber.Map{
-					"build_id":        id,
-					"contestant_id":   contestantID,
-					"status":          status,
-					"verdict":         verdict,
-					"diagnostics":     diagnostics,
-					"composite_score": compositeScore,
-					"submitted_at":    createdAt,
-				})
-			}
-		}
-	}
-
-	// 4. Generate dynamic chart values
-	// Calculate HTTP rate based on real submissions count over last 30s
-	var httpRate float64
-	if dbHealthy {
-		var recentCount int
-		_ = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM submissions WHERE created_at >= NOW() - INTERVAL '30 SECONDS'").Scan(&recentCount)
-		httpRate = float64(recentCount) / 30.0
-	}
-	// Add some baseline noise so charts render nicely
-	httpRate += 0.01 + 0.03*rand.Float64()
-
-	// DB query rate baseline + noise
-	dbQueryRate := httpRate * 1.5
-	dbQueryRate += 0.02 + 0.05*rand.Float64()
-
-	// p95 Duration: average p99 latency from diagnostics of completed runs, or a realistic baseline (e.g. 0.01 - 0.04s)
-	p95Duration := 0.005 + 0.01*rand.Float64()
-
-	return c.JSON(fiber.Map{
-		"db_healthy":              dbHealthy,
-		"redis_healthy":           redisHealthy,
-		"total_submissions":       totalSubs,
-		"active_submissions":      activeSubs,
-		"compilation_queue_depth": compileQueueDepth,
-		"pretest_queue_depth":     pretestQueueDepth,
-		"max_composite_score":     maxScore,
-		"recent_submissions":      recentSubmissions,
-		"http_rate":               httpRate,
-		"db_query_rate":           dbQueryRate,
-		"p95_duration":            p95Duration,
-	})
-}
-
-func zipDirToBytes(dirPath string) ([]byte, error) {
-	var zipBuf bytes.Buffer
-	zipWriter := zip.NewWriter(&zipBuf)
-
-	err := filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if info.IsDir() {
-			return nil
-		}
-		relPath, err := filepath.Rel(dirPath, path)
-		if err != nil {
-			return err
-		}
-		f, err := zipWriter.Create(relPath)
-		if err != nil {
-			return err
-		}
-		fileBytes, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		_, err = f.Write(fileBytes)
-		return err
-	})
-	if err != nil {
-		return nil, err
-	}
-	err = zipWriter.Close()
-	if err != nil {
-		return nil, err
-	}
-	return zipBuf.Bytes(), nil
-}
-
-func handleMockSubmission(c fiber.Ctx) error {
-	ctx := context.Background()
-	buildID := uuid.New().String()
-
-	engine := c.Query("engine")
-	if engine == "" {
-		engine = "go_optimized"
-	}
-
-	allowedEngines := map[string]bool{
-		"go_optimized": true,
-		"python_slow":  true,
-		"rust_crash":   true,
-		"node_scammer": true,
-		"cpp_basic":    true,
-	}
-	if !allowedEngines[engine] {
-		return c.Status(fiber.StatusBadRequest).SendString("Invalid engine name")
-	}
-
-	dirPath := filepath.Join("test_payloads", engine)
-	if _, err := os.Stat(dirPath); os.IsNotExist(err) {
-		return c.Status(fiber.StatusBadRequest).SendString("Engine directory not found")
-	}
-
-	zipBytes, err := zipDirToBytes(dirPath)
-	if err != nil {
-		log.Printf("[mock] Failed to zip directory %s: %v\n", dirPath, err)
-		return c.Status(fiber.StatusInternalServerError).SendString("failed to package mock engine")
-	}
-
-	// 2. Upload to S3/MinIO
-	s3Path := fmt.Sprintf("submissions/%s/submission.zip", buildID)
-	_, err = s3Client.PutObject(ctx, common.S3Bucket, s3Path, bytes.NewReader(zipBytes), int64(len(zipBytes)), minio.PutObjectOptions{
-		ContentType: "application/zip",
-	})
-	if err != nil {
-		log.Printf("[mock] Failed to upload mock to S3: %v\n", err)
-		return c.Status(fiber.StatusInternalServerError).SendString("failed to store mock submission ZIP")
-	}
-
-	// 3. Save to database
-	contestantID := fmt.Sprintf("mock-contestant-%d", rand.Intn(1000000))
-	_, err = db.ExecContext(ctx,
-		"INSERT INTO submissions (id, contestant_id, status, verdict, s3_path) VALUES ($1, $2, $3, $4, $5)",
-		buildID, contestantID, "queued", "Pending", s3Path,
-	)
-	if err != nil {
-		log.Printf("[mock] Failed to insert into PostgreSQL: %v\n", err)
-		return c.Status(fiber.StatusInternalServerError).SendString("failed to save mock submission status")
-	}
-
-	_, err = db.ExecContext(ctx,
-		"INSERT INTO submission_sources (submission_id, source_code) VALUES ($1, $2)",
-		buildID, fmt.Sprintf("[ZIP Mock Submission: %s]", engine),
-	)
-	if err != nil {
-		log.Printf("[mock] Failed to save mock submission source to DB: %v\n", err)
-	}
-
-	// 4. Push to compilation queue
-	err = rdb.XAdd(ctx, &redis.XAddArgs{
-		Stream: common.CompilationQueue,
-		Values: map[string]interface{}{
-			"submission_id": buildID,
-			"s3_path":       s3Path,
-			"contestant_id": contestantID,
-		},
-	}).Err()
-	if err != nil {
-		log.Printf("[mock] Failed to push to compilation stream: %v\n", err)
-		db.ExecContext(ctx, "UPDATE submissions SET status = $1, verdict = $2, diagnostics = $3 WHERE id = $4", "failed", "Queue Failure", `{"error":"failed to queue job"}`, buildID)
-		return c.Status(fiber.StatusInternalServerError).SendString("failed to queue mock submission")
-	}
-
-	log.Printf("[mock] Triggered mock submission %s for %s ✓\n", buildID, contestantID)
-	return c.JSON(fiber.Map{
-		"build_id": buildID,
-		"status":   "queued",
-	})
-}
-
-func handleCleanDB(c fiber.Ctx) error {
-	ctx := context.Background()
-
-	// Truncate PG Table
-	_, err := db.ExecContext(ctx, "TRUNCATE TABLE submissions RESTART IDENTITY CASCADE;")
-	if err != nil {
-		log.Printf("Failed to truncate submissions: %v\n", err)
-		return c.Status(fiber.StatusInternalServerError).SendString("Failed to truncate database submissions")
-	}
-
-	// Clear local submissions directory files to prevent disk clutter
-	cwd, _ := os.Getwd()
-	subsDir := filepath.Join(cwd, "submissions")
-	_ = os.RemoveAll(subsDir)
-	_ = os.MkdirAll(subsDir, 0777)
-
-	// Flush Redis Streams
-	if err := rdb.Del(ctx, common.CompilationQueue, common.PretestQueue, common.SystestQueue).Err(); err != nil {
-		log.Printf("Failed to delete Redis streams: %v\n", err)
-	}
-
-	// Reinitialize consumer groups/streams
-	if err := common.InitRedisQueues(ctx, rdb); err != nil {
-		log.Printf("Failed to reinitialize Redis streams/groups: %v\n", err)
-	}
-
-	log.Println("Database cleaned and Redis streams flushed ✓")
-	return c.JSON(fiber.Map{"status": "ok"})
-}
-
 func handleGetSource(c fiber.Ctx) error {
 	ctx := context.Background()
 	id := c.Params("id")
+
+	var subUserID sql.NullString
+	var subArenaID sql.NullString
+	err := db.QueryRowContext(ctx, "SELECT user_id, arena_id FROM submissions WHERE id = $1", id).Scan(&subUserID, &subArenaID)
+	if err == sql.ErrNoRows {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "submission not found"})
+	} else if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "internal database error"})
+	}
+
+	// Fetch current user from optionalAuth context
+	currentUserID := ""
+	currentUserRole := ""
+	if c.Locals("user_id") != nil {
+		currentUserID = c.Locals("user_id").(string)
+	}
+	if c.Locals("role") != nil {
+		currentUserRole = c.Locals("role").(string)
+	}
+
+	isOwnerOrAdmin := currentUserRole == "admin" || (subUserID.Valid && subUserID.String == currentUserID)
+
+	if !isOwnerOrAdmin {
+		var arenaStatus string
+		if subArenaID.Valid {
+			_ = db.QueryRowContext(ctx, "SELECT status FROM arenas WHERE id = $1", subArenaID.String).Scan(&arenaStatus)
+		}
+		if arenaStatus != "ended" {
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "Source code is private until the contest ends"})
+		}
+	}
+
 	var src string
-	err := db.QueryRowContext(ctx,
+	err = db.QueryRowContext(ctx,
 		"SELECT source_code FROM submission_sources WHERE submission_id = $1", id,
 	).Scan(&src)
 	if err == sql.ErrNoRows {
@@ -608,4 +533,248 @@ func handleGetSource(c fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "internal database error"})
 	}
 	return c.JSON(fiber.Map{"source_code": src})
+}
+
+// GET /api/v1/leaderboard/:arena_id
+func handleGetLeaderboard(c fiber.Ctx) error {
+	arenaID := c.Params("arena_id")
+	dataBytes, err := generateLeaderboardData(arenaID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to generate leaderboard"})
+	}
+
+	c.Set("Content-Type", "application/json")
+	return c.Send(dataBytes)
+}
+
+// GET /api/v1/leaderboard/:arena_id/stream
+func handleGetLeaderboardStream(c fiber.Ctx) error {
+	arenaID := c.Params("arena_id")
+
+	c.Set("Content-Type", "text/event-stream")
+	c.Set("Cache-Control", "no-cache")
+	c.Set("Connection", "keep-alive")
+	c.Set("Access-Control-Allow-Origin", "*")
+
+	return sse.New(sse.Config{
+		Handler: func(c fiber.Ctx, stream *sse.Stream) error {
+			// Send current data immediately
+			data, err := generateLeaderboardData(arenaID)
+			if err == nil {
+				_ = stream.Event(sse.Event{
+					Data: data,
+				})
+			}
+
+			ch := gatewayLeaderboardHub.subscribe(arenaID)
+			defer gatewayLeaderboardHub.unsubscribe(arenaID, ch)
+
+			keepAliveTicker := time.NewTicker(15 * time.Second)
+			defer keepAliveTicker.Stop()
+
+			for {
+				select {
+				case payload := <-ch:
+					err := stream.Event(sse.Event{
+						Data: []byte(payload),
+					})
+					if err != nil {
+						return nil // client disconnected
+					}
+				case <-keepAliveTicker.C:
+					// Send a keep-alive event
+					err := stream.Event(sse.Event{
+						Name: "ping",
+						Data: []byte("keep-alive"),
+					})
+					if err != nil {
+						return nil
+					}
+				case <-c.Context().Done():
+					return nil
+				}
+			}
+		},
+	})(c)
+}
+
+func broadcastActiveLeaderboards() {
+	ctx := context.Background()
+	rows, err := db.QueryContext(ctx, "SELECT id FROM arenas WHERE status IN ('active', 'system_test')")
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var arenaID string
+		if err := rows.Scan(&arenaID); err == nil {
+			data, err := generateLeaderboardData(arenaID)
+			if err == nil {
+				gatewayLeaderboardHub.broadcast(arenaID, string(data))
+				if arenaID == "default" {
+					// Fallback file sync
+					cwd, _ := os.Getwd()
+					targetPath := filepath.Join(cwd, "frontend", "leaderboard.json")
+					_ = os.WriteFile(targetPath, data, 0644)
+				}
+			}
+		}
+	}
+}
+
+type LeaderboardEntry struct {
+	Rank             int       `json:"rank"`
+	ContestantID     string    `json:"contestant_id"`
+	SubmissionID     string    `json:"submission_id"`
+	Verdict          string    `json:"verdict"`
+	CompositeScore   float64   `json:"composite_score"`
+	CorrectnessScore float64   `json:"correctness_score"`
+	P50Us            int64     `json:"p50_us"`
+	P90Us            int64     `json:"p90_us"`
+	P99Us            int64     `json:"p99_us"`
+	ActualTps        float64   `json:"actual_tps"`
+	LatencyScore     float64   `json:"latency_score"`
+	ThroughputScore  float64   `json:"throughput_score"`
+	EngineArchetype  string    `json:"engine_archetype"`
+	Status           string    `json:"status"`
+	UpdatedAt        time.Time `json:"updated_at"`
+	DeltaScore       float64   `json:"delta_score"`
+	DeltaP99         int64     `json:"delta_p99"`
+	Reason           string    `json:"reason"`
+}
+
+func generateLeaderboardData(arenaID string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	query := `
+		WITH ranked_submissions AS (
+			SELECT contestant_id, id, verdict, composite_score, correctness_score, p50_us, p90_us, p99_us, actual_tps, diagnostics, updated_at, status, user_id,
+			       ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY composite_score DESC, updated_at ASC) as rank_score
+			FROM submissions
+			WHERE arena_id = $1
+		)
+		SELECT contestant_id, id, verdict, composite_score, correctness_score, p50_us, p90_us, p99_us, actual_tps, diagnostics, updated_at, status, rank_score, user_id
+		FROM ranked_submissions
+		WHERE rank_score <= 2
+		ORDER BY user_id, rank_score ASC
+	`
+
+	rows, err := db.QueryContext(ctx, query, arenaID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	type rawRow struct {
+		contestantID     string
+		submissionID     string
+		verdict          string
+		compositeScore   float64
+		correctnessScore float64
+		p50Us            int64
+		p90Us            int64
+		p99Us            int64
+		actualTps        float64
+		diagnosticsRaw   []byte
+		updatedAt        time.Time
+		status           string
+		rankScore        int
+		userID           string
+	}
+
+	userMap := make(map[string][]rawRow)
+	for rows.Next() {
+		var r rawRow
+		err := rows.Scan(
+			&r.contestantID,
+			&r.submissionID,
+			&r.verdict,
+			&r.compositeScore,
+			&r.correctnessScore,
+			&r.p50Us,
+			&r.p90Us,
+			&r.p99Us,
+			&r.actualTps,
+			&r.diagnosticsRaw,
+			&r.updatedAt,
+			&r.status,
+			&r.rankScore,
+			&r.userID,
+		)
+		if err != nil {
+			continue
+		}
+		userMap[r.userID] = append(userMap[r.userID], r)
+	}
+
+	entries := []LeaderboardEntry{}
+
+	for _, subs := range userMap {
+		if len(subs) == 0 {
+			continue
+		}
+
+		best := subs[0]
+
+		var diag map[string]interface{}
+		if len(best.diagnosticsRaw) > 0 {
+			_ = json.Unmarshal(best.diagnosticsRaw, &diag)
+		}
+		if diag == nil {
+			diag = make(map[string]interface{})
+		}
+
+		latScore, _ := diag["latency_score"].(float64)
+		tpScore, _ := diag["throughput_score"].(float64)
+		archetype, _ := diag["engine_archetype"].(string)
+		if archetype == "" {
+			archetype = "Unclassified"
+		}
+		reason, _ := diag["reason"].(string)
+		if reason == "" {
+			reason = "Optimal Execution (Passes all SLAs)"
+		}
+
+		entry := LeaderboardEntry{
+			ContestantID:     best.contestantID,
+			SubmissionID:     best.submissionID,
+			Verdict:          best.verdict,
+			CompositeScore:   best.compositeScore,
+			CorrectnessScore: best.correctnessScore,
+			P50Us:            best.p50Us,
+			P90Us:            best.p90Us,
+			P99Us:            best.p99Us,
+			ActualTps:        best.actualTps,
+			LatencyScore:     latScore,
+			ThroughputScore:  tpScore,
+			EngineArchetype:  archetype,
+			Status:           best.status,
+			UpdatedAt:        best.updatedAt,
+			Reason:           reason,
+		}
+
+		if time.Since(best.updatedAt) <= 10*time.Minute && len(subs) > 1 {
+			secondBest := subs[1]
+			entry.DeltaScore = best.compositeScore - secondBest.compositeScore
+			entry.DeltaP99 = best.p99Us - secondBest.p99Us
+		}
+
+		entries = append(entries, entry)
+	}
+
+	// Sort leaderboard
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].CompositeScore != entries[j].CompositeScore {
+			return entries[i].CompositeScore > entries[j].CompositeScore
+		}
+		return entries[i].UpdatedAt.Before(entries[j].UpdatedAt)
+	})
+
+	for i := range entries {
+		entries[i].Rank = i + 1
+	}
+
+	return json.Marshal(entries)
 }

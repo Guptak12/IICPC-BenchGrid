@@ -75,60 +75,88 @@ func main() {
 	}
 
 	consumerName := "pretest-" + uuid.New().String()[:8]
-	log.Printf("Pretest Worker %s started, listening on pretest queue... ✓\n", consumerName)
+	log.Printf("Pretest/Systest Worker %s started... ✓\n", consumerName)
 
 	// Trap shutdown signals
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Start PEL recovery for pretest group (claim messages idle > 2 minutes)
+	// Start PEL recovery for pretest and systest groups
 	common.StartPELRecovery(shutdownCtx, rdb, common.PretestQueue, common.PretestGroup, consumerName, 2*time.Minute)
+	common.StartPELRecovery(shutdownCtx, rdb, common.SystestQueue, common.SystestGroup, consumerName, 2*time.Minute)
 
 	// Start background Docker container sweeper to garbage collect orphaned contestant containers
 	startDockerSweeper(shutdownCtx, dockerClient)
 
+	// Run pretest queue loop
+	go startWorkerLoop(shutdownCtx, common.PretestQueue, common.PretestGroup, consumerName, func(c context.Context, msg redis.XMessage) {
+		processPretestMessage(c, msg, false)
+	})
+
+	// Run system test queue loop (blocking)
+	startWorkerLoop(shutdownCtx, common.SystestQueue, common.SystestGroup, consumerName, func(c context.Context, msg redis.XMessage) {
+		processPretestMessage(c, msg, true)
+	})
+}
+
+func startWorkerLoop(ctx context.Context, stream, group, consumerName string, handler func(context.Context, redis.XMessage)) {
 	for {
-		// Read new messages from group
-		streams, err := rdb.XReadGroup(shutdownCtx, &redis.XReadGroupArgs{
-			Group:    common.PretestGroup,
+		streams, err := rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+			Group:    group,
 			Consumer: consumerName,
-			Streams:  []string{common.PretestQueue, ">"},
+			Streams:  []string{stream, ">"},
 			Count:    1,
 			Block:    2 * time.Second,
 		}).Result()
 
-		if shutdownCtx.Err() != nil {
-			log.Println("Shutdown signal received, pretest worker shutting down...")
+		if ctx.Err() != nil {
+			log.Printf("Queue loop for %s shutting down...", stream)
 			return
 		}
 
 		if err == redis.Nil {
 			continue
 		} else if err != nil {
-			log.Printf("Error reading from stream: %v\n", err)
+			log.Printf("[%s] Error reading from stream: %v\n", stream, err)
 			time.Sleep(2 * time.Second)
 			continue
 		}
 
-		for _, stream := range streams {
-			for _, message := range stream.Messages {
-				processPretestMessage(shutdownCtx, message)
+		for _, s := range streams {
+			for _, message := range s.Messages {
+				handler(ctx, message)
 			}
 		}
 	}
 }
 
-func processPretestMessage(ctx context.Context, message redis.XMessage) {
+func processPretestMessage(ctx context.Context, message redis.XMessage, isSystest bool) {
+	queueName := common.PretestQueue
+	groupName := common.PretestGroup
+	numBots := 5
+	ordersPerBot := 100
+
+	if isSystest {
+		queueName = common.SystestQueue
+		groupName = common.SystestGroup
+		numBots = 10
+		ordersPerBot = 500
+	}
+
 	submissionID, ok1 := message.Values["submission_id"].(string)
 	imageTag, ok2 := message.Values["image_tag"].(string)
 
 	if !ok1 || !ok2 {
 		log.Printf("Skipping invalid stream message: %v\n", message.ID)
-		rdb.XAck(ctx, common.PretestQueue, common.PretestGroup, message.ID)
+		rdb.XAck(ctx, queueName, groupName, message.ID)
 		return
 	}
 
-	log.Printf("[submission:%s] Starting pretests...\n", submissionID[:8])
+	testType := "pretests"
+	if isSystest {
+		testType = "system tests"
+	}
+	log.Printf("[submission:%s] Starting %s...\n", submissionID[:8], testType)
 
 	// 1. Update PostgreSQL status to 'running'
 	_, err := db.ExecContext(ctx,
@@ -163,22 +191,22 @@ func processPretestMessage(ctx context.Context, message redis.XMessage) {
 	var accumulatedLogs string
 
 	for run := 0; run < k; run++ {
-		log.Printf("[submission:%s] Starting pretest run %d/%d...\n", submissionID[:8], run+1, k)
+		log.Printf("[submission:%s] Starting %s run %d/%d...\n", submissionID[:8], testType, run+1, k)
 
 		// Start sandboxed contestant container directly using their image
 		containerID, endpoint, err := startContestantSandbox(ctx, submissionID, imageTag)
 		if err != nil {
 			log.Printf("[submission:%s] Run %d: Failed to spin up sandbox: %v\n", submissionID[:8], run+1, err)
-			if common.ShouldRetry(ctx, rdb, common.PretestQueue, common.PretestGroup, message.ID, message.Values, err) {
+			if common.ShouldRetry(ctx, rdb, queueName, groupName, message.ID, message.Values, err) {
 				return
 			}
 			failPretest(ctx, submissionID, "Runtime Failure", "Failed to spin up runtime sandbox: "+err.Error(), accumulatedLogs)
 			return
 		}
 
-		// Execute pretest fleet with run-specific seed
+		// Execute bot fleet with run-specific seed
 		seedForRun := baseSeed + int64(run*1000)
-		results, err := RunPretestFleet(ctx, endpoint, seedForRun)
+		results, err := RunFleet(ctx, endpoint, seedForRun, numBots, ordersPerBot)
 
 		// Clean up container immediately after this run and extract logs (Edge Case 3)
 		log.Printf("[submission:%s] Run %d: Cleaning up contestant sandbox...\n", submissionID[:8], run+1)
@@ -194,11 +222,11 @@ func processPretestMessage(ctx context.Context, message redis.XMessage) {
 		_, _ = dockerClient.ContainerRemove(context.Background(), containerID, client.ContainerRemoveOptions{Force: true})
 
 		if err != nil {
-			log.Printf("[submission:%s] Run %d: Error during pretest execution: %v\n", submissionID[:8], run+1, err)
-			if common.ShouldRetry(ctx, rdb, common.PretestQueue, common.PretestGroup, message.ID, message.Values, err) {
+			log.Printf("[submission:%s] Run %d: Error during execution: %v\n", submissionID[:8], run+1, err)
+			if common.ShouldRetry(ctx, rdb, queueName, groupName, message.ID, message.Values, err) {
 				return
 			}
-			failPretest(ctx, submissionID, "Runtime Failure", "Pretest execution failed: "+err.Error(), accumulatedLogs)
+			failPretest(ctx, submissionID, "Runtime Failure", "Execution failed: "+err.Error(), accumulatedLogs)
 			return
 		}
 
@@ -296,8 +324,8 @@ func processPretestMessage(ctx context.Context, message redis.XMessage) {
 	// Save sandboxed logs snippet in diagnostics for frontend rendering (Edge Case 3)
 	diagnostics["sandbox_logs"] = tailLogs(accumulatedLogs, 100)
 
-	log.Printf("[submission:%s] Pretest Finished! Verdict: %s | Score: %.2f (Mean: %.2f, StdDev: %.2f) ✓\n",
-		submissionID[:8], verdict, compositeScore, meanScore, stdDev)
+	log.Printf("[submission:%s] %s Finished! Verdict: %s | Score: %.2f (Mean: %.2f, StdDev: %.2f) ✓\n",
+		submissionID[:8], testType, verdict, compositeScore, meanScore, stdDev)
 
 	// Update PostgreSQL with final results
 	diagBytes, _ := json.Marshal(diagnostics)
@@ -314,7 +342,7 @@ func processPretestMessage(ctx context.Context, message redis.XMessage) {
 	}
 
 	// Acknowledge stream message
-	rdb.XAck(ctx, common.PretestQueue, common.PretestGroup, message.ID)
+	rdb.XAck(ctx, queueName, groupName, message.ID)
 }
 
 func startContestantSandbox(ctx context.Context, submissionID string, imageTag string) (string, string, error) {
