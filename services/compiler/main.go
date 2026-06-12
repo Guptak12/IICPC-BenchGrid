@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log"
 	"os/signal"
 	"strings"
@@ -61,6 +62,7 @@ func main() {
 		log.Fatalf("Postgres connection failed: %v", err)
 	}
 	defer db.Close()
+	common.ConfigureDBPool(db)
 
 	// Initialize queues
 	if err := common.InitRedisQueues(ctx, rdb); err != nil {
@@ -73,6 +75,11 @@ func main() {
 	// Trap shutdown signals
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Start Prometheus metrics server
+	go common.ServeMetrics(":9091")
+	common.StartQueueDepthCollector(shutdownCtx, rdb, 5*time.Second)
+	common.StartDBPoolCollector(shutdownCtx, db, "compiler", 5*time.Second)
 
 	// Start PEL recovery for compiler group (claim messages idle > 2 minutes)
 	common.StartPELRecovery(shutdownCtx, rdb, common.CompilationQueue, common.CompilationGroup, consumerName, 2*time.Minute)
@@ -113,16 +120,27 @@ func processMessage(ctx context.Context, message redis.XMessage) {
 	s3Path, _ := message.Values["s3_path"].(string)
 	githubURL, _ := message.Values["github_url"].(string)
 	contestantID, _ := message.Values["contestant_id"].(string)
+	isSystestStr, _ := message.Values["is_systest"].(string)
+	isSystest := isSystestStr == "true"
 
 	if !ok1 || (s3Path == "" && githubURL == "") {
 		log.Printf("Skipping invalid stream message: %v\n", message.ID)
-		rdb.XAck(ctx, common.CompilationQueue, common.CompilationGroup, message.ID)
+		common.AckAndDel(ctx, rdb, common.CompilationQueue, common.CompilationGroup, message.ID)
 		return
 	}
+
+	// Prometheus: track active jobs and build duration
+	common.WorkerActiveJobs.WithLabelValues("compiler", fmt.Sprintf("compiler-%s", submissionID[:8])).Inc()
+	compileStart := time.Now()
+	defer func() {
+		common.WorkerActiveJobs.WithLabelValues("compiler", fmt.Sprintf("compiler-%s", submissionID[:8])).Dec()
+		common.CompilationDuration.Observe(time.Since(compileStart).Seconds())
+	}()
 
 	log.Printf("[submission:%s] Starting image build...\n", submissionID[:8])
 
 	// 1. Update PostgreSQL status to 'building'
+	common.SubmissionsTotal.WithLabelValues("building").Inc()
 	_, err := db.ExecContext(ctx,
 		"UPDATE submissions SET status = $1, updated_at = NOW() WHERE id = $2",
 		"building", submissionID,
@@ -149,7 +167,7 @@ func processMessage(ctx context.Context, message redis.XMessage) {
 			verdict = "Build Timeout"
 		}
 		failSubmission(ctx, submissionID, verdict, stderr)
-		rdb.XAck(ctx, common.CompilationQueue, common.CompilationGroup, message.ID)
+		common.AckAndDel(ctx, rdb, common.CompilationQueue, common.CompilationGroup, message.ID)
 		return
 	}
 
@@ -164,9 +182,16 @@ func processMessage(ctx context.Context, message redis.XMessage) {
 		log.Printf("Failed to update status to built: %v\n", err)
 	}
 
-	// 4. Push job to pretest queue via XADD
+	// 4. Push job to pretest/systest queue via XADD
+	targetQueue := common.PretestQueue
+	queueErrStr := "pretests"
+	if isSystest {
+		targetQueue = common.SystestQueue
+		queueErrStr = "system tests"
+	}
+
 	err = rdb.XAdd(ctx, &redis.XAddArgs{
-		Stream: common.PretestQueue,
+		Stream: targetQueue,
 		Values: map[string]interface{}{
 			"submission_id": submissionID,
 			"image_tag":     imageTag,
@@ -174,11 +199,11 @@ func processMessage(ctx context.Context, message redis.XMessage) {
 		},
 	}).Err()
 	if err != nil {
-		log.Printf("[submission:%s] Failed to queue pretest job: %v\n", submissionID[:8], err)
-		failSubmission(ctx, submissionID, "Queue Failure", "Failed to queue for pretests: "+err.Error())
+		log.Printf("[submission:%s] Failed to queue %s job: %v\n", submissionID[:8], queueErrStr, err)
+		failSubmission(ctx, submissionID, "Queue Failure", fmt.Sprintf("Failed to queue for %s: %v", queueErrStr, err))
 	} else {
 		// Acknowledge the compilation message in the group
-		rdb.XAck(ctx, common.CompilationQueue, common.CompilationGroup, message.ID)
+		common.AckAndDel(ctx, rdb, common.CompilationQueue, common.CompilationGroup, message.ID)
 	}
 }
 

@@ -30,7 +30,7 @@ func ShouldRetry(ctx context.Context, rdb *redis.Client, stream, group, msgID st
 			Stream: DeadLetterQueue,
 			Values: values,
 		})
-		rdb.XAck(ctx, stream, group, msgID)
+		AckAndDel(ctx, rdb, stream, group, msgID)
 		log.Printf("[DLQ] Message %s moved to dead letter after %d retries\n", msgID, retryCount)
 		return false
 	}
@@ -41,7 +41,7 @@ func ShouldRetry(ctx context.Context, rdb *redis.Client, stream, group, msgID st
 		Stream: stream,
 		Values: values,
 	})
-	rdb.XAck(ctx, stream, group, msgID)
+	AckAndDel(ctx, rdb, stream, group, msgID)
 	log.Printf("[retry] Message %s re-queued (attempt %d/%d)\n", msgID, retryCount+1, MaxRetries)
 	return true
 }

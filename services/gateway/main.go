@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"iicpc-sandbox/services/common"
@@ -25,9 +26,10 @@ import (
 )
 
 var (
-	rdb      *redis.Client
-	db       *sql.DB
-	s3Client *minio.Client
+	rdb               *redis.Client
+	db                *sql.DB
+	s3Client          *minio.Client
+	HTTPRequestsCount uint64
 )
 
 type ArenaSSEHub struct {
@@ -89,6 +91,7 @@ func main() {
 		log.Fatalf("Postgres connection failed: %v", err)
 	}
 	defer db.Close()
+	common.ConfigureDBPool(db)
 
 	// Bootstrap Default Arena
 	bootstrapDefaultArena()
@@ -108,9 +111,30 @@ func main() {
 		log.Fatalf("Failed to ensure S3 bucket: %v", err)
 	}
 
+	// Start metrics server
+	go common.ServeMetrics(":9093")
+	common.StartDBPoolCollector(ctx, db, "gateway", 5*time.Second)
+
 	// Initialize Fiber app
 	app := fiber.New(fiber.Config{
 		BodyLimit: 10 * 1024 * 1024, // 10 MB limit
+	})
+
+	// Register HTTP telemetry middleware
+	app.Use(func(c fiber.Ctx) error {
+		atomic.AddUint64(&HTTPRequestsCount, 1)
+		start := time.Now()
+		err := c.Next()
+		duration := time.Since(start).Seconds()
+
+		method := c.Method()
+		path := c.Path()
+		statusCode := fmt.Sprintf("%d", c.Response().StatusCode())
+
+		common.HTTPRequestsTotal.WithLabelValues(method, path, statusCode).Inc()
+		common.HTTPRequestDuration.WithLabelValues(method, path).Observe(duration)
+
+		return err
 	})
 
 	// Start periodic gateway leaderboard generator to broadcast active updates

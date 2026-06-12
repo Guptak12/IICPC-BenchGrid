@@ -9,6 +9,8 @@ import (
 	"math"
 	"math/rand"
 	"net"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,6 +23,7 @@ import (
 	"github.com/guptak12/bot-fleet/shadow"
 	"google.golang.org/protobuf/proto"
 	"iicpc-sandbox/pkg/protocol"
+	"iicpc-sandbox/services/common"
 )
 
 // Strategy Types matching bot-fleet
@@ -231,6 +234,11 @@ func RunFleet(ctx context.Context, endpoint string, baseSeed int64, numBots int,
 	bots := make([]*PretestBot, numBots)
 	strategies := []StrategyType{MarketMaker, MomentumTrader, NoiseTrader}
 
+	ratePerSec := 50.0
+	if val, err := strconv.ParseFloat(os.Getenv("BOT_RATE_PER_SEC"), 64); err == nil && val > 0 {
+		ratePerSec = val
+	}
+
 	for i := 0; i < numBots; i++ {
 		strat := strategies[i % len(strategies)]
 		bots[i] = NewPretestBot(
@@ -240,7 +248,7 @@ func RunFleet(ctx context.Context, endpoint string, baseSeed int64, numBots int,
 			100.0, // Mid Price
 			0.10,  // Spread
 			ordersPerBot,
-			50.0, // 50 orders/sec
+			ratePerSec,
 			baseSeed+int64(i),
 		)
 	}
@@ -278,8 +286,22 @@ func RunFleet(ctx context.Context, endpoint string, baseSeed int64, numBots int,
 				tps := float64(curr-lastSent) / 0.2
 				lastSent = curr
 				tpsSamplesMu.Lock()
-				tpsSamples = append(tpsSamples, tps)
+				if curr < int64(numBots*ordersPerBot) || len(tpsSamples) == 0 || tpsSamples[len(tpsSamples)-1] > 0 {
+					tpsSamples = append(tpsSamples, tps)
+				}
 				tpsSamplesMu.Unlock()
+
+				// Update real-time Prometheus gauges
+				common.FleetTPS.Set(tps)
+
+				histMu.Lock()
+				p99 := rttHist.ValueAtQuantile(99)
+				histMu.Unlock()
+				p99Us := p99 / 1000
+				if p99Us < 0 {
+					p99Us = 0
+				}
+				common.FleetP99Us.Set(float64(p99Us))
 			}
 		}
 	}()
@@ -296,7 +318,6 @@ func RunFleet(ctx context.Context, endpoint string, baseSeed int64, numBots int,
 	g.Go(func() error {
 		nextSeqID := int64(1)
 		jitterBuffer := make(map[int64]PretestEvent)
-		jitterGapThreshold := 50
 
 		for {
 			select {
@@ -316,7 +337,7 @@ func RunFleet(ctx context.Context, endpoint string, baseSeed int64, numBots int,
 									minKey = k
 								}
 							}
-							if minKey != -1 {
+							if minKey != -1 && minKey > nextSeqID {
 								nextSeqID = minKey
 							} else {
 								break
@@ -330,18 +351,6 @@ func RunFleet(ctx context.Context, endpoint string, baseSeed int64, numBots int,
 				for {
 					item, exists := jitterBuffer[nextSeqID]
 					if !exists {
-						if len(jitterBuffer) >= jitterGapThreshold {
-							minKey := int64(-1)
-							for k := range jitterBuffer {
-								if minKey == -1 || k < minKey {
-									minKey = k
-								}
-							}
-							if minKey != -1 {
-								nextSeqID = minKey
-								continue
-							}
-						}
 						break
 					}
 					processEvent(item, validator, acceptedOrders)
@@ -444,6 +453,7 @@ func RunFleet(ctx context.Context, endpoint string, baseSeed int64, numBots int,
 				b.SendTimes[int64(order.OrderId)] = time.Now().UnixNano()
 				b.sendTimesMu.Unlock()
 
+				_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 				_, err = conn.Write(lengthPrefix)
 				if err == nil {
 					_, err = conn.Write(payload)

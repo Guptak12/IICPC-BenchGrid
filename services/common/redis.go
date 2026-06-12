@@ -96,3 +96,12 @@ func InitRedisQueues(ctx context.Context, rdb *redis.Client) error {
 
 	return nil
 }
+
+// AckAndDel acknowledges a message in the consumer group and deletes it from the stream.
+// This cleans up memory and ensures the stream length represents the current pending queue depth.
+func AckAndDel(ctx context.Context, rdb *redis.Client, stream, group, msgID string) error {
+	if err := rdb.XAck(ctx, stream, group, msgID).Err(); err != nil {
+		return err
+	}
+	return rdb.XDel(ctx, stream, msgID).Err()
+}

@@ -529,6 +529,14 @@ const dashboardHTML = `<!DOCTYPE html>
                 <i class="fa-solid fa-trophy" style="color: var(--accent-cyan);"></i>
                 <span>Contestant Arena</span>
             </a>
+            <a href="http://localhost:3001" target="_blank" class="status-pill link-pill" style="background: rgba(210, 153, 34, 0.15); border: 1px solid rgba(210, 153, 34, 0.4); text-decoration: none; color: var(--text-color); cursor: pointer; display: flex; align-items: center; gap: 8px;">
+                <i class="fa-solid fa-chart-line" style="color: var(--accent-amber);"></i>
+                <span>Grafana Metrics</span>
+            </a>
+            <a href="http://localhost:9090" target="_blank" class="status-pill link-pill" style="background: rgba(138, 43, 226, 0.15); border: 1px solid rgba(138, 43, 226, 0.4); text-decoration: none; color: var(--text-color); cursor: pointer; display: flex; align-items: center; gap: 8px;">
+                <i class="fa-solid fa-fire" style="color: var(--accent-violet);"></i>
+                <span>Prometheus</span>
+            </a>
             <div class="status-pill">
                 <div class="status-indicator status-ok" id="db-led"></div>
                 <span>Postgres</span>

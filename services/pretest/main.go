@@ -11,7 +11,9 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -23,13 +25,15 @@ import (
 	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/client"
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/sync/errgroup"
 )
 
 var (
-	rdb          *redis.Client
-	db           *sql.DB
-	dockerClient *client.Client
-	s3Client     *minio.Client
+	rdb               *redis.Client
+	db                *sql.DB
+	dockerClient      *client.Client
+	s3Client          *minio.Client
+	activeEvaluations atomic.Int64
 )
 
 func main() {
@@ -68,6 +72,7 @@ func main() {
 		log.Fatalf("Postgres connection failed: %v", err)
 	}
 	defer db.Close()
+	common.ConfigureDBPool(db)
 
 	// Initialize queues
 	if err := common.InitRedisQueues(ctx, rdb); err != nil {
@@ -80,6 +85,11 @@ func main() {
 	// Trap shutdown signals
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Start Prometheus metrics server
+	go common.ServeMetrics(":9092")
+	common.StartQueueDepthCollector(shutdownCtx, rdb, 5*time.Second)
+	common.StartDBPoolCollector(shutdownCtx, db, "pretest", 5*time.Second)
 
 	// Start PEL recovery for pretest and systest groups
 	common.StartPELRecovery(shutdownCtx, rdb, common.PretestQueue, common.PretestGroup, consumerName, 2*time.Minute)
@@ -134,13 +144,27 @@ func processPretestMessage(ctx context.Context, message redis.XMessage, isSystes
 	queueName := common.PretestQueue
 	groupName := common.PretestGroup
 	numBots := 5
+	if val, err := strconv.Atoi(os.Getenv("PRETEST_NUM_BOTS")); err == nil && val > 0 {
+		numBots = val
+	}
 	ordersPerBot := 100
+	if val, err := strconv.Atoi(os.Getenv("PRETEST_ORDERS_PER_BOT")); err == nil && val > 0 {
+		ordersPerBot = val
+	}
+	testType := "pretests"
 
 	if isSystest {
 		queueName = common.SystestQueue
 		groupName = common.SystestGroup
 		numBots = 10
+		if val, err := strconv.Atoi(os.Getenv("SYSTEST_NUM_BOTS")); err == nil && val > 0 {
+			numBots = val
+		}
 		ordersPerBot = 500
+		if val, err := strconv.Atoi(os.Getenv("SYSTEST_ORDERS_PER_BOT")); err == nil && val > 0 {
+			ordersPerBot = val
+		}
+		testType = "system tests"
 	}
 
 	submissionID, ok1 := message.Values["submission_id"].(string)
@@ -148,15 +172,30 @@ func processPretestMessage(ctx context.Context, message redis.XMessage, isSystes
 
 	if !ok1 || !ok2 {
 		log.Printf("Skipping invalid stream message: %v\n", message.ID)
-		rdb.XAck(ctx, queueName, groupName, message.ID)
+		common.AckAndDel(ctx, rdb, queueName, groupName, message.ID)
 		return
 	}
 
-	testType := "pretests"
-	if isSystest {
-		testType = "system tests"
-	}
 	log.Printf("[submission:%s] Starting %s...\n", submissionID[:8], testType)
+
+	// Prometheus: track active jobs and total duration
+	common.WorkerActiveJobs.WithLabelValues("pretest", submissionID[:8]).Inc()
+	common.SubmissionsTotal.WithLabelValues("running").Inc()
+	activeEvaluations.Add(1)
+	totalStart := time.Now()
+	defer func() {
+		common.WorkerActiveJobs.WithLabelValues("pretest", submissionID[:8]).Dec()
+		common.PretestDuration.WithLabelValues(testType).Observe(time.Since(totalStart).Seconds())
+		// Delay resetting the gauges to 0 by 15 seconds so Prometheus has time to scrape the final metrics.
+		// Use activeEvaluations atomic counter to avoid resetting gauges if another run starts in the meantime.
+		go func() {
+			time.Sleep(15 * time.Second)
+			if activeEvaluations.Add(-1) == 0 {
+				common.FleetTPS.Set(0)
+				common.FleetP99Us.Set(0)
+			}
+		}()
+	}()
 
 	// 1. Update PostgreSQL status to 'running'
 	_, err := db.ExecContext(ctx,
@@ -167,19 +206,103 @@ func processPretestMessage(ctx context.Context, message redis.XMessage, isSystes
 		log.Printf("Failed to update status to running: %v\n", err)
 	}
 
-	// 2. Run k=3 iterations (AlphaForgeBench K-Run stability requirement)
-	k := 3
-	var runResults []PretestResults
-	var runScores []float64
+	// 2. Run k=1 iteration for post-contest evaluation/testing by default
+	k := 1
+	if val, err := strconv.Atoi(os.Getenv("K_RUNS")); err == nil && val > 0 {
+		k = val
+	}
+	baseSeed := int64(42424242)
 
-	var totalCorrectness float64
-	var totalP50Us int64
-	var totalP90Us int64
-	var totalP99Us int64
-	var totalEngineP99Us int64
-	var totalTpsEnd float64
-	var totalSent, totalFailed int64
-	var totalPhantomFills, totalPriorityViolations int64
+	type runResult struct {
+		results PretestResults
+		score   float64
+		logs    string
+	}
+	runOutputs := make([]runResult, k)
+
+	g, gctx := errgroup.WithContext(ctx)
+	for run := 0; run < k; run++ {
+		run := run // capture loop variable
+		g.Go(func() error {
+			runStart := time.Now()
+			defer func() {
+				common.PretestRunDuration.Observe(time.Since(runStart).Seconds())
+			}()
+
+			log.Printf("[submission:%s] Starting %s run %d/%d...\n", submissionID[:8], testType, run+1, k)
+
+			// Each run gets a uniquely named container so parallel runs don't collide
+			containerID, endpoint, err := startContestantSandbox(gctx, fmt.Sprintf("%s-run-%d", submissionID, run), imageTag)
+			if err != nil {
+				log.Printf("[submission:%s] Run %d: Failed to spin up sandbox: %v\n", submissionID[:8], run+1, err)
+				return fmt.Errorf("run %d sandbox failed: %w", run+1, err)
+			}
+
+			// Execute bot fleet with run-specific seed
+			seedForRun := baseSeed + int64(run*1000)
+			results, fleetErr := RunFleet(gctx, endpoint, seedForRun, numBots, ordersPerBot)
+
+			// Clean up container immediately after this run and extract logs
+			log.Printf("[submission:%s] Run %d: Cleaning up contestant sandbox...\n", submissionID[:8], run+1)
+			var runLogs string
+			reader, logErr := dockerClient.ContainerLogs(context.Background(), containerID, client.ContainerLogsOptions{ShowStdout: true, ShowStderr: true})
+			if logErr == nil {
+				logData, _ := io.ReadAll(reader)
+				runLogs = fmt.Sprintf("=== RUN %d LOGS ===\n%s\n", run+1, string(logData))
+				log.Printf("[submission:%s] Run %d Sandbox Logs:\n%s\n", submissionID[:8], run+1, string(logData))
+				reader.Close()
+			}
+
+			_, _ = dockerClient.ContainerStop(context.Background(), containerID, client.ContainerStopOptions{})
+			_, _ = dockerClient.ContainerRemove(context.Background(), containerID, client.ContainerRemoveOptions{Force: true})
+
+			if fleetErr != nil {
+				log.Printf("[submission:%s] Run %d: Error during execution: %v\n", submissionID[:8], run+1, fleetErr)
+				return fmt.Errorf("run %d execution failed: %w", run+1, fleetErr)
+			}
+
+			// Record results
+			_, runScore, _ := EvaluateVerdict(results)
+
+			// Update fleet Prometheus gauges from this run
+			common.FleetOrdersSentTotal.Add(float64(results.OrdersSent))
+			common.FleetTPS.Set(results.TpsEnd)
+			common.FleetCorrectness.Set(results.Correctness)
+			common.FleetP99Us.Set(float64(results.P99Us))
+
+			runOutputs[run] = runResult{
+				results: results,
+				score:   runScore,
+				logs:    runLogs,
+			}
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		log.Printf("[submission:%s] Parallel K-run failure: %v\n", submissionID[:8], err)
+		if common.ShouldRetry(ctx, rdb, queueName, groupName, message.ID, message.Values, err) {
+			return
+		}
+		var accumulatedLogs string
+		for _, ro := range runOutputs {
+			accumulatedLogs += ro.logs
+		}
+		failPretest(ctx, submissionID, "Runtime Failure", "Parallel K-run failed: "+err.Error(), accumulatedLogs)
+		common.AckAndDel(ctx, rdb, queueName, groupName, message.ID)
+		return
+	}
+
+	// Aggregate results from all K runs
+	var (
+		totalCorrectness                                   float64
+		totalP50Us, totalP90Us, totalP99Us, totalEngineP99Us int64
+		totalTpsEnd                                        float64
+		totalSent, totalFailed                             int64
+		totalPhantomFills, totalPriorityViolations          int64
+		runScores                                          []float64
+		accumulatedLogs                                    string
+	)
 
 	strategyBreakdownSum := map[string]*StrategyMetrics{
 		string(MarketMaker):    {OrdersSent: 0, OrdersFailed: 0, AvgLatencyUs: 0},
@@ -187,55 +310,11 @@ func processPretestMessage(ctx context.Context, message redis.XMessage, isSystes
 		string(NoiseTrader):    {OrdersSent: 0, OrdersFailed: 0, AvgLatencyUs: 0},
 	}
 
-	baseSeed := int64(42424242)
-	var accumulatedLogs string
+	for _, ro := range runOutputs {
+		results := ro.results
+		runScores = append(runScores, ro.score)
+		accumulatedLogs += ro.logs
 
-	for run := 0; run < k; run++ {
-		log.Printf("[submission:%s] Starting %s run %d/%d...\n", submissionID[:8], testType, run+1, k)
-
-		// Start sandboxed contestant container directly using their image
-		containerID, endpoint, err := startContestantSandbox(ctx, submissionID, imageTag)
-		if err != nil {
-			log.Printf("[submission:%s] Run %d: Failed to spin up sandbox: %v\n", submissionID[:8], run+1, err)
-			if common.ShouldRetry(ctx, rdb, queueName, groupName, message.ID, message.Values, err) {
-				return
-			}
-			failPretest(ctx, submissionID, "Runtime Failure", "Failed to spin up runtime sandbox: "+err.Error(), accumulatedLogs)
-			return
-		}
-
-		// Execute bot fleet with run-specific seed
-		seedForRun := baseSeed + int64(run*1000)
-		results, err := RunFleet(ctx, endpoint, seedForRun, numBots, ordersPerBot)
-
-		// Clean up container immediately after this run and extract logs (Edge Case 3)
-		log.Printf("[submission:%s] Run %d: Cleaning up contestant sandbox...\n", submissionID[:8], run+1)
-		reader, logErr := dockerClient.ContainerLogs(context.Background(), containerID, client.ContainerLogsOptions{ShowStdout: true, ShowStderr: true})
-		if logErr == nil {
-			logData, _ := io.ReadAll(reader)
-			accumulatedLogs += fmt.Sprintf("=== RUN %d LOGS ===\n%s\n", run+1, string(logData))
-			log.Printf("[submission:%s] Run %d Sandbox Logs:\n%s\n", submissionID[:8], run+1, string(logData))
-			reader.Close()
-		}
-
-		_, _ = dockerClient.ContainerStop(context.Background(), containerID, client.ContainerStopOptions{})
-		_, _ = dockerClient.ContainerRemove(context.Background(), containerID, client.ContainerRemoveOptions{Force: true})
-
-		if err != nil {
-			log.Printf("[submission:%s] Run %d: Error during execution: %v\n", submissionID[:8], run+1, err)
-			if common.ShouldRetry(ctx, rdb, queueName, groupName, message.ID, message.Values, err) {
-				return
-			}
-			failPretest(ctx, submissionID, "Runtime Failure", "Execution failed: "+err.Error(), accumulatedLogs)
-			return
-		}
-
-		// Record results
-		_, runScore, _ := EvaluateVerdict(results)
-		runScores = append(runScores, runScore)
-		runResults = append(runResults, results)
-
-		// Accumulate
 		totalCorrectness += results.Correctness
 		totalP50Us += results.P50Us
 		totalP90Us += results.P90Us
@@ -247,7 +326,6 @@ func processPretestMessage(ctx context.Context, message redis.XMessage, isSystes
 		totalPhantomFills += results.PhantomFills
 		totalPriorityViolations += results.PriorityViolations
 
-		// Sum up strategy breakdown metrics
 		if results.StrategyBreakdown != nil {
 			for strat, metrics := range results.StrategyBreakdown {
 				if sumMetrics, ok := strategyBreakdownSum[strat]; ok {
@@ -298,7 +376,7 @@ func processPretestMessage(ctx context.Context, message redis.XMessage, isSystes
 		EngineP99Us:        avgEngineP99Us,
 		OrdersSent:         avgSent,
 		OrdersFailed:       avgFailed,
-		TpsStart:           runResults[0].TpsStart, // baseline TPS start
+		TpsStart:           runOutputs[0].results.TpsStart,
 		TpsEnd:             avgTpsEnd,
 		PhantomFills:       avgPhantom,
 		PriorityViolations: avgPriority,
@@ -307,8 +385,7 @@ func processPretestMessage(ctx context.Context, message redis.XMessage, isSystes
 
 	verdict, compositeScore, diagnostics := EvaluateVerdict(aggregatedResults)
 
-	// Apply stability bonus/penalty:
-	// "Add stability bonus to scoring formula (+5 if std < 2%)"
+	// Apply stability bonus/penalty
 	stabilityBonus := 0.0
 	if stdDev < 2.0 {
 		stabilityBonus = 5.0
@@ -321,13 +398,13 @@ func processPretestMessage(ctx context.Context, message redis.XMessage, isSystes
 	diagnostics["stability_std_dev"] = math.Round(stdDev*100) / 100
 	diagnostics["stability_bonus"] = stabilityBonus
 	diagnostics["run_scores"] = runScores
-	// Save sandboxed logs snippet in diagnostics for frontend rendering (Edge Case 3)
 	diagnostics["sandbox_logs"] = tailLogs(accumulatedLogs, 100)
 
-	log.Printf("[submission:%s] %s Finished! Verdict: %s | Score: %.2f (Mean: %.2f, StdDev: %.2f) ✓\n",
+	log.Printf("[submission:%s] %s Finished! Verdict: %s | Score: %.2f (Mean: %.2f, StdDev: %.2f) \u2713\n",
 		submissionID[:8], testType, verdict, compositeScore, meanScore, stdDev)
 
 	// Update PostgreSQL with final results
+	common.SubmissionsTotal.WithLabelValues("completed").Inc()
 	diagBytes, _ := json.Marshal(diagnostics)
 	_, err = db.ExecContext(ctx,
 		`UPDATE submissions 
@@ -341,8 +418,8 @@ func processPretestMessage(ctx context.Context, message redis.XMessage, isSystes
 		log.Printf("Failed to write final submission results to DB: %v\n", err)
 	}
 
-	// Acknowledge stream message
-	rdb.XAck(ctx, queueName, groupName, message.ID)
+	// Acknowledge and delete stream message
+	common.AckAndDel(ctx, rdb, queueName, groupName, message.ID)
 }
 
 func startContestantSandbox(ctx context.Context, submissionID string, imageTag string) (string, string, error) {

@@ -37,6 +37,11 @@ services:
     networks:
       - iicpc-net
       - sandbox-net
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
 
   master:
     image: bot-fleet:v1
@@ -50,6 +55,11 @@ services:
       - DB_ADDR=postgres://iicpc:iicpc_secret@postgres:5432/iicpc_db?sslmode=disable
     networks:
       - iicpc-net
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
 
 volumes:
   redis_data:
