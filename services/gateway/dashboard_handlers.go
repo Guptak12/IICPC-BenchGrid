@@ -184,6 +184,13 @@ func handleMockSubmission(c fiber.Ctx) error {
 	ctx := context.Background()
 	buildID := uuid.New().String()
 
+	// 0. Enforce Submission Mutex (DB check)
+	var activeCount int
+	err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM submissions WHERE status IN ('queued', 'compiling', 'running')").Scan(&activeCount)
+	if err == nil && activeCount > 0 {
+		return c.Status(fiber.StatusLocked).SendString("Another benchmark is currently running. Please wait for it to complete.")
+	}
+
 	engine := c.Query("engine")
 	if engine == "" {
 		engine = "go_optimized"
@@ -240,6 +247,11 @@ func handleMockSubmission(c fiber.Ctx) error {
 		log.Printf("[mock] Failed to save mock submission source to DB: %v\n", err)
 	}
 
+	isSystestStr := c.Query("is_systest")
+	if isSystestStr == "" {
+		isSystestStr = "true"
+	}
+
 	// 4. Push to compilation queue
 	err = rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: common.CompilationQueue,
@@ -247,7 +259,7 @@ func handleMockSubmission(c fiber.Ctx) error {
 			"submission_id": buildID,
 			"s3_path":       s3Path,
 			"contestant_id": contestantID,
-			"is_systest":    "true",
+			"is_systest":    isSystestStr,
 		},
 	}).Err()
 	if err != nil {

@@ -70,3 +70,13 @@ func TestCompositeScore(t *testing.T) {
 		t.Errorf("CompositeScore(95, 80, 90) = %v, want %v", got, want)
 	}
 }
+
+func TestDynamicLatencyScore(t *testing.T) {
+	// target=1000, ceiling=10000
+	// p50=500 (<=1000 -> 100), p90=5500 (midway -> 50), p99=10000 (>=10000 -> 0)
+	// Weighted: 0.2*100 + 0.3*50 + 0.5*0 = 35.0
+	got := DynamicLatencyScore(500, 5500, 10000, 1000, 10000)
+	if math.Abs(got-35.0) > 0.01 {
+		t.Errorf("DynamicLatencyScore(500,5500,10000,1000,10000) = %v, want 35", got)
+	}
+}

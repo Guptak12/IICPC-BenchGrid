@@ -33,6 +33,27 @@ func LatencyScore(p50Us, p90Us, p99Us float64) float64 {
 	return math.Round((s50*0.20+s90*0.30+s99*0.50)*100) / 100
 }
 
+// DynamicLatencyScore computes a weighted composite latency score using dynamic targets.
+func DynamicLatencyScore(p50Us, p90Us, p99Us, target, ceiling float64) float64 {
+	s50 := dynamicLatencyBucket(p50Us, target, ceiling)
+	s90 := dynamicLatencyBucket(p90Us, target, ceiling)
+	s99 := dynamicLatencyBucket(p99Us, target, ceiling)
+	return math.Round((s50*0.20+s90*0.30+s99*0.50)*100) / 100
+}
+
+func dynamicLatencyBucket(latencyUs, target, ceiling float64) float64 {
+	if latencyUs <= target {
+		return 100.0
+	}
+	if latencyUs >= ceiling {
+		return 0.0
+	}
+	if target >= ceiling {
+		return 0.0
+	}
+	return 100.0 * (1.0 - (latencyUs-target)/(ceiling-target))
+}
+
 // ThroughputScore returns 0–100 based on order failure rate.
 func ThroughputScore(failRate float64) float64 {
 	if failRate < 0 {

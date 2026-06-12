@@ -53,22 +53,31 @@ type PriceLevel struct {
 	Orders *list.List // List of *Order
 }
 
-// Validator verifies that the C++ engine matched orders correctly
-type Validator struct {
+func int64DescComparator(a, b interface{}) int {
+	return -utils.Int64Comparator(a, b)
+}
+
+// SymbolShard handles order book and validation logic for a single symbol
+type SymbolShard struct {
 	mu            sync.Mutex
-	pendingOrders map[int64]*Order // Cache orders until the C++ engine ACKs them
-	// O(1) Order Map: orderID -> list.Element inside a PriceLevel's Orders list
-	orderMap map[int64]*list.Element
+	pendingOrders map[int64]*Order
+	orderMap      map[int64]*list.Element
 
 	// Red-Black trees for Price Levels
-	bids *redblacktree.Tree // Sorted descending (highest price first)
-	asks *redblacktree.Tree // Sorted ascending (lowest price first)
+	bids *redblacktree.Tree // Sorted descending
+	asks *redblacktree.Tree // Sorted ascending
 
 	expectedFills map[int64][]Fill
 	actualFills   map[int64][]Fill
 
-	totalExpectedFills int64
-	totalActualFills   int64
+	// Incremental counters accumulated for cleaned-up orders
+	expectedQty        int64
+	actualQty          int64
+	priceCorrectQty    int64
+	priorityCorrectQty int64
+	expectedValue      int64
+	valueDiff          int64
+	phantomQty         int64
 
 	missedFills        int64
 	phantomFills       int64
@@ -79,97 +88,74 @@ type Validator struct {
 	printedMismatches  int
 }
 
-func int64DescComparator(a, b interface{}) int {
-	return -utils.Int64Comparator(a, b)
-}
-
-// NewValidator creates a new shadow global Validator
-func NewValidator() *Validator {
-	return &Validator{
-		pendingOrders:     make(map[int64]*Order),
-		orderMap:          make(map[int64]*list.Element),
-		bids:              redblacktree.NewWith(int64DescComparator),
-		asks:              redblacktree.NewWith(utils.Int64Comparator),
-		expectedFills:     make(map[int64][]Fill),
-		actualFills:       make(map[int64][]Fill),
-		printedMismatches: 0,
+func NewSymbolShard() *SymbolShard {
+	return &SymbolShard{
+		pendingOrders: make(map[int64]*Order),
+		orderMap:      make(map[int64]*list.Element),
+		bids:          redblacktree.NewWith(int64DescComparator),
+		asks:          redblacktree.NewWith(utils.Int64Comparator),
+		expectedFills: make(map[int64][]Fill),
+		actualFills:   make(map[int64][]Fill),
 	}
 }
 
-// ProcessOrder processes an order sent to the sandbox by adding it to the shadow book and matching it.
-func (v *Validator) ProcessOrder(orderID int64, orderType string, side string, price int64, quantity int64) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-
-	if strings.ToLower(orderType) == "cancel" {
+func (s *SymbolShard) checkCleanup(orderID int64) {
+	_, isPending := s.pendingOrders[orderID]
+	if isPending {
+		return
+	}
+	_, isResting := s.orderMap[orderID]
+	if isResting {
 		return
 	}
 
-	if _, exists := v.pendingOrders[orderID]; exists {
-		v.duplicateOrders++
+	expList := s.expectedFills[orderID]
+	actList := s.actualFills[orderID]
+
+	var totalExpQty, totalActQty int64
+	for _, f := range expList {
+		totalExpQty += f.FilledQty
 	}
-	if _, exists := v.orderMap[orderID]; exists {
-		v.duplicateOrders++
+	for _, f := range actList {
+		totalActQty += f.FilledQty
 	}
 
-	v.pendingOrders[orderID] = &Order{
-		ID:       orderID,
-		Type:     orderType,
-		Side:     side,
-		Price:    price,
-		Quantity: quantity,
-	}
-}
-
-// ProcessAck ACTUALLY TRIGGERS THE MATCHING LOGIC
-func (v *Validator) ProcessAck(orderID int64, status string) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-
-	cleanStatus := strings.ToLower(status)
-
-	if cleanStatus == "cancelled" {
-		found := v.hasRestingOrder(orderID)
-		if found {
-			v.removeRestingOrder(orderID)
-		}
+	if totalExpQty != totalActQty {
 		return
 	}
 
-	order, ok := v.pendingOrders[orderID]
-	if !ok {
-		if cleanStatus == "rejected" {
-			return
-		}
-		v.unknownAcks++
+	foldedExp := foldPartials(expList)
+	foldedAct := foldPartials(actList)
+
+	if len(foldedExp) != len(foldedAct) {
 		return
 	}
-	delete(v.pendingOrders, orderID)
-
-	cleanType := strings.ToLower(order.Type)
-
-	switch cleanType {
-	case "limit":
-		if cleanStatus != "accepted" {
-			v.ackViolations++
+	for i := range foldedExp {
+		if foldedExp[i].FilledQty != foldedAct[i].FilledQty ||
+			foldedExp[i].FilledPrice != foldedAct[i].FilledPrice ||
+			foldedExp[i].MatchedWith != foldedAct[i].MatchedWith {
 			return
-		}
-		v.matchLimitOrder(order)
-	case "market":
-		if cleanStatus != "accepted" {
-			v.ackViolations++
-			return
-		}
-		v.matchMarketOrder(order)
-	default:
-		if cleanStatus != "rejected" {
-			v.ackViolations++
 		}
 	}
+
+	// Perfectly matched!
+	s.expectedQty += totalExpQty
+	s.actualQty += totalActQty
+	s.priceCorrectQty += totalExpQty
+	s.priorityCorrectQty += totalExpQty
+
+	var expValue int64
+	for _, f := range foldedExp {
+		expValue += f.FilledQty * f.FilledPrice
+	}
+	s.expectedValue += expValue
+
+	delete(s.expectedFills, orderID)
+	delete(s.actualFills, orderID)
 }
 
-func (v *Validator) matchLimitOrder(order *Order) {
-	remainingQty := v.matchIncoming(order, true)
+func (s *SymbolShard) matchLimitOrder(order *Order) {
+	remainingQty := s.matchIncoming(order, true)
 	if remainingQty <= 0 {
 		return
 	}
@@ -178,31 +164,28 @@ func (v *Validator) matchLimitOrder(order *Order) {
 	order.Quantity = remainingQty
 
 	if cleanSide == "buy" {
-		v.addOrderToBook(order, v.bids)
+		s.addOrderToBook(order, s.bids)
 	} else if cleanSide == "sell" {
-		v.addOrderToBook(order, v.asks)
+		s.addOrderToBook(order, s.asks)
 	}
 }
 
-func (v *Validator) matchMarketOrder(order *Order) {
-	v.matchIncoming(order, false)
+func (s *SymbolShard) matchMarketOrder(order *Order) {
+	s.matchIncoming(order, false)
 }
 
-func (v *Validator) matchIncoming(order *Order, useLimitPrice bool) int64 {
+func (s *SymbolShard) matchIncoming(order *Order, useLimitPrice bool) int64 {
 	remainingQty := order.Quantity
 	cleanSide := strings.ToLower(order.Side)
-	// Collect empty price levels to remove AFTER the iterator is done.
-	// Removing from the tree mid-iteration invalidates the iterator's
-	// internal stack in gods/redblacktree — defer all deletions.
 	var emptyLevels []int64
 
 	if cleanSide == "buy" {
-		iter := v.asks.Iterator()
+		iter := s.asks.Iterator()
 		for iter.Next() && remainingQty > 0 {
 			askPrice := iter.Key().(int64)
 
 			if useLimitPrice && order.Price < askPrice {
-				break // price crossed — no more eligible asks
+				break
 			}
 
 			level := iter.Value().(*PriceLevel)
@@ -211,8 +194,6 @@ func (v *Validator) matchIncoming(order *Order, useLimitPrice bool) int64 {
 				restingOrder := e.Value.(*Order)
 				next := e.Next()
 
-				// Wash trade prevention: skip orders from the same bot.
-				// The order stays in the book — another bot may match it later.
 				if isSelfCross(order.ID, restingOrder.ID) {
 					e = next
 					continue
@@ -223,38 +204,36 @@ func (v *Validator) matchIncoming(order *Order, useLimitPrice bool) int64 {
 					tradeQty = restingOrder.Quantity
 				}
 
-				v.recordExpectedFill(order.ID, tradeQty, askPrice, restingOrder.ID)
-				v.recordExpectedFill(restingOrder.ID, tradeQty, askPrice, order.ID)
+				s.recordExpectedFill(order.ID, tradeQty, askPrice, restingOrder.ID)
+				s.recordExpectedFill(restingOrder.ID, tradeQty, askPrice, order.ID)
 
 				remainingQty -= tradeQty
 				restingOrder.Quantity -= tradeQty
 
 				if restingOrder.Quantity == 0 {
 					level.Orders.Remove(e)
-					delete(v.orderMap, restingOrder.ID)
+					delete(s.orderMap, restingOrder.ID)
+					s.checkCleanup(restingOrder.ID)
 				}
 				e = next
 			}
 
-			// Only schedule removal if truly empty.
-			// A level with self-cross orders still resting is NOT empty.
 			if level.Orders.Len() == 0 {
 				emptyLevels = append(emptyLevels, askPrice)
 			}
 		}
 
-		// Safe to modify the tree now — iterator is no longer active.
 		for _, price := range emptyLevels {
-			v.asks.Remove(price)
+			s.asks.Remove(price)
 		}
 
 	} else if cleanSide == "sell" {
-		iter := v.bids.Iterator()
+		iter := s.bids.Iterator()
 		for iter.Next() && remainingQty > 0 {
 			bidPrice := iter.Key().(int64)
 
 			if useLimitPrice && order.Price > bidPrice {
-				break // price crossed — no more eligible bids
+				break
 			}
 
 			level := iter.Value().(*PriceLevel)
@@ -273,15 +252,16 @@ func (v *Validator) matchIncoming(order *Order, useLimitPrice bool) int64 {
 					tradeQty = restingOrder.Quantity
 				}
 
-				v.recordExpectedFill(order.ID, tradeQty, bidPrice, restingOrder.ID)
-				v.recordExpectedFill(restingOrder.ID, tradeQty, bidPrice, order.ID)
+				s.recordExpectedFill(order.ID, tradeQty, bidPrice, restingOrder.ID)
+				s.recordExpectedFill(restingOrder.ID, tradeQty, bidPrice, order.ID)
 
 				remainingQty -= tradeQty
 				restingOrder.Quantity -= tradeQty
 
 				if restingOrder.Quantity == 0 {
 					level.Orders.Remove(e)
-					delete(v.orderMap, restingOrder.ID)
+					delete(s.orderMap, restingOrder.ID)
+					s.checkCleanup(restingOrder.ID)
 				}
 				e = next
 			}
@@ -292,14 +272,14 @@ func (v *Validator) matchIncoming(order *Order, useLimitPrice bool) int64 {
 		}
 
 		for _, price := range emptyLevels {
-			v.bids.Remove(price)
+			s.bids.Remove(price)
 		}
 	}
 
 	return remainingQty
 }
 
-func (v *Validator) addOrderToBook(order *Order, tree *redblacktree.Tree) {
+func (s *SymbolShard) addOrderToBook(order *Order, tree *redblacktree.Tree) {
 	node, found := tree.Get(order.Price)
 	var level *PriceLevel
 	if found {
@@ -310,29 +290,29 @@ func (v *Validator) addOrderToBook(order *Order, tree *redblacktree.Tree) {
 	}
 
 	elem := level.Orders.PushBack(order)
-	v.orderMap[order.ID] = elem
+	s.orderMap[order.ID] = elem
 }
 
-func (v *Validator) hasRestingOrder(orderID int64) bool {
-	_, ok := v.orderMap[orderID]
+func (s *SymbolShard) hasRestingOrder(orderID int64) bool {
+	_, ok := s.orderMap[orderID]
 	return ok
 }
 
-func (v *Validator) removeRestingOrder(orderID int64) bool {
-	elem, ok := v.orderMap[orderID]
+func (s *SymbolShard) removeRestingOrder(orderID int64) bool {
+	elem, ok := s.orderMap[orderID]
 	if !ok {
 		return false
 	}
 
 	order := elem.Value.(*Order)
-	tree := v.asks
+	tree := s.asks
 	if strings.ToLower(order.Side) == "buy" {
-		tree = v.bids
+		tree = s.bids
 	}
 
 	node, found := tree.Get(order.Price)
 	if !found {
-		delete(v.orderMap, orderID)
+		delete(s.orderMap, orderID)
 		return false
 	}
 
@@ -341,24 +321,166 @@ func (v *Validator) removeRestingOrder(orderID int64) bool {
 	if level.Orders.Len() == 0 {
 		tree.Remove(order.Price)
 	}
-	delete(v.orderMap, orderID)
+	delete(s.orderMap, orderID)
 	return true
 }
 
-func (v *Validator) recordExpectedFill(orderID int64, qty int64, price int64, matchedWith int64) {
-	v.expectedFills[orderID] = append(v.expectedFills[orderID], Fill{
+func (s *SymbolShard) recordExpectedFill(orderID int64, qty int64, price int64, matchedWith int64) {
+	s.expectedFills[orderID] = append(s.expectedFills[orderID], Fill{
 		OrderID:     orderID,
 		FilledQty:   qty,
 		FilledPrice: price,
 		MatchedWith: matchedWith,
 	})
-	v.totalExpectedFills++
 }
 
-// ProcessFill processes a fill event from the sandbox
-func (v *Validator) ProcessFill(orderID int64, filledQty int64, filledPrice int64, matchedWith ...int64) {
+func (s *SymbolShard) priorityMatchedQty(expectedList []Fill, actualList []Fill) int64 {
+	var matched int64
+	for i, expected := range expectedList {
+		if i >= len(actualList) {
+			s.priorityViolations++
+			continue
+		}
+		actual := actualList[i]
+		if actual.FilledQty != expected.FilledQty || actual.FilledPrice != expected.FilledPrice {
+			s.priorityViolations++
+			continue
+		}
+		if actual.MatchedWith != expected.MatchedWith {
+			s.priorityViolations++
+			continue
+		}
+		matched += expected.FilledQty
+	}
+	if len(actualList) > len(expectedList) {
+		s.priorityViolations += int64(len(actualList) - len(expectedList))
+	}
+	return matched
+}
+
+// Validator routes validation updates to symbol shards to prevent contention
+type Validator struct {
+	mu           sync.RWMutex
+	shards       map[string]*SymbolShard
+	orderToShard map[int64]*SymbolShard
+}
+
+// NewValidator creates a new sharded Validator
+func NewValidator() *Validator {
+	return &Validator{
+		shards:       make(map[string]*SymbolShard),
+		orderToShard: make(map[int64]*SymbolShard),
+	}
+}
+
+func (v *Validator) getShard(symbol string) *SymbolShard {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	shard, ok := v.shards[symbol]
+	if !ok {
+		shard = NewSymbolShard()
+		v.shards[symbol] = shard
+	}
+	return shard
+}
+
+func (v *Validator) getShardForOrder(orderID int64) *SymbolShard {
+	v.mu.RLock()
+	shard, ok := v.orderToShard[orderID]
+	v.mu.RUnlock()
+	if ok {
+		return shard
+	}
+	return v.getShard("BTCUSD")
+}
+
+func (v *Validator) ProcessOrder(orderID int64, orderType string, side string, price int64, quantity int64) {
+	shard := v.getShard("BTCUSD")
+	v.mu.Lock()
+	v.orderToShard[orderID] = shard
+	v.mu.Unlock()
+
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	if strings.ToLower(orderType) == "cancel" {
+		return
+	}
+
+	if _, exists := shard.pendingOrders[orderID]; exists {
+		shard.duplicateOrders++
+	}
+	if _, exists := shard.orderMap[orderID]; exists {
+		shard.duplicateOrders++
+	}
+
+	shard.pendingOrders[orderID] = &Order{
+		ID:       orderID,
+		Type:     orderType,
+		Side:     side,
+		Price:    price,
+		Quantity: quantity,
+	}
+	shard.checkCleanup(orderID)
+}
+
+func (v *Validator) ProcessAck(orderID int64, status string) {
+	shard := v.getShardForOrder(orderID)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	cleanStatus := strings.ToLower(status)
+
+	if cleanStatus == "cancelled" {
+		found := shard.hasRestingOrder(orderID)
+		if found {
+			shard.removeRestingOrder(orderID)
+		}
+		shard.checkCleanup(orderID)
+		return
+	}
+
+	order, ok := shard.pendingOrders[orderID]
+	if !ok {
+		if cleanStatus == "rejected" {
+			shard.checkCleanup(orderID)
+			return
+		}
+		shard.unknownAcks++
+		shard.checkCleanup(orderID)
+		return
+	}
+	delete(shard.pendingOrders, orderID)
+
+	cleanType := strings.ToLower(order.Type)
+
+	switch cleanType {
+	case "limit":
+		if cleanStatus != "accepted" {
+			shard.ackViolations++
+			shard.checkCleanup(orderID)
+			return
+		}
+		shard.matchLimitOrder(order)
+	case "market":
+		if cleanStatus != "accepted" {
+			shard.ackViolations++
+			shard.checkCleanup(orderID)
+			return
+		}
+		shard.matchMarketOrder(order)
+	default:
+		if cleanStatus != "rejected" {
+			shard.ackViolations++
+		}
+	}
+	shard.checkCleanup(orderID)
+}
+
+func (v *Validator) ProcessFill(orderID int64, filledQty int64, filledPrice int64, matchedWith ...int64) {
+	shard := v.getShardForOrder(orderID)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
 	var counterparty int64
 	if len(matchedWith) > 0 {
@@ -371,11 +493,11 @@ func (v *Validator) ProcessFill(orderID int64, filledQty int64, filledPrice int6
 		FilledPrice: filledPrice,
 		MatchedWith: counterparty,
 	}
-	v.actualFills[orderID] = append(v.actualFills[orderID], actualFill)
-	v.totalActualFills++
+	shard.actualFills[orderID] = append(shard.actualFills[orderID], actualFill)
+	shard.checkCleanup(orderID)
 }
 
-// GetCorrectnessScore calculates final correctness score
+// GetCorrectnessScore calculates final correctness score across all shards
 func (v *Validator) GetCorrectnessScore() float64 {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -384,84 +506,93 @@ func (v *Validator) GetCorrectnessScore() float64 {
 	var actualQty int64
 	var priceCorrectQty int64
 	var priorityCorrectQty int64
-	var phantomQty int64
 	var expectedValue int64
 	var valueDiff int64
+	var phantomQty int64
+	var ackViolations int64
+	var duplicateOrders int64
+	var unknownAcks int64
 
-	v.missedFills = 0
-	v.phantomFills = 0
-	v.priorityViolations = 0
-
-	for orderID, expectedList := range v.expectedFills {
-		actualList, actOk := v.actualFills[orderID]
-		expectedList = foldPartials(expectedList)
-		if actOk {
-			actualList = foldPartials(actualList)
+	for _, s := range v.shards {
+		s.mu.Lock()
+		for orderID := range s.expectedFills {
+			s.checkCleanup(orderID)
 		}
 
-		if !actOk {
-			v.missedFills++
-		}
+		expectedQty += s.expectedQty
+		actualQty += s.actualQty
+		priceCorrectQty += s.priceCorrectQty
+		priorityCorrectQty += s.priorityCorrectQty
+		expectedValue += s.expectedValue
+		valueDiff += s.valueDiff
+		phantomQty += s.phantomQty
+		ackViolations += s.ackViolations
+		duplicateOrders += s.duplicateOrders
+		unknownAcks += s.unknownAcks
 
-		var totalExpQty, totalActQty int64
-		var expValue, actValue int64
+		for orderID, expectedList := range s.expectedFills {
+			actualList, actOk := s.actualFills[orderID]
+			expectedList = foldPartials(expectedList)
+			if actOk {
+				actualList = foldPartials(actualList)
+			}
 
-		for _, f := range expectedList {
-			totalExpQty += f.FilledQty
-			expValue += f.FilledQty * f.FilledPrice
-		}
+			var totalExpQty, totalActQty int64
+			var expValue, actValue int64
 
-		for _, f := range actualList {
-			totalActQty += f.FilledQty
-			actValue += f.FilledQty * f.FilledPrice
-		}
+			for _, f := range expectedList {
+				totalExpQty += f.FilledQty
+				expValue += f.FilledQty * f.FilledPrice
+			}
 
-		expectedQty += totalExpQty
-		actualQty += totalActQty
-		expectedValue += expValue
-		valueDiff += absInt64(expValue - actValue)
+			for _, f := range actualList {
+				totalActQty += f.FilledQty
+				actValue += f.FilledQty * f.FilledPrice
+			}
 
-		if totalActQty < totalExpQty {
-			v.missedFills++
-		} else if totalActQty > totalExpQty {
-			v.phantomFills++
-			phantomQty += totalActQty - totalExpQty
-		}
+			expectedQty += totalExpQty
+			actualQty += totalActQty
+			expectedValue += expValue
+			valueDiff += absInt64(expValue - actValue)
 
-		priceCorrectQty += matchingQtyByPrice(expectedList, actualList)
-		priorityCorrectQty += v.priorityMatchedQty(expectedList, actualList)
+			if totalActQty > totalExpQty {
+				phantomQty += totalActQty - totalExpQty
+			}
 
-		if totalExpQty != totalActQty || expValue != actValue {
-			if v.printedMismatches < 50 {
-				v.printedMismatches++
-				fmt.Printf("[Validator] Mismatch Order %d (Bot %d): Expected Qty=%d Value=%d, Actual Qty=%d Value=%d\n",
-					orderID, botID(orderID), totalExpQty, expValue, totalActQty, actValue)
-				for _, f := range expectedList {
-					fmt.Printf("   -> Expected Fill: Qty=%d Price=%d MatchedWith=%d\n", f.FilledQty, f.FilledPrice, f.MatchedWith)
-				}
-				for _, f := range actualList {
-					fmt.Printf("   -> Actual Fill: Qty=%d Price=%d MatchedWith=%d\n", f.FilledQty, f.FilledPrice, f.MatchedWith)
-				}
-				if v.printedMismatches == 50 {
-					fmt.Println("[Validator] Maximum mismatch logs reached (50). Suppressing further logging.")
+			priceCorrectQty += matchingQtyByPrice(expectedList, actualList)
+			priorityCorrectQty += s.priorityMatchedQty(expectedList, actualList)
+
+			if totalExpQty != totalActQty || expValue != actValue {
+				if s.printedMismatches < 50 {
+					s.printedMismatches++
+					fmt.Printf("[Validator] Mismatch Order %d (Bot %d): Expected Qty=%d Value=%d, Actual Qty=%d Value=%d\n",
+						orderID, botID(orderID), totalExpQty, expValue, totalActQty, actValue)
+					for _, f := range expectedList {
+						fmt.Printf("   -> Expected Fill: Qty=%d Price=%d MatchedWith=%d\n", f.FilledQty, f.FilledPrice, f.MatchedWith)
+					}
+					for _, f := range actualList {
+						fmt.Printf("   -> Actual Fill: Qty=%d Price=%d MatchedWith=%d\n", f.FilledQty, f.FilledPrice, f.MatchedWith)
+					}
+					if s.printedMismatches == 50 {
+						fmt.Println("[Validator] Maximum mismatch logs reached (50). Suppressing further logging.")
+					}
 				}
 			}
 		}
-	}
 
-	// Unaccounted fills (completely phantom)
-	for orderID := range v.actualFills {
-		if _, expOk := v.expectedFills[orderID]; !expOk {
-			v.phantomFills++
-			for _, f := range v.actualFills[orderID] {
-				actualQty += f.FilledQty
-				phantomQty += f.FilledQty
+		for orderID := range s.actualFills {
+			if _, expOk := s.expectedFills[orderID]; !expOk {
+				for _, f := range s.actualFills[orderID] {
+					actualQty += f.FilledQty
+					phantomQty += f.FilledQty
+				}
 			}
 		}
+		s.mu.Unlock()
 	}
 
 	if expectedQty == 0 {
-		if actualQty > 0 || v.ackViolations > 0 || v.duplicateOrders > 0 || v.unknownAcks > 0 {
+		if actualQty > 0 || ackViolations > 0 || duplicateOrders > 0 || unknownAcks > 0 {
 			return 0.0
 		}
 		return 100.0
@@ -479,9 +610,9 @@ func (v *Validator) GetCorrectnessScore() float64 {
 	if phantomQty > 0 {
 		score -= minFloat64(25.0, 25.0*(float64(phantomQty)/float64(expectedQty)))
 	}
-	score -= float64(v.ackViolations) * 2.0
-	score -= float64(v.duplicateOrders) * 2.0
-	score -= float64(v.unknownAcks) * 2.0
+	score -= float64(ackViolations) * 2.0
+	score -= float64(duplicateOrders) * 2.0
+	score -= float64(unknownAcks) * 2.0
 
 	if score < 0 {
 		score = 0
@@ -495,53 +626,28 @@ func (v *Validator) GetCorrectnessScore() float64 {
 
 // GetPhantomFills returns the count of phantom fills
 func (v *Validator) GetPhantomFills() int64 {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	return v.phantomFills
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	var total int64
+	for _, s := range v.shards {
+		s.mu.Lock()
+		total += s.phantomFills
+		s.mu.Unlock()
+	}
+	return total
 }
 
 // GetPriorityViolations returns the count of priority violations
 func (v *Validator) GetPriorityViolations() int64 {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	return v.priorityViolations
-}
-
-// priorityMatchedQty checks that fills arrived in the EXACT sequence the shadow
-// book produced them: same qty, same price, same counterparty.
-//
-// FIX: removed the `actual.MatchedWith != 0` escape hatch.
-// Previously an engine could send matched_with:0 to bypass the counterparty
-// check and still score a full priority match. Now:
-//   - If the validator expected a counterparty, the engine MUST report it.
-//   - matched_with:0 is only accepted when the expected counterparty is also 0
-//     (which never happens in practice — every fill has a real counterparty).
-
-func (v *Validator) priorityMatchedQty(expectedList []Fill, actualList []Fill) int64 {
-	var matched int64
-	for i, expected := range expectedList {
-		if i >= len(actualList) {
-			v.priorityViolations++
-			continue
-		}
-		actual := actualList[i]
-		if actual.FilledQty != expected.FilledQty || actual.FilledPrice != expected.FilledPrice {
-			v.priorityViolations++
-			continue
-		}
-		// Counterparty must match exactly.
-        // Zero is NOT a wildcard — every real fill has a counterparty order ID.
-        if actual.MatchedWith != expected.MatchedWith {
-            v.priorityViolations++
-            continue
-        }
-
-		matched += expected.FilledQty
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	var total int64
+	for _, s := range v.shards {
+		s.mu.Lock()
+		total += s.priorityViolations
+		s.mu.Unlock()
 	}
-	if len(actualList) > len(expectedList) {
-		v.priorityViolations += int64(len(actualList) - len(expectedList))
-	}
-	return matched
+	return total
 }
 
 func matchingQtyByPrice(expectedList []Fill, actualList []Fill) int64 {
@@ -589,16 +695,10 @@ func maxFloat64(a, b float64) float64 {
 	return b
 }
 
-// botID extracts the bot's numeric identity from a structured order ID.
-// Convention: orderID = (NumericID << 32) | sequenceNumber
-// The upper 32 bits uniquely identify which bot placed the order.
 func botID(orderID int64) int64 {
-    return orderID >> 32
+	return orderID >> 32
 }
 
-// isSelfCross returns true when both orders originated from the same bot.
-// We only enforce this when the upper 32 bits are non-zero — raw integer IDs
-// used in unit tests (1, 2, 3) have botID=0 and are exempt from this check.
 func isSelfCross(incomingID, restingID int64) bool {
-    return botID(incomingID) != 0 && botID(incomingID) == botID(restingID)
+	return botID(incomingID) != 0 && botID(incomingID) == botID(restingID)
 }

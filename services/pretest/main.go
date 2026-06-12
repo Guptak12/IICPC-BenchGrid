@@ -147,7 +147,7 @@ func processPretestMessage(ctx context.Context, message redis.XMessage, isSystes
 	if val, err := strconv.Atoi(os.Getenv("PRETEST_NUM_BOTS")); err == nil && val > 0 {
 		numBots = val
 	}
-	ordersPerBot := 100
+	ordersPerBot := 200
 	if val, err := strconv.Atoi(os.Getenv("PRETEST_ORDERS_PER_BOT")); err == nil && val > 0 {
 		ordersPerBot = val
 	}
@@ -156,11 +156,11 @@ func processPretestMessage(ctx context.Context, message redis.XMessage, isSystes
 	if isSystest {
 		queueName = common.SystestQueue
 		groupName = common.SystestGroup
-		numBots = 10
+		numBots = 500
 		if val, err := strconv.Atoi(os.Getenv("SYSTEST_NUM_BOTS")); err == nil && val > 0 {
 			numBots = val
 		}
-		ordersPerBot = 500
+		ordersPerBot = 20000
 		if val, err := strconv.Atoi(os.Getenv("SYSTEST_ORDERS_PER_BOT")); err == nil && val > 0 {
 			ordersPerBot = val
 		}
@@ -238,9 +238,22 @@ func processPretestMessage(ctx context.Context, message redis.XMessage, isSystes
 				return fmt.Errorf("run %d sandbox failed: %w", run+1, err)
 			}
 
+			// Inspect the container config to retrieve the protocol
+			protocolStr := "TCP_PROTOBUF"
+			inspectInfo, inspectErr := dockerClient.ContainerInspect(gctx, containerID, client.ContainerInspectOptions{})
+			if inspectErr == nil && inspectInfo.Container.Config != nil {
+				for _, env := range inspectInfo.Container.Config.Env {
+					if strings.HasPrefix(env, "ENGINE_PROTOCOL=") {
+						protocolStr = strings.TrimPrefix(env, "ENGINE_PROTOCOL=")
+						break
+					}
+				}
+			}
+			log.Printf("[submission:%s] Run %d detected protocol: %s\n", submissionID[:8], run+1, protocolStr)
+
 			// Execute bot fleet with run-specific seed
 			seedForRun := baseSeed + int64(run*1000)
-			results, fleetErr := RunFleet(gctx, endpoint, seedForRun, numBots, ordersPerBot)
+			results, fleetErr := RunFleet(gctx, endpoint, seedForRun, numBots, ordersPerBot, protocolStr, isSystest)
 
 			// Clean up container immediately after this run and extract logs
 			log.Printf("[submission:%s] Run %d: Cleaning up contestant sandbox...\n", submissionID[:8], run+1)
@@ -369,6 +382,7 @@ func processPretestMessage(ctx context.Context, message redis.XMessage, isSystes
 
 	// Evaluate final aggregated verdict using the average metrics
 	aggregatedResults := PretestResults{
+		Protocol:           runOutputs[0].results.Protocol,
 		Correctness:        avgCorrectness,
 		P50Us:              avgP50Us,
 		P90Us:              avgP90Us,
@@ -425,7 +439,7 @@ func processPretestMessage(ctx context.Context, message redis.XMessage, isSystes
 func startContestantSandbox(ctx context.Context, submissionID string, imageTag string) (string, string, error) {
 	log.Printf("[debug] startContestantSandbox: dynamic port mapping configuration initialized (Port 8000)")
 	containerName := "contestant-" + submissionID
-	pidsLimit := int64(2048)
+	pidsLimit := int64(128)
 
 	sandboxNet := os.Getenv("SANDBOX_NET")
 	if sandboxNet == "" {
@@ -450,8 +464,8 @@ func startContestantSandbox(ctx context.Context, submissionID string, imageTag s
 		NetworkMode: container.NetworkMode(sandboxNet),
 		Runtime:     sandboxRuntime,
 		Resources: container.Resources{
-			Memory:     256 * 1024 * 1024, // 256MB memory cap
-			NanoCPUs:   int64(1 * 1e9),     // 1 CPU
+			Memory:     512 * 1024 * 1024, // 512MB memory cap
+			NanoCPUs:   int64(2 * 1e9),     // 2 CPU
 			PidsLimit:  &pidsLimit,
 			CpusetCpus: cpuset,
 		},

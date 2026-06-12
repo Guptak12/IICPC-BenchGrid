@@ -653,12 +653,15 @@ const dashboardHTML = `<!DOCTYPE html>
                             <option value="cpp_basic">C++ (Basic/Normal)</option>
                         </select>
                     </div>
-                    <button class="btn btn-primary" onclick="triggerMockSubmission()">
-                        <i class="fa-solid fa-rocket"></i> Trigger Mock Submission
-                    </button>
-                    <button class="btn btn-outline" onclick="pollMetrics()">
-                        <i class="fa-solid fa-arrows-rotate"></i> Refresh Metrics
-                    </button>
+					<button id="btn-mock-pretest" class="btn btn-primary" onclick="triggerMockSubmission(false)" style="background-color: var(--accent-cyan); color: #0d1117; box-shadow: 0 0 10px rgba(0, 245, 255, 0.2); border-color: var(--accent-cyan); margin-bottom: 8px;">
+						<i class="fa-solid fa-flask"></i> Mock Pretests
+					</button>
+					<button id="btn-mock-systest" class="btn btn-primary" onclick="triggerMockSubmission(true)" style="background-color: var(--accent-violet); color: #ffffff; box-shadow: 0 0 10px rgba(138, 43, 226, 0.2); border-color: var(--accent-violet);">
+						<i class="fa-solid fa-bolt"></i> Mock System Tests
+					</button>
+					<button class="btn btn-outline" onclick="pollMetrics()" style="margin-top: 8px;">
+						<i class="fa-solid fa-arrows-rotate"></i> Refresh Metrics
+					</button>
                     <div style="margin-top: 20px; border-top: 1px solid var(--border-color); padding-top: 20px;">
                         <span style="font-size: 11px; text-transform: uppercase; color: var(--text-muted); display: block; margin-bottom: 10px;">Dangerous Actions</span>
                         <button class="btn btn-danger" onclick="confirmResetDB()">
@@ -871,6 +874,26 @@ const dashboardHTML = `<!DOCTYPE html>
                 document.getElementById('kpi-max-score').textContent = data.max_composite_score.toFixed(2);
                 document.getElementById('stat-exporter-up').textContent = data.db_healthy ? "1" : "0";
 
+                // Toggle Mock buttons state based on active runs count
+                const pretestBtn = document.getElementById('btn-mock-pretest');
+                const systestBtn = document.getElementById('btn-mock-systest');
+                if (pretestBtn && systestBtn) {
+                    const disabled = data.active_submissions > 0;
+                    pretestBtn.disabled = disabled;
+                    systestBtn.disabled = disabled;
+                    if (disabled) {
+                        pretestBtn.style.opacity = '0.5';
+                        pretestBtn.style.cursor = 'not-allowed';
+                        systestBtn.style.opacity = '0.5';
+                        systestBtn.style.cursor = 'not-allowed';
+                    } else {
+                        pretestBtn.style.opacity = '1.0';
+                        pretestBtn.style.cursor = 'pointer';
+                        systestBtn.style.opacity = '1.0';
+                        systestBtn.style.cursor = 'pointer';
+                    }
+                }
+
                 // Update Charts
                 const nowStr = new Date().toTimeString().split(' ')[0].substring(3); // mm:ss
                 
@@ -994,14 +1017,20 @@ const dashboardHTML = `<!DOCTYPE html>
         }
 
         // Trigger Operations
-        async function triggerMockSubmission() {
+        async function triggerMockSubmission(isSystest) {
             const engine = document.getElementById('mock-engine-select').value;
-            addLog('Sending request to dispatch mock submission (' + engine + ')...');
+            const modeName = isSystest ? "System Tests" : "Pretests";
+            addLog('Sending request to dispatch mock submission (' + engine + ') for ' + modeName + '...');
             try {
-                const res = await fetch('/api/v1/dashboard/actions/mock-submission?engine=' + encodeURIComponent(engine), { method: 'POST' });
-                if (!res.ok) throw new Error(await res.text());
+                const res = await fetch('/api/v1/dashboard/actions/mock-submission?engine=' + encodeURIComponent(engine) + '&is_systest=' + isSystest, { method: 'POST' });
+                if (!res.ok) {
+                    if (res.status === 423) {
+                        throw new Error('Another benchmark is currently running. Please wait for it to complete.');
+                    }
+                    throw new Error(await res.text());
+                }
                 const data = await res.json();
-                addLog("Mock submission (" + engine + ") successfully accepted! BuildID: " + data.build_id, 'warning');
+                addLog("Mock submission (" + engine + ") successfully accepted for " + modeName + "! BuildID: " + data.build_id, 'warning');
                 pollMetrics();
             } catch (err) {
                 addLog("Failed to trigger mock submission: " + err.message, 'error');
