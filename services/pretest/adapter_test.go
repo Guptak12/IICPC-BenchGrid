@@ -236,6 +236,8 @@ func TestRESTAdapter(t *testing.T) {
 	orderChan := make(chan map[string]interface{}, 10)
 	sseCloseChan := make(chan struct{})
 
+	const testOrderID = uint64((3 << 32) | 888)
+
 	// 1. Start Mock HTTP Server (POST /api/v1/orders & GET /api/v1/events)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "POST" && r.URL.Path == "/api/v1/orders" {
@@ -260,7 +262,7 @@ func TestRESTAdapter(t *testing.T) {
 
 			// Send mock SSE execution report event
 			reportMap := map[string]interface{}{
-				"order_id":      888,
+				"order_id":      testOrderID,
 				"status":        "ACCEPTED",
 				"filled_qty":    0,
 				"filled_price":  0,
@@ -297,7 +299,7 @@ func TestRESTAdapter(t *testing.T) {
 
 	testOrder := &protocol.Order{
 		BotId:    3,
-		OrderId:  888,
+		OrderId:  testOrderID,
 		Type:     protocol.OrderType_LIMIT,
 		Side:     protocol.Side_BUY,
 		Price:    15000,
@@ -312,8 +314,8 @@ func TestRESTAdapter(t *testing.T) {
 	// Verify server got order via HTTP POST
 	select {
 	case received := <-orderChan:
-		if id, ok := received["order_id"].(float64); !ok || id != 888 {
-			t.Errorf("expected order_id 888, got %v", received["order_id"])
+		if id, ok := received["order_id"].(float64); !ok || id != float64(testOrderID) {
+			t.Errorf("expected order_id %d, got %v", testOrderID, received["order_id"])
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("timeout waiting for REST server to receive order via POST")
@@ -328,7 +330,7 @@ func TestRESTAdapter(t *testing.T) {
 
 	select {
 	case ev := <-eventChan:
-		if ev.Report.OrderId != 888 || ev.Report.Status != protocol.ExecutionStatus_ACCEPTED {
+		if ev.Report.OrderId != testOrderID || ev.Report.Status != protocol.ExecutionStatus_ACCEPTED {
 			t.Errorf("unexpected report: %+v", ev.Report)
 		}
 	case <-time.After(500 * time.Millisecond):

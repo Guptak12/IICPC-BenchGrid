@@ -651,6 +651,9 @@ const dashboardHTML = `<!DOCTYPE html>
                             <option value="rust_crash">Rust (Crash after 10 orders)</option>
                             <option value="node_scammer">Node.js (Scammer/Anomalies)</option>
                             <option value="cpp_basic">C++ (Basic/Normal)</option>
+                            <option value="go_ws">Go (WebSocket Protocol Mock)</option>
+                            <option value="go_rest">Go (REST/SSE Protocol Mock)</option>
+                            <option value="go_fix">Go (FIX Protocol Mock)</option>
                         </select>
                     </div>
 					<button id="btn-mock-pretest" class="btn btn-primary" onclick="triggerMockSubmission(false)" style="background-color: var(--accent-cyan); color: #0d1117; box-shadow: 0 0 10px rgba(0, 245, 255, 0.2); border-color: var(--accent-cyan); margin-bottom: 8px;">

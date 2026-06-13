@@ -202,6 +202,9 @@ func handleMockSubmission(c fiber.Ctx) error {
 		"rust_crash":   true,
 		"node_scammer": true,
 		"cpp_basic":    true,
+		"go_ws":        true,
+		"go_rest":      true,
+		"go_fix":       true,
 	}
 	if !allowedEngines[engine] {
 		return c.Status(fiber.StatusBadRequest).SendString("Invalid engine name")

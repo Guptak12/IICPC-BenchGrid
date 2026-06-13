@@ -185,14 +185,17 @@ func handleGetProfile(c fiber.Ctx) error {
 				// Compute user's rank in this contest
 				standingsQuery := `
 					WITH standings AS (
-						SELECT user_id, MAX(composite_score) as best_score, MIN(updated_at) as min_updated_at
+						SELECT user_id, 
+						       MAX(CASE WHEN verdict = 'Accepted' THEN 1 ELSE 0 END) as has_accepted,
+						       MAX(composite_score) as best_score, 
+						       MIN(updated_at) as min_updated_at
 						FROM submissions
 						WHERE arena_id = $1 AND status = 'completed'
 						GROUP BY user_id
 					),
 					ranked AS (
 						SELECT user_id,
-						       ROW_NUMBER() OVER (ORDER BY best_score DESC, min_updated_at ASC) as rank
+						       ROW_NUMBER() OVER (ORDER BY has_accepted DESC, best_score DESC, min_updated_at ASC) as rank
 						FROM standings
 					)
 					SELECT rank FROM ranked WHERE user_id = $2
@@ -328,7 +331,7 @@ func triggerSystemTestsForArena(arenaID string) {
 	query := `
 		WITH ranked_submissions AS (
 			SELECT s.id, s.contestant_id, s.s3_path, s.github_url, s.user_id,
-			       ROW_NUMBER() OVER (PARTITION BY s.user_id ORDER BY s.composite_score DESC, s.created_at DESC) as rn
+			       ROW_NUMBER() OVER (PARTITION BY COALESCE(s.user_id, s.contestant_id) ORDER BY (s.verdict = 'Accepted') DESC, s.composite_score DESC, s.created_at DESC) as rn
 			FROM submissions s
 			WHERE s.arena_id = $1 AND s.status = 'completed'
 		)

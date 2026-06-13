@@ -150,11 +150,11 @@ func TestEvaluateVerdictLogarithmicScoringAndSLA(t *testing.T) {
 	if verdict != "Correctness Error" {
 		t.Errorf("Expected verdict to be 'Correctness Error' due to SLA breach, got %s", verdict)
 	}
-	if score != 0.0 {
-		t.Errorf("Expected score to be 0.0, got %f", score)
+	if score != 71.5 {
+		t.Errorf("Expected score to be 71.5, got %f", score)
 	}
-	if diags["throughput_score"].(float64) != 0.0 {
-		t.Errorf("Expected throughput score to be 0.0, got %v", diags["throughput_score"])
+	if diags["throughput_score"].(float64) != 5.0 {
+		t.Errorf("Expected throughput score to be 5.0, got %v", diags["throughput_score"])
 	}
 
 	// 2. Test logarithmic decay score under 0.1% limit

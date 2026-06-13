@@ -649,8 +649,8 @@ func generateLeaderboardData(arenaID string) ([]byte, error) {
 
 	query := `
 		WITH ranked_submissions AS (
-			SELECT contestant_id, id, verdict, composite_score, correctness_score, p50_us, p90_us, p99_us, actual_tps, diagnostics, updated_at, status, user_id,
-			       ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY composite_score DESC, updated_at ASC) as rank_score
+			SELECT contestant_id, id, verdict, composite_score, correctness_score, p50_us, p90_us, p99_us, actual_tps, diagnostics, updated_at, status, COALESCE(user_id, contestant_id) as user_id,
+			       ROW_NUMBER() OVER (PARTITION BY COALESCE(user_id, contestant_id) ORDER BY (verdict = 'Accepted') DESC, composite_score DESC, updated_at ASC) as rank_score
 			FROM submissions
 			WHERE arena_id = $1
 		)
@@ -765,6 +765,11 @@ func generateLeaderboardData(arenaID string) ([]byte, error) {
 
 	// Sort leaderboard
 	sort.Slice(entries, func(i, j int) bool {
+		iAccepted := entries[i].Verdict == "Accepted"
+		jAccepted := entries[j].Verdict == "Accepted"
+		if iAccepted != jAccepted {
+			return iAccepted // Accepted runs rank above failed runs
+		}
 		if entries[i].CompositeScore != entries[j].CompositeScore {
 			return entries[i].CompositeScore > entries[j].CompositeScore
 		}

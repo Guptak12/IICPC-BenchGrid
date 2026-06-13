@@ -62,8 +62,7 @@ type PretestBot struct {
 	seqNum       atomic.Int64
 	ordersSent   int
 	activeOrders []int64
-	SendTimes    map[int64]int64
-	sendTimesMu  sync.RWMutex
+	SendTimes    []int64
 }
 
 func NewPretestBot(numericID int64, stringID string, strategy StrategyType, midPrice, spread float64, ordersToSend int, ratePerSec float64, seed int64) *PretestBot {
@@ -77,7 +76,7 @@ func NewPretestBot(numericID int64, stringID string, strategy StrategyType, midP
 		RatePerSec:   ratePerSec,
 		Seed:         seed,
 		rng:          rand.New(rand.NewSource(seed)),
-		SendTimes:    make(map[int64]int64),
+		SendTimes:    make([]int64, ordersToSend+1),
 	}
 }
 
@@ -461,22 +460,20 @@ func RunFleet(ctx context.Context, endpoint string, baseSeed int64, numBots int,
 				} else {
 					sleepDur := scheduler.NextSleep()
 					if sleepDur > 0 {
-						timer := time.NewTimer(sleepDur)
-						select {
-						case <-gctx.Done():
-							timer.Stop()
-							return nil
-						case <-timer.C:
-						}
+						time.Sleep(sleepDur)
+					}
+					select {
+					case <-gctx.Done():
+						return nil
+					default:
 					}
 				}
 
 				order := b.GenerateNextOrder()
 				validator.ProcessOrder(int64(order.OrderId), order.Type.String(), order.Side.String(), order.Price, int64(order.Quantity))
 
-				b.sendTimesMu.Lock()
-				b.SendTimes[int64(order.OrderId)] = time.Now().UnixNano()
-				b.sendTimesMu.Unlock()
+				seq := int64(order.OrderId & 0xFFFFFFFF)
+				b.SendTimes[seq] = time.Now().UnixNano()
 
 				err := adapter.SendOrder(gctx, order)
 				if err != nil {
@@ -491,6 +488,7 @@ func RunFleet(ctx context.Context, endpoint string, baseSeed int64, numBots int,
 					case <-gctx.Done():
 					case eventChan <- PretestEvent{ReceivedAt: time.Now().UnixNano(), IsFailure: true}:
 					}
+					break
 				} else {
 					totalSent.Add(1)
 
@@ -572,22 +570,24 @@ func RunFleet(ctx context.Context, endpoint string, baseSeed int64, numBots int,
 
 	// Map timeouts (sent orders that were never accepted) as failures in their respective send-time bins
 	for _, b := range bots {
-		b.sendTimesMu.RLock()
-		for orderID, sendTime := range b.SendTimes {
-			if !acceptedOrders[orderID] {
-				idx := (sendTime - startTime) / 1_000_000_000
-				if idx < 0 {
-					idx = 0
+		for seq := 1; seq <= b.OrdersToSend; seq++ {
+			sendTime := b.SendTimes[seq]
+			if sendTime > 0 {
+				orderID := (int64(b.NumericID) << 32) | int64(seq)
+				if !acceptedOrders[orderID] {
+					idx := (sendTime - startTime) / 1_000_000_000
+					if idx < 0 {
+						idx = 0
+					}
+					w, exists := bins[idx]
+					if !exists {
+						w = &TimeWindow{}
+						bins[idx] = w
+					}
+					w.Failures++
 				}
-				w, exists := bins[idx]
-				if !exists {
-					w = &TimeWindow{}
-					bins[idx] = w
-				}
-				w.Failures++
 			}
 		}
-		b.sendTimesMu.RUnlock()
 	}
 
 	// Calculate MaxSustainedTPS: maximum successes count in any bin that contains exactly 0 failures
@@ -751,11 +751,13 @@ func recordMetrics(ev PretestEvent, bots []*PretestBot, histMu *sync.Mutex, rttH
 	}
 	b := bots[botIDVal-1]
 
-	b.sendTimesMu.RLock()
-	sendTime, ok := b.SendTimes[int64(report.OrderId)]
-	b.sendTimesMu.RUnlock()
+	seq := int64(report.OrderId & 0xFFFFFFFF)
+	var sendTime int64
+	if seq > 0 && seq < int64(len(b.SendTimes)) {
+		sendTime = b.SendTimes[seq]
+	}
 
-	if ok && ev.ReceivedAt > 0 {
+	if sendTime > 0 && ev.ReceivedAt > 0 {
 		rttNs := ev.ReceivedAt - sendTime
 		engineNs := int64(report.ProcessingNs)
 
@@ -996,10 +998,14 @@ func getFloatAsInt64(v interface{}) (int64, bool) {
 }
 
 type RESTAdapter struct {
-	client   *http.Client
-	endpoint string
-	botID    int64
-	sseConn  io.ReadCloser
+	client    *http.Client
+	endpoint  string
+	botID     int64
+	sseConn   io.ReadCloser
+	orderChan chan *protocol.Order
+	wg        sync.WaitGroup
+	ctx       context.Context
+	cancel    context.CancelFunc
 }
 
 func (a *RESTAdapter) Init(ctx context.Context, endpoint string, botID int64) error {
@@ -1011,40 +1017,71 @@ func (a *RESTAdapter) Init(ctx context.Context, endpoint string, botID int64) er
 		IdleConnTimeout:     90 * time.Second,
 	}
 	a.client = &http.Client{Transport: t}
+
+	a.orderChan = make(chan *protocol.Order, 50000)
+	a.ctx, a.cancel = context.WithCancel(context.Background())
+
+	// Start 50 concurrent worker goroutines
+	const numWorkers = 50
+	for i := 0; i < numWorkers; i++ {
+		a.wg.Add(1)
+		go a.worker()
+	}
+
 	return nil
 }
 
-func (a *RESTAdapter) SendOrder(ctx context.Context, order *protocol.Order) error {
-	orderMap := map[string]interface{}{
-		"bot_id":   order.BotId,
-		"order_id": order.OrderId,
-		"type":     order.Type.String(),
-		"side":     order.Side.String(),
-		"price":    order.Price,
-		"quantity": order.Quantity,
-	}
-	payload, err := json.Marshal(orderMap)
-	if err != nil {
-		return err
-	}
+func (a *RESTAdapter) worker() {
+	defer a.wg.Done()
+
 	url := a.endpoint
 	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
 		url = "http://" + url
 	}
-	req, err := http.NewRequestWithContext(ctx, "POST", url+"/api/v1/orders", bytes.NewReader(payload))
-	if err != nil {
-		return err
+	postURL := url + "/api/v1/orders"
+
+	for order := range a.orderChan {
+		orderMap := map[string]interface{}{
+			"bot_id":   order.BotId,
+			"order_id": order.OrderId,
+			"type":     order.Type.String(),
+			"side":     order.Side.String(),
+			"price":    order.Price,
+			"quantity": order.Quantity,
+		}
+		payload, err := json.Marshal(orderMap)
+		if err != nil {
+			continue
+		}
+
+		reqCtx, reqCancel := context.WithTimeout(a.ctx, 5*time.Second)
+		req, err := http.NewRequestWithContext(reqCtx, "POST", postURL, bytes.NewReader(payload))
+		if err != nil {
+			reqCancel()
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := a.client.Do(req)
+		reqCancel()
+		if err != nil {
+			continue
+		}
+		resp.Body.Close()
 	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return err
+}
+
+func (a *RESTAdapter) SendOrder(ctx context.Context, order *protocol.Order) error {
+	select {
+	case <-a.ctx.Done():
+		return a.ctx.Err()
+	case <-ctx.Done():
+		return ctx.Err()
+	case a.orderChan <- order:
+		return nil
+	default:
+		return fmt.Errorf("RESTAdapter order channel buffer full")
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
-	return nil
 }
 
 func (a *RESTAdapter) StartReceiver(ctx context.Context, eventChan chan<- PretestEvent) error {
@@ -1074,10 +1111,12 @@ func (a *RESTAdapter) StartReceiver(ctx context.Context, eventChan chan<- Pretes
 				if err := json.Unmarshal([]byte(dataStr), &repMap); err == nil {
 					report := mapJSONToExecutionReport(repMap)
 					isOwn := int64(report.OrderId>>32) == a.botID
-					select {
-					case <-ctx.Done():
-						return
-					case eventChan <- PretestEvent{Report: report, IsOwn: isOwn, ReceivedAt: receivedAt}:
+					if isOwn {
+						select {
+						case <-ctx.Done():
+							return
+						case eventChan <- PretestEvent{Report: report, IsOwn: isOwn, ReceivedAt: receivedAt}:
+						}
 					}
 				}
 			}
@@ -1087,6 +1126,14 @@ func (a *RESTAdapter) StartReceiver(ctx context.Context, eventChan chan<- Pretes
 }
 
 func (a *RESTAdapter) Close() error {
+	if a.cancel != nil {
+		a.cancel()
+	}
+	if a.orderChan != nil {
+		close(a.orderChan)
+	}
+	a.wg.Wait()
+
 	if a.sseConn != nil {
 		return a.sseConn.Close()
 	}

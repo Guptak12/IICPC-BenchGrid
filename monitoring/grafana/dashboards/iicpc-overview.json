@@ -674,7 +674,7 @@
             "uid": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (method, path, status_code) (rate(iicpc_http_requests_total[10s]))",
+          "expr": "sum by (method, path, status_code) (rate(iicpc_http_requests_total[$__rate_interval]))",
           "legendFormat": "{{method}} {{path}} ({{status_code}})",
           "range": true,
           "refId": "A"

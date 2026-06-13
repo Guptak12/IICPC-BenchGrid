@@ -621,6 +621,13 @@ func tailLogs(logs string, maxLines int) string {
 }
 
 func startDockerSweeper(ctx context.Context, dockerClient *client.Client) {
+	timeoutMin := 30
+	if val, err := strconv.Atoi(os.Getenv("SWEEPER_TIMEOUT_MINUTES")); err == nil && val > 0 {
+		timeoutMin = val
+	}
+	timeoutDur := time.Duration(timeoutMin) * time.Minute
+	log.Printf("[sweeper] Initialized with timeout: %v\n", timeoutDur)
+
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -648,7 +655,7 @@ func startDockerSweeper(ctx context.Context, dockerClient *client.Client) {
 					}
 
 					createdTime := time.Unix(c.Created, 0)
-					if now.Sub(createdTime) > 5*time.Minute {
+					if now.Sub(createdTime) > timeoutDur {
 						log.Printf("[sweeper] Found orphaned/timed-out contestant container %s (created %v ago). Cleaning up...\n", c.ID[:12], now.Sub(createdTime))
 						_, _ = dockerClient.ContainerStop(ctx, c.ID, client.ContainerStopOptions{})
 						_, _ = dockerClient.ContainerRemove(ctx, c.ID, client.ContainerRemoveOptions{Force: true})
