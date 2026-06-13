@@ -564,7 +564,7 @@ const dashboardHTML = `<!DOCTYPE html>
             <div class="kpi-detail">Stream backlog length</div>
         </div>
         <div class="kpi-card">
-            <span class="kpi-title">Pretest Queue Depth</span>
+            <span class="kpi-title">Testing Queue Depth</span>
             <div class="kpi-value" id="kpi-pretest-queue">0</div>
             <div class="kpi-detail">Active evaluation backlog</div>
         </div>
@@ -597,8 +597,8 @@ const dashboardHTML = `<!DOCTYPE html>
             </div>
             <div class="k8s-pod-card" style="background: rgba(255, 255, 255, 0.02); border: 1px solid var(--border-color); border-radius: 8px; padding: 15px; text-align: center; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;">
                 <i class="fa-solid fa-vial-virus" style="font-size: 24px; color: var(--accent-violet);"></i>
-                <span style="font-size: 11px; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.5px;">Pretest Pods</span>
-                <span id="pod-count-pretest" style="font-size: 32px; font-weight: 700; color: #ffffff;">0</span>
+                <span style="font-size: 11px; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.5px;">Testing Pods</span>
+                <span id="pod-count-testing" style="font-size: 32px; font-weight: 700; color: #ffffff;">0</span>
             </div>
             <div class="k8s-pod-card" style="background: rgba(255, 255, 255, 0.02); border: 1px solid var(--border-color); border-radius: 8px; padding: 15px; text-align: center; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;">
                 <i class="fa-solid fa-database" style="font-size: 24px; color: var(--accent-green);"></i>
@@ -643,7 +643,7 @@ const dashboardHTML = `<!DOCTYPE html>
                             <option value="go_fix">Go (FIX Protocol Mock)</option>
                         </select>
                     </div>
-					<button id="btn-mock-pretest" class="btn btn-primary" onclick="triggerMockSubmission(false)" style="background-color: var(--accent-cyan); color: #0d1117; box-shadow: 0 0 10px rgba(0, 245, 255, 0.2); border-color: var(--accent-cyan); margin-bottom: 8px;">
+					<button id="btn-mock-testing" class="btn btn-primary" onclick="triggerMockSubmission(false)" style="background-color: var(--accent-cyan); color: #0d1117; box-shadow: 0 0 10px rgba(0, 245, 255, 0.2); border-color: var(--accent-cyan); margin-bottom: 8px;">
 						<i class="fa-solid fa-flask"></i> Mock Pretests
 					</button>
 					<button id="btn-mock-systest" class="btn btn-primary" onclick="triggerMockSubmission(true)" style="background-color: var(--accent-violet); color: #ffffff; box-shadow: 0 0 10px rgba(138, 43, 226, 0.2); border-color: var(--accent-violet);">
@@ -802,7 +802,7 @@ const dashboardHTML = `<!DOCTYPE html>
                     const k8s = data.k8s_status;
                     document.getElementById('pod-count-gateway').textContent = k8s.gateway_pods;
                     document.getElementById('pod-count-compiler').textContent = k8s.compiler_pods;
-                    document.getElementById('pod-count-pretest').textContent = k8s.pretest_pods > 0 ? k8s.pretest_pods : "0 (Host)";
+                    document.getElementById('pod-count-testing').textContent = k8s.testing_pods > 0 ? k8s.testing_pods : "0 (Host)";
                     document.getElementById('pod-count-postgres').textContent = k8s.postgres_pods;
                     document.getElementById('pod-count-redis').textContent = k8s.redis_pods;
                     document.getElementById('pod-count-total').textContent = k8s.total_pods;
@@ -820,13 +820,13 @@ const dashboardHTML = `<!DOCTYPE html>
                 }
 
                 // Toggle Mock buttons state based on active runs count - Always enabled for concurrency testing
-                const pretestBtn = document.getElementById('btn-mock-pretest');
+                const testingBtn = document.getElementById('btn-mock-testing');
                 const systestBtn = document.getElementById('btn-mock-systest');
-                if (pretestBtn && systestBtn) {
-                    pretestBtn.disabled = false;
+                if (testingBtn && systestBtn) {
+                    testingBtn.disabled = false;
                     systestBtn.disabled = false;
-                    pretestBtn.style.opacity = '1.0';
-                    pretestBtn.style.cursor = 'pointer';
+                    testingBtn.style.opacity = '1.0';
+                    testingBtn.style.cursor = 'pointer';
                     systestBtn.style.opacity = '1.0';
                     systestBtn.style.cursor = 'pointer';
                 }

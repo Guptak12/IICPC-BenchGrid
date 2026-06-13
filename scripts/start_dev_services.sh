@@ -72,8 +72,6 @@ export S3_ACCESS_KEY="minioadmin"
 export S3_SECRET_KEY="minioadmin"
 export S3_BUCKET="submissions"
 export S3_USE_SSL="false"
-export COMPILE_IMAGE="iicpc-sandbox:v1"
-export RUNTIME_IMAGE="iicpc-runtime-sandbox:v1"
 export SWEEPER_TIMEOUT_MINUTES="30"
 
 # Kill existing background instances of our services to avoid port binding conflicts

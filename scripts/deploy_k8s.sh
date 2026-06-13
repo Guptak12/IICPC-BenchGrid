@@ -31,7 +31,7 @@ export HOME="/tmp/empty-home-for-docker"
 mkdir -p "$HOME"
 
 # Build microservices
-SERVICES=("gateway" "compiler" "pretest")
+SERVICES=("gateway" "compiler" "testing")
 
 echo "Compiling microservices on host..."
 mkdir -p bin
@@ -89,16 +89,16 @@ echo "=== 7. Deploying Microservice Workers and Gateway ==="
 kubectl apply -f k8s/sandbox-networkpolicy.yaml
 kubectl apply -f k8s/compiler.yaml
 if [ "${HYBRID:-}" = "true" ]; then
-  echo "Hybrid mode: Skipping pretest worker deployment in cluster."
+  echo "Hybrid mode: Skipping testing worker deployment in cluster."
 else
-  kubectl apply -f k8s/pretest.yaml
+  kubectl apply -f k8s/testing.yaml
 fi
 kubectl apply -f k8s/gateway.yaml
 
 echo "=== 8. Deploying Horizontal Pod Autoscalers (HPAs) ==="
 kubectl apply -f k8s/hpa/compiler-hpa.yaml
 if [ "${HYBRID:-}" != "true" ]; then
-  kubectl apply -f k8s/hpa/pretest-hpa.yaml
+  kubectl apply -f k8s/hpa/testing-hpa.yaml
 fi
 
 echo "=== 9. Deployment Complete! Checking Status ==="

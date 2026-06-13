@@ -74,7 +74,6 @@ mkdir -p bin
 go build -o bin/gateway services/gateway/*.go
 go build -o bin/compiler services/compiler/*.go
 go build -o bin/testing services/testing/*.go
-go build -o bin/leaderboard services/leaderboard/*.go
 
 # Run decoupled microservices
 ./bin/gateway > /tmp/gateway_test.log 2>&1 &
@@ -84,9 +83,6 @@ PIDS+=($!)
 PIDS+=($!)
 
 ./bin/testing > /tmp/testing_test.log 2>&1 &
-PIDS+=($!)
-
-./bin/leaderboard > /tmp/leaderboard_test.log 2>&1 &
 PIDS+=($!)
 
 # Wait for gateway to start

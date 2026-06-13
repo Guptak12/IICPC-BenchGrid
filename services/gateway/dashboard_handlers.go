@@ -44,7 +44,7 @@ type PodList struct {
 type K8sPodStatus struct {
 	GatewayPods   int  `json:"gateway_pods"`
 	CompilerPods  int  `json:"compiler_pods"`
-	PretestPods   int  `json:"pretest_pods"`
+	TestingPods   int  `json:"testing_pods"`
 	PostgresPods  int  `json:"postgres_pods"`
 	RedisPods     int  `json:"redis_pods"`
 	TotalPods     int  `json:"total_pods"`
@@ -58,7 +58,7 @@ func getK8sPods() (K8sPodStatus, error) {
 		return K8sPodStatus{
 			GatewayPods:   3,
 			CompilerPods:  2,
-			PretestPods:   0,
+			TestingPods:   0,
 			PostgresPods:  1,
 			RedisPods:     1,
 			TotalPods:     7,
@@ -112,8 +112,8 @@ func getK8sPods() (K8sPodStatus, error) {
 			status.GatewayPods++
 		case "compilation-worker":
 			status.CompilerPods++
-		case "pretest-worker":
-			status.PretestPods++
+		case "testing-worker":
+			status.TestingPods++
 		case "postgres":
 			status.PostgresPods++
 		case "redis":

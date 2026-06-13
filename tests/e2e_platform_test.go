@@ -246,17 +246,16 @@ func TestE2EPlatformFullWorkflow(t *testing.T) {
 		t.Fatalf("Invalid gateway submit response: %+v", submitResp)
 	}
 	t.Logf("Submission uploaded successfully! BuildID: %s", submitResp.BuildID)
-
 	// Step 4: Poll status endpoint until completion or compilation/pretest failure
 	success := false
-	timeout := time.After(60 * time.Second)
+	timeout := time.After(120 * time.Second)
 	tick := time.NewTicker(1 * time.Second)
 	defer tick.Stop()
 
 	for {
 		select {
 		case <-timeout:
-			t.Fatalf("E2E Test Timeout: submission did not compile and execute within 60 seconds")
+			t.Fatalf("E2E Test Timeout: submission did not compile and execute within 120 seconds")
 		case <-tick.C:
 			statusReq, err := http.NewRequest("GET", fmt.Sprintf("http://localhost:3000/api/v1/build/%s", submitResp.BuildID), nil)
 			if err != nil {

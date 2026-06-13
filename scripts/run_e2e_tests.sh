@@ -25,14 +25,6 @@ fi
 docker network rm sandbox-net >/dev/null 2>&1 || true
 docker network create sandbox-net
 echo "Created network: sandbox-net"
-
-SANDBOX_IMAGE="iicpc-sandbox:v1"
-RUNTIME_IMAGE="iicpc-runtime-sandbox:v1"
-
-echo "=== 1. Building/Verifying Contestant Sandbox Images ==="
-docker build -f Dockerfile.sandbox -t "$SANDBOX_IMAGE" .
-docker build -f Dockerfile.runtime-sandbox -t "$RUNTIME_IMAGE" .
-
 echo "=== 2. Starting Infrastructure Services (PostgreSQL + Redis + MinIO) ==="
 docker compose up -d postgres redis minio init-db
 
@@ -81,8 +73,6 @@ export S3_ACCESS_KEY="minioadmin"
 export S3_SECRET_KEY="minioadmin"
 export S3_BUCKET="submissions"
 export S3_USE_SSL="false"
-export COMPILE_IMAGE="iicpc-sandbox:v1"
-export RUNTIME_IMAGE="iicpc-runtime-sandbox:v1"
 
 # Process registry for cleanup
 PIDS=()
@@ -100,7 +90,6 @@ mkdir -p bin
 go build -o bin/gateway services/gateway/*.go
 go build -o bin/compiler services/compiler/*.go
 go build -o bin/testing services/testing/*.go
-go build -o bin/leaderboard services/leaderboard/*.go
 
 # Run services
 ./bin/gateway > /tmp/e2e_gateway.log 2>&1 &
@@ -110,9 +99,6 @@ PIDS+=($!)
 PIDS+=($!)
 
 ./bin/testing > /tmp/e2e_testing.log 2>&1 &
-PIDS+=($!)
-
-./bin/leaderboard > /tmp/e2e_leaderboard.log 2>&1 &
 PIDS+=($!)
 
 # Wait for gateway to start

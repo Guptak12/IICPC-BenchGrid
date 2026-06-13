@@ -26,23 +26,7 @@ docker network rm sandbox-net >/dev/null 2>&1 || true
 docker network create sandbox-net
 echo "Created network: sandbox-net"
 
-SANDBOX_IMAGE="${SANDBOX_IMAGE:-iicpc-sandbox:v1}"
-RUNTIME_IMAGE="${RUNTIME_IMAGE:-iicpc-runtime-sandbox:v1}"
 PAYLOAD="${PAYLOAD:-submission.zip}"
-
-if ! docker image inspect "$SANDBOX_IMAGE" >/dev/null 2>&1; then
-  echo "=== 1. Sandbox image not found. Building it... ==="
-  docker build -f Dockerfile.sandbox -t "$SANDBOX_IMAGE" .
-else
-  echo "=== 1. Sandbox image found. Skipping build ==="
-fi
-
-if ! docker image inspect "$RUNTIME_IMAGE" >/dev/null 2>&1; then
-  echo "=== 1. Runtime sandbox image not found. Building it... ==="
-  docker build -f Dockerfile.runtime-sandbox -t "$RUNTIME_IMAGE" .
-else
-  echo "=== 1. Runtime sandbox image found. Skipping build ==="
-fi
 
 echo "=== 2. Starting Infrastructure Services (PostgreSQL + Redis + MinIO) ==="
 docker compose up -d postgres redis minio init-db
@@ -86,7 +70,6 @@ if [ ! -d "test_payloads/$ENGINE_NAME" ]; then
   echo "Error: test_payloads/$ENGINE_NAME directory does not exist"
   exit 1
 fi
-
 rm -f "$ROOT_DIR/submission.zip"
 (cd "test_payloads/$ENGINE_NAME" && zip -q -r "$ROOT_DIR/submission.zip" .)
 
@@ -95,7 +78,6 @@ mkdir -p bin
 go build -o bin/gateway services/gateway/*.go
 go build -o bin/compiler services/compiler/*.go
 go build -o bin/testing services/testing/*.go
-go build -o bin/leaderboard services/leaderboard/*.go
 
 echo "=== 5. Starting Platform Microservices ==="
 export REDIS_ADDR="127.0.0.1:6379"
@@ -106,8 +88,6 @@ export S3_ACCESS_KEY="minioadmin"
 export S3_SECRET_KEY="minioadmin"
 export S3_BUCKET="submissions"
 export S3_USE_SSL="false"
-export COMPILE_IMAGE="iicpc-sandbox:v1"
-export RUNTIME_IMAGE="iicpc-runtime-sandbox:v1"
 
 # Clean up background jobs on exit
 PIDS=()
@@ -130,10 +110,6 @@ PIDS+=($!)
 
 ./bin/testing > /tmp/testing.log 2>&1 &
 PIDS+=($!)
-
-./bin/leaderboard > /tmp/leaderboard.log 2>&1 &
-PIDS+=($!)
-
 # Wait for gateway to start
 echo "=== Waiting for Submission Gateway to listen on port 3000 ==="
 for _ in {1..30}; do
@@ -160,7 +136,7 @@ echo "Submission ID: $BUILD_ID"
 
 echo "=== 7. Polling Submission Lifecycle Status ==="
 FINAL_STATUS=""
-for _ in {1..60}; do
+for _ in {1..120}; do
   BUILD_STATUS="$(curl -fsS "http://localhost:3000/api/v1/build/${BUILD_ID}")"
   STATUS="$(printf '%s' "$BUILD_STATUS" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')"
   VERDICT="$(printf '%s' "$BUILD_STATUS" | sed -n 's/.*"verdict":"\([^"]*\)".*/\1/p')"

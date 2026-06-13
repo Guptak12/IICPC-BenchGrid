@@ -1,23 +1,23 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: pretest-worker
+  name: testing-worker
   namespace: default
   labels:
-    app: pretest-worker
+    app: testing-worker
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: pretest-worker
+      app: testing-worker
   template:
     metadata:
       labels:
-        app: pretest-worker
+        app: testing-worker
     spec:
       containers:
-      - name: pretest
-        image: iicpc-pretest:latest
+      - name: testing
+        image: iicpc-testing:latest
         imagePullPolicy: IfNotPresent
         env:
         - name: REDIS_ADDR
