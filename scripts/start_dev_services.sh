@@ -78,6 +78,7 @@ export SWEEPER_TIMEOUT_MINUTES="30"
 
 # Kill existing background instances of our services to avoid port binding conflicts
 killall gateway compiler pretest 2>/dev/null || true
+sleep 2
 
 ./bin/gateway > /tmp/gateway.log 2>&1 &
 GATEWAY_PID=$!

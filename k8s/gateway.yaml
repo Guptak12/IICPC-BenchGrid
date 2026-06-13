@@ -28,6 +28,8 @@ spec:
           value: "postgres://iicpc:iicpc_secret@postgres:5432/iicpc_db?sslmode=disable"
         - name: LEADERBOARD_JSON_PATH
           value: "/app/data/leaderboard.json"
+        - name: S3_ENDPOINT
+          value: "host.docker.internal:9000"
         volumeMounts:
         - name: public-html
           mountPath: /app/data
@@ -67,3 +69,27 @@ spec:
   selector:
     app: submission-gateway
   type: ClusterIP
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gateway-pod-reader
+  namespace: default
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gateway-pod-reader-binding
+  namespace: default
+subjects:
+- kind: ServiceAccount
+  name: default
+  namespace: default
+roleRef:
+  kind: Role
+  name: gateway-pod-reader
+  apiGroup: rbac.authorization.k8s.io

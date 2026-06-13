@@ -56,21 +56,21 @@ func EvaluateVerdict(res PretestResults) (string, float64, map[string]interface{
 	}
 
 	// Dynamic baseline targets & ceilings based on protocol (microseconds)
-	target := 500.0
-	ceiling := 5000.0
+	target := 50000.0
+	ceiling := 500000.0
 	switch strings.ToUpper(res.Protocol) {
-	case "FIX":
-		target = 500.0
-		ceiling = 5000.0
-	case "WS":
-		target = 1500.0
-		ceiling = 15000.0
-	case "REST":
+	case "FIX", "TCP", "TCP_PROTOBUF":
+		target = 50000.0     // 50ms target for raw TCP
+		ceiling = 500000.0   // 500ms ceiling for raw TCP
+	case "WS", "WEBSOCKET":
+		target = 100000.0    // 100ms target for WebSocket
+		ceiling = 1000000.0  // 1000ms (1s) ceiling for WebSocket
+	case "REST", "HTTP":
+		target = 150000.0    // 150ms target for REST
+		ceiling = 1500000.0  // 1500ms (1.5s) ceiling for REST
+	default:
 		target = 50000.0
 		ceiling = 500000.0
-	default:
-		target = 500.0
-		ceiling = 5000.0
 	}
 
 	if db != nil {

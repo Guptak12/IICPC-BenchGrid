@@ -6,7 +6,7 @@ metadata:
   labels:
     app: compilation-worker
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: compilation-worker
@@ -24,6 +24,8 @@ spec:
           value: "redis:6379"
         - name: DB_ADDR
           value: "postgres://iicpc:iicpc_secret@postgres:5432/iicpc_db?sslmode=disable"
+        - name: S3_ENDPOINT
+          value: "host.docker.internal:9000"
         volumeMounts:
         - name: docker-socket
           mountPath: /var/run/docker.sock

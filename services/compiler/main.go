@@ -149,7 +149,13 @@ func processMessage(ctx context.Context, message redis.XMessage) {
 		log.Printf("Failed to update status to building: %v\n", err)
 	}
 
-	// 2. Perform Docker/Kaniko build
+	// Burn CPU for 30 seconds to simulate build CPU load for HPA testing
+	log.Printf("[submission:%s] Burning CPU for 30 seconds to simulate build CPU load for HPA scaling test...\n", submissionID[:8])
+	burnStart := time.Now()
+	for time.Since(burnStart) < 30*time.Second {
+		// busy loop
+	}
+
 	success, imageTag, stderr, err := BuildImage(ctx, s3Client, s3Path, githubURL, submissionID)
 	if err != nil {
 		log.Printf("[submission:%s] System error during build: %v\n", submissionID[:8], err)

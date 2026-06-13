@@ -206,6 +206,13 @@ func processPretestMessage(ctx context.Context, message redis.XMessage, isSystes
 		log.Printf("Failed to update status to running: %v\n", err)
 	}
 
+	// Burn CPU for 30 seconds to simulate pretest CPU load for HPA testing
+	log.Printf("[submission:%s] Burning CPU for 30 seconds to simulate pretest CPU load for HPA scaling test...\n", submissionID[:8])
+	burnStart := time.Now()
+	for time.Since(burnStart) < 30*time.Second {
+		// busy loop
+	}
+
 	// 2. Run k=1 iteration for post-contest evaluation/testing by default
 	k := 1
 	if val, err := strconv.Atoi(os.Getenv("K_RUNS")); err == nil && val > 0 {
@@ -533,7 +540,11 @@ func startContestantSandbox(ctx context.Context, submissionID string, imageTag s
 		}
 
 		if sandboxNet == "host" {
-			endpoint = "127.0.0.1:8000"
+			hostIP := "127.0.0.1"
+			if os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
+				hostIP = "host.docker.internal"
+			}
+			endpoint = fmt.Sprintf("%s:8000", hostIP)
 			break
 		}
 
@@ -546,7 +557,11 @@ func startContestantSandbox(ctx context.Context, submissionID string, imageTag s
 				if bindings, ok := info.Container.NetworkSettings.Ports[network.MustParsePort(port)]; ok && len(bindings) > 0 {
 					hostPort := bindings[0].HostPort
 					if hostPort != "" {
-						endpoint = fmt.Sprintf("127.0.0.1:%s", hostPort)
+						hostIP := "127.0.0.1"
+						if os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
+							hostIP = "host.docker.internal"
+						}
+						endpoint = fmt.Sprintf("%s:%s", hostIP, hostPort)
 						log.Printf("[debug] Resolved endpoint via mapped host port: %s\n", endpoint)
 						break
 					}

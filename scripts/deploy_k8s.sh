@@ -25,22 +25,18 @@ fi
 
 echo "=== 2. Building Docker Images ==="
 # Setup isolated docker and kubeconfig contexts
+export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
 export DOCKER_HOST="unix:///var/run/docker.sock"
 export HOME="/tmp/empty-home-for-docker"
 mkdir -p "$HOME"
 
-# Build contestant sandbox images
-echo "Building sandbox images..."
-docker build -f Dockerfile.sandbox -t iicpc-sandbox:v1 .
-docker build -f Dockerfile.runtime-sandbox -t iicpc-runtime-sandbox:v1 .
-
 # Build microservices
-SERVICES=("gateway" "compiler" "pretest" "leaderboard")
+SERVICES=("gateway" "compiler" "pretest")
 
 echo "Compiling microservices on host..."
 mkdir -p bin
 for svc in "${SERVICES[@]}"; do
-  CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o bin/${svc} services/${svc}/*.go
+  CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o bin/${svc} ./services/${svc}
 done
 
 for svc in "${SERVICES[@]}"; do
@@ -51,8 +47,6 @@ done
 echo "=== 3. Loading Images into Kubernetes Cluster ==="
 if [ "$PROVIDER" = "kind" ]; then
   echo "Loading images into Kind cluster '$CLUSTER_NAME'..."
-  kind load docker-image iicpc-sandbox:v1 --name "$CLUSTER_NAME"
-  kind load docker-image iicpc-runtime-sandbox:v1 --name "$CLUSTER_NAME"
   for svc in "${SERVICES[@]}"; do
     kind load docker-image "iicpc-${svc}:latest" --name "$CLUSTER_NAME"
   done
@@ -64,8 +58,6 @@ if [ "$PROVIDER" = "kind" ]; then
   fi
 elif [ "$PROVIDER" = "minikube" ]; then
   echo "Loading images into Minikube..."
-  minikube image load iicpc-sandbox:v1
-  minikube image load iicpc-runtime-sandbox:v1
   for svc in "${SERVICES[@]}"; do
     minikube image load "iicpc-${svc}:latest"
   done
@@ -96,13 +88,18 @@ kubectl wait --for=condition=complete --timeout=60s job/iicpc-migration-job
 echo "=== 7. Deploying Microservice Workers and Gateway ==="
 kubectl apply -f k8s/sandbox-networkpolicy.yaml
 kubectl apply -f k8s/compiler.yaml
-kubectl apply -f k8s/pretest.yaml
-kubectl apply -f k8s/leaderboard.yaml
+if [ "${HYBRID:-}" = "true" ]; then
+  echo "Hybrid mode: Skipping pretest worker deployment in cluster."
+else
+  kubectl apply -f k8s/pretest.yaml
+fi
 kubectl apply -f k8s/gateway.yaml
 
 echo "=== 8. Deploying Horizontal Pod Autoscalers (HPAs) ==="
 kubectl apply -f k8s/hpa/compiler-hpa.yaml
-kubectl apply -f k8s/hpa/pretest-hpa.yaml
+if [ "${HYBRID:-}" != "true" ]; then
+  kubectl apply -f k8s/hpa/pretest-hpa.yaml
+fi
 
 echo "=== 9. Deployment Complete! Checking Status ==="
 kubectl get pods -o wide

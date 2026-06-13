@@ -7,7 +7,6 @@ const dashboardHTML = `<!DOCTYPE html>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>IICPC Benchmarking - Developer Diagnostics Dashboard</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         :root {
             --bg-color: #0d1117;
@@ -576,57 +575,45 @@ const dashboardHTML = `<!DOCTYPE html>
         </div>
     </div>
 
-    <!-- Charts Grid -->
-    <div class="dashboard-grid">
-        <div class="card">
-            <div class="card-header">
-                <div class="card-title">
-                    <i class="fa-solid fa-arrow-trend-up" style="color: var(--accent-cyan);"></i>
-                    <span>HTTP Request Rate</span>
-                </div>
-                <span style="font-size: 11px; color: var(--text-muted);">reqs/sec</span>
+    <!-- Kubernetes Pod Status Grid -->
+    <div class="card" style="margin-bottom: 20px;">
+        <div class="card-header">
+            <div class="card-title">
+                <i class="fa-solid fa-cubes" style="color: var(--accent-cyan);"></i>
+                <span>Kubernetes Cluster Pods Status</span>
             </div>
-            <div class="chart-container">
-                <canvas id="httpRateChart"></canvas>
-            </div>
+            <span id="cluster-mode-badge" class="badge" style="background-color: rgba(0, 245, 255, 0.15); color: var(--accent-cyan);">K8s In-Cluster Mode</span>
         </div>
-
-        <div class="card">
-            <div class="card-header">
-                <div class="card-title">
-                    <i class="fa-solid fa-chart-line" style="color: var(--accent-violet);"></i>
-                    <span>DB Query Rate</span>
-                </div>
-                <span style="font-size: 11px; color: var(--text-muted);">queries/sec</span>
+        <div class="k8s-pod-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 20px; padding: 10px 0;">
+            <div class="k8s-pod-card" style="background: rgba(255, 255, 255, 0.02); border: 1px solid var(--border-color); border-radius: 8px; padding: 15px; text-align: center; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;">
+                <i class="fa-solid fa-network-wired" style="font-size: 24px; color: var(--accent-cyan);"></i>
+                <span style="font-size: 11px; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.5px;">Gateway Pods</span>
+                <span id="pod-count-gateway" style="font-size: 32px; font-weight: 700; color: #ffffff;">0</span>
             </div>
-            <div class="chart-container">
-                <canvas id="dbQueryChart"></canvas>
+            <div class="k8s-pod-card" style="background: rgba(255, 255, 255, 0.02); border: 1px solid var(--border-color); border-radius: 8px; padding: 15px; text-align: center; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;">
+                <i class="fa-solid fa-gears" style="font-size: 24px; color: var(--accent-amber);"></i>
+                <span style="font-size: 11px; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.5px;">Compiler Pods</span>
+                <span id="pod-count-compiler" style="font-size: 32px; font-weight: 700; color: #ffffff;">0</span>
             </div>
-        </div>
-
-        <div class="card">
-            <div class="card-header">
-                <div class="card-title">
-                    <i class="fa-solid fa-wave-square" style="color: var(--accent-cyan);"></i>
-                    <span>Processing p95 Duration</span>
-                </div>
-                <span style="font-size: 11px; color: var(--text-muted);">seconds</span>
+            <div class="k8s-pod-card" style="background: rgba(255, 255, 255, 0.02); border: 1px solid var(--border-color); border-radius: 8px; padding: 15px; text-align: center; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;">
+                <i class="fa-solid fa-vial-virus" style="font-size: 24px; color: var(--accent-violet);"></i>
+                <span style="font-size: 11px; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.5px;">Pretest Pods</span>
+                <span id="pod-count-pretest" style="font-size: 32px; font-weight: 700; color: #ffffff;">0</span>
             </div>
-            <div class="chart-container">
-                <canvas id="p95DurationChart"></canvas>
+            <div class="k8s-pod-card" style="background: rgba(255, 255, 255, 0.02); border: 1px solid var(--border-color); border-radius: 8px; padding: 15px; text-align: center; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;">
+                <i class="fa-solid fa-database" style="font-size: 24px; color: var(--accent-green);"></i>
+                <span style="font-size: 11px; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.5px;">Postgres Pods</span>
+                <span id="pod-count-postgres" style="font-size: 32px; font-weight: 700; color: #ffffff;">0</span>
             </div>
-        </div>
-
-        <div class="card">
-            <div class="card-header">
-                <div class="card-title">
-                    <i class="fa-solid fa-circle-check"></i>
-                    <span>Postgres Exporter Status</span>
-                </div>
+            <div class="k8s-pod-card" style="background: rgba(255, 255, 255, 0.02); border: 1px solid var(--border-color); border-radius: 8px; padding: 15px; text-align: center; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;">
+                <i class="fa-solid fa-memory" style="font-size: 24px; color: var(--accent-red);"></i>
+                <span style="font-size: 11px; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.5px;">Redis Broker</span>
+                <span id="pod-count-redis" style="font-size: 32px; font-weight: 700; color: #ffffff;">0</span>
             </div>
-            <div class="stat-panel-content">
-                <div class="stat-huge" id="stat-exporter-up">1</div>
-                <div class="stat-label">Exporter Up</div>
+            <div class="k8s-pod-card" style="background: linear-gradient(135deg, rgba(0, 245, 255, 0.05), rgba(138, 43, 226, 0.05)); border: 1px solid rgba(0, 245, 255, 0.2); border-radius: 8px; padding: 15px; text-align: center; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;">
+                <i class="fa-solid fa-cube" style="font-size: 24px; color: #ffffff; text-shadow: 0 0 10px rgba(255, 255, 255, 0.5);"></i>
+                <span style="font-size: 11px; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.5px;">Total Pods</span>
+                <span id="pod-count-total" style="font-size: 32px; font-weight: 700; color: #00f5ff; text-shadow: 0 0 10px var(--glow-cyan);">0</span>
             </div>
         </div>
     </div>
@@ -748,73 +735,7 @@ const dashboardHTML = `<!DOCTYPE html>
     </div>
 
     <script>
-        // Set up Chart.js Charts
-        const chartOptions = {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: { legend: { display: false } },
-            scales: {
-                x: {
-                    grid: { color: 'rgba(255, 255, 255, 0.05)' },
-                    ticks: { color: '#8b949e', font: { size: 10 } }
-                },
-                y: {
-                    grid: { color: 'rgba(255, 255, 255, 0.05)' },
-                    ticks: { color: '#8b949e', font: { size: 10 } }
-                }
-            }
-        };
 
-        const httpCtx = document.getElementById('httpRateChart').getContext('2d');
-        const httpRateChart = new Chart(httpCtx, {
-            type: 'line',
-            data: {
-                labels: Array(10).fill(''),
-                datasets: [{
-                    data: Array(10).fill(0),
-                    borderColor: '#00f5ff',
-                    backgroundColor: 'rgba(0, 245, 255, 0.05)',
-                    borderWidth: 2,
-                    tension: 0.3,
-                    fill: true
-                }]
-            },
-            options: chartOptions
-        });
-
-        const dbCtx = document.getElementById('dbQueryChart').getContext('2d');
-        const dbQueryChart = new Chart(dbCtx, {
-            type: 'line',
-            data: {
-                labels: Array(10).fill(''),
-                datasets: [{
-                    data: Array(10).fill(0),
-                    borderColor: '#8a2be2',
-                    backgroundColor: 'rgba(138, 43, 226, 0.05)',
-                    borderWidth: 2,
-                    tension: 0.3,
-                    fill: true
-                }]
-            },
-            options: chartOptions
-        });
-
-        const p95Ctx = document.getElementById('p95DurationChart').getContext('2d');
-        const p95DurationChart = new Chart(p95Ctx, {
-            type: 'line',
-            data: {
-                labels: Array(10).fill(''),
-                datasets: [{
-                    data: Array(10).fill(0),
-                    borderColor: '#ffb000',
-                    backgroundColor: 'rgba(255, 176, 0, 0.05)',
-                    borderWidth: 2,
-                    tension: 0.3,
-                    fill: true
-                }]
-            },
-            options: chartOptions
-        });
 
         // Initialize Console Logger
         function addLog(message, level) {
@@ -875,51 +796,42 @@ const dashboardHTML = `<!DOCTYPE html>
                 document.getElementById('kpi-compile-queue').textContent = data.compilation_queue_depth;
                 document.getElementById('kpi-pretest-queue').textContent = data.pretest_queue_depth;
                 document.getElementById('kpi-max-score').textContent = data.max_composite_score.toFixed(2);
-                document.getElementById('stat-exporter-up').textContent = data.db_healthy ? "1" : "0";
 
-                // Toggle Mock buttons state based on active runs count
-                const pretestBtn = document.getElementById('btn-mock-pretest');
-                const systestBtn = document.getElementById('btn-mock-systest');
-                if (pretestBtn && systestBtn) {
-                    const disabled = data.active_submissions > 0;
-                    pretestBtn.disabled = disabled;
-                    systestBtn.disabled = disabled;
-                    if (disabled) {
-                        pretestBtn.style.opacity = '0.5';
-                        pretestBtn.style.cursor = 'not-allowed';
-                        systestBtn.style.opacity = '0.5';
-                        systestBtn.style.cursor = 'not-allowed';
+                // Update Kubernetes Pod status metrics
+                if (data.k8s_status) {
+                    const k8s = data.k8s_status;
+                    document.getElementById('pod-count-gateway').textContent = k8s.gateway_pods;
+                    document.getElementById('pod-count-compiler').textContent = k8s.compiler_pods;
+                    document.getElementById('pod-count-pretest').textContent = k8s.pretest_pods > 0 ? k8s.pretest_pods : "0 (Host)";
+                    document.getElementById('pod-count-postgres').textContent = k8s.postgres_pods;
+                    document.getElementById('pod-count-redis').textContent = k8s.redis_pods;
+                    document.getElementById('pod-count-total').textContent = k8s.total_pods;
+
+                    const badge = document.getElementById('cluster-mode-badge');
+                    if (k8s.is_cluster_mode) {
+                        badge.textContent = "K8s In-Cluster Mode";
+                        badge.style.backgroundColor = "rgba(0, 245, 255, 0.15)";
+                        badge.style.color = "var(--accent-cyan)";
                     } else {
-                        pretestBtn.style.opacity = '1.0';
-                        pretestBtn.style.cursor = 'pointer';
-                        systestBtn.style.opacity = '1.0';
-                        systestBtn.style.cursor = 'pointer';
+                        badge.textContent = "Local Hybrid Mode";
+                        badge.style.backgroundColor = "rgba(138, 43, 226, 0.15)";
+                        badge.style.color = "var(--accent-violet)";
                     }
                 }
 
-                // Update Charts
-                const nowStr = new Date().toTimeString().split(' ')[0].substring(3); // mm:ss
-                
-                // HTTP Rate Chart
-                httpRateChart.data.labels.push(nowStr);
-                httpRateChart.data.labels.shift();
-                httpRateChart.data.datasets[0].data.push(data.http_rate);
-                httpRateChart.data.datasets[0].data.shift();
-                httpRateChart.update();
+                // Toggle Mock buttons state based on active runs count - Always enabled for concurrency testing
+                const pretestBtn = document.getElementById('btn-mock-pretest');
+                const systestBtn = document.getElementById('btn-mock-systest');
+                if (pretestBtn && systestBtn) {
+                    pretestBtn.disabled = false;
+                    systestBtn.disabled = false;
+                    pretestBtn.style.opacity = '1.0';
+                    pretestBtn.style.cursor = 'pointer';
+                    systestBtn.style.opacity = '1.0';
+                    systestBtn.style.cursor = 'pointer';
+                }
 
-                // DB Query Rate Chart
-                dbQueryChart.data.labels.push(nowStr);
-                dbQueryChart.data.labels.shift();
-                dbQueryChart.data.datasets[0].data.push(data.db_query_rate);
-                dbQueryChart.data.datasets[0].data.shift();
-                dbQueryChart.update();
 
-                // P95 Duration Chart
-                p95DurationChart.data.labels.push(nowStr);
-                p95DurationChart.data.labels.shift();
-                p95DurationChart.data.datasets[0].data.push(data.p95_duration);
-                p95DurationChart.data.datasets[0].data.shift();
-                p95DurationChart.update();
 
                 // Check for new console logs by looking at state differences
                 if (cachedSubmissions.length !== data.recent_submissions.length) {

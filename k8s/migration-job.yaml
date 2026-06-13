@@ -8,14 +8,15 @@ spec:
     spec:
       containers:
       - name: migration
-        image: ghcr.io/pressly/goose:v3.20.0
+        image: iicpc-init-db:latest
         imagePullPolicy: IfNotPresent
         command:
-        - sh
-        - -c
-        - |
-          echo "Running Goose migrations..."
-          goose -dir /migrations postgres "$DB_ADDR" up
+        - /usr/local/bin/goose
+        - -dir
+        - /migrations
+        - postgres
+        - $(DB_ADDR)
+        - up
         env:
         - name: DB_ADDR
           value: "postgres://iicpc:iicpc_secret@postgres:5432/iicpc_db?sslmode=disable"

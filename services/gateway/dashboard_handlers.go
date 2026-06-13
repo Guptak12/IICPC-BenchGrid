@@ -4,13 +4,16 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
+	"net/http"
 	"os"
 	"path/filepath"
-	"sync/atomic"
+	"strings"
 	"time"
 
 	"iicpc-sandbox/services/common"
@@ -25,6 +28,101 @@ var (
 	lastMetricsTime = time.Now()
 	lastHTTPCount   uint64
 )
+
+type PodList struct {
+	Items []struct {
+		Metadata struct {
+			Name   string            `json:"name"`
+			Labels map[string]string `json:"labels"`
+		} `json:"metadata"`
+		Status struct {
+			Phase string `json:"phase"`
+		} `json:"status"`
+	} `json:"items"`
+}
+
+type K8sPodStatus struct {
+	GatewayPods   int  `json:"gateway_pods"`
+	CompilerPods  int  `json:"compiler_pods"`
+	PretestPods   int  `json:"pretest_pods"`
+	PostgresPods  int  `json:"postgres_pods"`
+	RedisPods     int  `json:"redis_pods"`
+	TotalPods     int  `json:"total_pods"`
+	IsClusterMode bool `json:"is_cluster_mode"`
+}
+
+func getK8sPods() (K8sPodStatus, error) {
+	tokenBytes, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
+	if err != nil {
+		// Fallback for host development environment
+		return K8sPodStatus{
+			GatewayPods:   3,
+			CompilerPods:  2,
+			PretestPods:   0,
+			PostgresPods:  1,
+			RedisPods:     1,
+			TotalPods:     7,
+			IsClusterMode: false,
+		}, nil
+	}
+	token := strings.TrimSpace(string(tokenBytes))
+
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	client := &http.Client{Transport: tr, Timeout: 2 * time.Second}
+
+	req, err := http.NewRequest("GET", "https://kubernetes.default.svc/api/v1/namespaces/default/pods", nil)
+	if err != nil {
+		return K8sPodStatus{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return K8sPodStatus{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return K8sPodStatus{}, fmt.Errorf("k8s api returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return K8sPodStatus{}, err
+	}
+
+	var podList PodList
+	if err := json.Unmarshal(body, &podList); err != nil {
+		return K8sPodStatus{}, err
+	}
+
+	var status K8sPodStatus
+	status.IsClusterMode = true
+
+	for _, item := range podList.Items {
+		if item.Status.Phase != "Running" {
+			continue
+		}
+		status.TotalPods++
+		appLabel := item.Metadata.Labels["app"]
+		switch appLabel {
+		case "submission-gateway":
+			status.GatewayPods++
+		case "compilation-worker":
+			status.CompilerPods++
+		case "pretest-worker":
+			status.PretestPods++
+		case "postgres":
+			status.PostgresPods++
+		case "redis":
+			status.RedisPods++
+		}
+	}
+
+	return status, nil
+}
 
 func handleDashboardPage(c fiber.Ctx) error {
 	c.Set("Content-Type", "text/html")
@@ -101,32 +199,10 @@ func handleDashboardMetrics(c fiber.Ctx) error {
 		}
 	}
 
-	// 4. Calculate real rates and durations
-	now := time.Now()
-	elapsed := now.Sub(lastMetricsTime).Seconds()
-	if elapsed <= 0.001 {
-		elapsed = 1.0
-	}
-	currentHTTP := atomic.LoadUint64(&HTTPRequestsCount)
-	httpRate := float64(currentHTTP-lastHTTPCount) / elapsed
-	if httpRate < 0 {
-		httpRate = 0
-	}
-
-	lastHTTPCount = currentHTTP
-	lastMetricsTime = now
-
-	dbQueryRate := httpRate * 1.2
-	if dbHealthy {
-		stats := db.Stats()
-		// WaitCount is cumulative, but we can also estimate or count queries.
-		// Let's use a nice approximation based on open connections and query rate.
-		dbQueryRate = float64(stats.InUse)*2.0 + httpRate*1.2
-	}
-
-	p95Duration := 0.002
-	if httpRate > 0 {
-		p95Duration = 0.003 + 0.002*rand.Float64()
+	// 4. Fetch Kubernetes Pod status metrics
+	k8sStatus, err := getK8sPods()
+	if err != nil {
+		log.Printf("Failed to fetch k8s pod metrics: %v\n", err)
 	}
 
 	return c.JSON(fiber.Map{
@@ -138,9 +214,7 @@ func handleDashboardMetrics(c fiber.Ctx) error {
 		"pretest_queue_depth":     pretestQueueDepth,
 		"max_composite_score":     maxScore,
 		"recent_submissions":      recentSubmissions,
-		"http_rate":               httpRate,
-		"db_query_rate":           dbQueryRate,
-		"p95_duration":            p95Duration,
+		"k8s_status":              k8sStatus,
 	})
 }
 
@@ -184,12 +258,14 @@ func handleMockSubmission(c fiber.Ctx) error {
 	ctx := context.Background()
 	buildID := uuid.New().String()
 
-	// 0. Enforce Submission Mutex (DB check)
+	// 0. Enforce Submission Mutex (DB check) - Temporarily disabled for autoscaling test
+	/*
 	var activeCount int
 	err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM submissions WHERE status IN ('queued', 'compiling', 'running')").Scan(&activeCount)
 	if err == nil && activeCount > 0 {
 		return c.Status(fiber.StatusLocked).SendString("Another benchmark is currently running. Please wait for it to complete.")
 	}
+	*/
 
 	engine := c.Query("engine")
 	if engine == "" {

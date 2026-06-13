@@ -1,32 +1,36 @@
 # IICPC Matching Engine Protocol Specification
 
-Under the "Bring Your Own Server" (BYOS) architecture, contestants submit a containerized server (e.g. via a Git URL or a ZIP archive containing a `Dockerfile`) that listens on **Port 8000** for raw TCP connections.
+Under the "Bring Your Own Server" (BYOS) architecture, contestants submit a containerized server (e.g. via a Git URL or a ZIP archive containing a `Dockerfile`) that listens on **Port 8000** for incoming connections from the platform's Bot Fleet.
 
-## Raw TCP Socket Contract
+The platform automatically detects the desired integration protocol by inspecting the container's environment variables. Specifically, the container's `Dockerfile` should set:
+`ENV ENGINE_PROTOCOL=<PROTOCOL_NAME>`
 
-- **Port**: `8000` (Contestants must expose and listen on TCP port 8000)
-- **Protocol**: Raw TCP
-- **Framing**: **4-byte Little-Endian unsigned integer length prefix** followed by the binary Protocol Buffers (protobuf) payload.
-
-Each message sent from the Bot Fleet to the contestant server, or from the contestant server to the Bot Fleet, must be formatted with this length-prefixed framing:
-
-```
-+---------------------------+-----------------------------------+
-| Length Prefix (4 bytes)   | Protobuf Binary Payload (N bytes) |
-| Little-Endian uint32      | (Order or ExecutionReport)        |
-+---------------------------+-----------------------------------+
-```
+Supported protocols are:
+1. `TCP_PROTOBUF` (Default, if environment variable is not specified)
+2. `WS` (WebSocket)
+3. `REST` (HTTP REST API + Server-Sent Events)
+4. `FIX` (FIX 4.4 protocol)
 
 ---
 
-## Protocol Buffer Schemas
+## 1. TCP_PROTOBUF (Raw TCP & Protocol Buffers)
 
-Contestants should use the following `.proto` schema definitions to compile their serializer/deserializer code.
+- **Endpoint**: `tcp://0.0.0.0:8000`
+- **Framing**: **4-byte Little-Endian unsigned integer length prefix** followed by the binary Protocol Buffers (protobuf) payload.
+  
+  ```
+  +---------------------------+-----------------------------------+
+  | Length Prefix (4 bytes)   | Protobuf Binary Payload (N bytes) |
+  | Little-Endian uint32      | (Order or ExecutionReport)        |
+  +---------------------------+-----------------------------------+
+  ```
 
-### Order (Platform → Contestant)
-Sent by the Bot Fleet to place or cancel orders:
+### Protobuf Schemas
 
+#### Order (Platform → Contestant)
 ```protobuf
+syntax = "proto3";
+
 enum OrderType {
     LIMIT = 0;
     MARKET = 1;
@@ -48,10 +52,10 @@ message Order {
 }
 ```
 
-### Execution Report (Contestant → Platform)
-Sent by the contestant's matching engine to report state updates or matching events:
-
+#### Execution Report (Contestant → Platform)
 ```protobuf
+syntax = "proto3";
+
 enum ExecutionStatus {
     ACCEPTED = 0;
     FILLED = 1;
@@ -73,20 +77,133 @@ message ExecutionReport {
 
 ---
 
+## 2. WS (WebSocket)
+
+- **Endpoint**: `ws://0.0.0.0:8000/` (The platform connects to the root URL)
+- **Framing**: JSON Text Messages
+
+### Messages
+
+#### Order JSON (Platform → Contestant)
+Sent as a WebSocket text message:
+```json
+{
+  "bot_id": 1,
+  "order_id": 10001,
+  "type": "LIMIT",      // "LIMIT", "MARKET", "CANCEL"
+  "side": "BUY",        // "BUY", "SELL"
+  "price": 10050,       // Scaled by 100
+  "quantity": 500       // Scaled by 100
+}
+```
+
+#### Execution Report JSON (Contestant → Platform)
+Sent as a WebSocket text message back to the client connection:
+```json
+{
+  "order_id": 10001,
+  "status": "ACCEPTED", // "ACCEPTED", "FILLED", "PARTIAL", "REJECTED", "CANCELLED"
+  "filled_qty": 0,      // Scaled by 100
+  "filled_price": 0,    // Scaled by 100
+  "engine_seq_id": 1,   // Monotonically increasing sequence ID
+  "processing_ns": 150, // Latency in nanoseconds
+  "matched_with": 0     // Counterparty order ID
+}
+```
+
+---
+
+## 3. REST (HTTP REST & Server-Sent Events)
+
+- **Endpoint**: `http://0.0.0.0:8000`
+- **Order Submission**: `POST /api/v1/orders`
+- **Execution Stream**: `GET /api/v1/events` (Server-Sent Events)
+
+### Order Submission (`POST /api/v1/orders`)
+- **Headers**: `Content-Type: application/json`
+- **Body**: JSON representation of the Order (identical to WebSocket Order JSON format):
+```json
+{
+  "bot_id": 1,
+  "order_id": 10002,
+  "type": "LIMIT",
+  "side": "BUY",
+  "price": 10100,
+  "quantity": 1000
+}
+```
+- **Response**: `200 OK` or `202 Accepted`
+
+### Execution Stream (`GET /api/v1/events`)
+- **Headers**:
+  - `Content-Type: text/event-stream`
+  - `Cache-Control: no-cache`
+  - `Connection: keep-alive`
+- **Format**: Server-Sent Events containing data lines in JSON format (identical to WebSocket Execution JSON format):
+```
+data: {"order_id": 10002, "status": "ACCEPTED", "filled_qty": 0, "filled_price": 0, "engine_seq_id": 1, "processing_ns": 200, "matched_with": 0}
+
+data: {"order_id": 10002, "status": "FILLED", "filled_qty": 1000, "filled_price": 10100, "engine_seq_id": 2, "processing_ns": 320, "matched_with": 9999}
+```
+
+---
+
+## 4. FIX (Financial Information eXchange)
+
+- **Endpoint**: `tcp://0.0.0.0:8000` (Raw TCP)
+- **Protocol version**: `FIX.4.4` (standard header/trailer checks)
+
+### Message Types
+
+| MsgType (Tag 35) | Description | Sender |
+|---|---|---|
+| `A` | Logon | Bot &rarr; Engine / Engine &rarr; Bot |
+| `D` | New Order Single | Bot &rarr; Engine |
+| `F` | Order Cancel Request | Bot &rarr; Engine |
+| `8` | Execution Report | Engine &rarr; Bot |
+
+### Fields Mapping
+
+#### Logon (`35=A`)
+Sent by the Bot to initiate connection; the Engine must respond with a similar Logon.
+- `8`: `FIX.4.4` (BeginString)
+- `9`: BodyLength
+- `35`: `A` (MsgType)
+- `49`: SenderCompID (e.g. `BOT-1`)
+- `56`: TargetCompID (`CONTESTANT`)
+- `34`: MsgSeqNum
+- `98`: `0` (EncryptMethod)
+- `108`: `30` (HeartBtInt)
+- `10`: Checksum
+
+#### New Order Single (`35=D`)
+- `11`: ClOrdID (Order ID)
+- `54`: Side (`1` = Buy, `2` = Sell)
+- `38`: OrderQty (quantity, scaled by 100)
+- `44`: Price (scaled by 100)
+- `40`: OrdType (`2` = Limit, `1` = Market)
+- `55`: Symbol (`BTCUSD`)
+- `1`: Account (Bot ID)
+
+#### Order Cancel Request (`35=F`)
+- `11`: ClOrdID (unique cancel ID)
+- `41`: OrigClOrdID (Order ID to cancel)
+
+#### Execution Report (`35=8`)
+- `11`: ClOrdID (Order ID)
+- `39`: OrdStatus (`0` = New/Accepted, `1` = Partially Filled, `2` = Filled, `4` = Cancelled, `8` = Rejected)
+- `32`: LastQty (`filled_qty`) or `38` (`quantity`)
+- `31`: LastPx (`filled_price`) or `44` (`price`)
+- `17`: ExecID (Engine Sequence ID) or `34` (MsgSeqNum)
+- `9000`: ProcessingLatency (Latency in nanoseconds)
+- `9001`: MatchedOrderID (Counterparty order ID)
+
+---
+
 ## Important Rules & Constraints
 
 1. **Strict Port Contract**: Contestant containers **must** bind and listen on `0.0.0.0:8000` to be reachable by the platform.
 2. **Concurrency**: The server **must** support concurrent connections as multiple bots in the fleet will connect and dispatch orders simultaneously.
 3. **Self-Crossing Policy**: The platform validator enforces wash trade prevention. An order will not match against another resting order from the same bot. If a buy and sell from the same bot would cross, the engine skips the crossing order. The platform validator checks this based on the `matched_with` field.
-4. **Order ID Mapping**: You must echo back the exact `order_id` in your `ExecutionReport`.
+4. **Order ID Mapping**: You must echo back the exact `order_id` / `ClOrdID` in your execution reports.
 5. **Execution Order**: Every order must receive an immediate `ACCEPTED` or `REJECTED` report. Fill reports (`FILLED` or `PARTIAL`) may follow asynchronously.
-
----
-
-## Submission & Reliability Warning
-
-> [!WARNING]
-> **GitHub API Rate Limiting Policies**:
-> During peak submission periods right before the deadline, heavy parallel git cloning of public GitHub repositories may trigger rate-limiting errors or clone blocks from GitHub's servers.
-> 
-> To guarantee a successful evaluation run under strict deadline pressure, contestants are **strongly encouraged to upload a standalone ZIP archive** containing their source files and a `Dockerfile` rather than depending on external GitHub URL repository checkouts.

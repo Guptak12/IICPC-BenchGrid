@@ -202,23 +202,25 @@ While optimizing the engine correctness, we evaluated several technical tradeoff
 
 ## 8. Phase 9: Real-Time Developer Diagnostics Dashboard
 
-We have implemented an interactive, single-page **Developer Diagnostics Dashboard** served directly from the Submission Gateway (`http://localhost:3000/dashboard`).
+We have implemented an interactive, single-page **Developer Diagnostics Dashboard** served directly from the Submission Gateway (`http://localhost:3002/dashboard`).
 
 ### Key Capabilities Built:
 1. **Interactive Controls**: Features a "Developer Deck" that lets developers trigger programmatically generated C++ mock submissions directly into the compilation/pretest pipeline to watch logs and metrics in real-time, or cleanly reset/prune the environment data.
 2. **Glassmorphism Theme**: Curated a rich dark-mode HSL color palette with glowing borders, translucent backdrop-filters, custom scrollbars, and dynamic state-changing LED health indicators for database and broker endpoints.
-3. **Telemetry Charts**: Integrated Chart.js to render real-time time-series metrics including HTTP Request Rate, DB Query Rate, Processing p95 Duration, and Postgres Exporter status.
+3. **Kubernetes Cluster Pods Status**: Removed client-side Charts and Exporter widgets to focus on real-time Kubernetes cluster statistics. Integrates direct namespace-scoped queries to the Kubernetes API server using the gateway pod service account to list and display replica status counters:
+   - **Gateway Pods** (active replicas)
+   - **Compiler Pods** (active replicas)
+   - **Pretest Pods** (active replicas/local hybrid status)
+   - **Postgres Pods**
+   - **Redis Broker Pods**
+   - **Total Namespace Pods**
 4. **Submissions Table & Live Console**: Features a monospace running event console logging system activity, and a submissions table with colored status badges. Clicking any submission opens a details drawer sliding in from the right to show the raw formatted telemetry JSON and C++ source code.
 
 ### Visual Walkthrough & Telemetry Recording
 
-Here is the recorded video demonstrating the live diagnostics dashboard layout, metrics updates, telemetry drawer inspection, and mock submission trigger operations:
+Here is the screenshot of the upgraded Developer Diagnostics Console displaying the live Kubernetes cluster pod stats:
 
-![Developer Dashboard Recording](/home/stackedshadow/.gemini/antigravity/brain/1fa29fa1-82fb-432d-8fe8-933225f6ef25/developer_dashboard_demo_1780463248995.webp)
-
-Here is a screenshot of the completed mock submission state on the diagnostics console:
-
-![Developer Dashboard Interface](/home/stackedshadow/.gemini/antigravity/brain/1fa29fa1-82fb-432d-8fe8-933225f6ef25/developer_dashboard.png)
+![Developer Dashboard K8s Pods](/Users/destructor/.gemini/antigravity-ide/brain/75393f60-58c8-4dc1-8840-d49bebac818d/dashboard_k8s_pods_1781346285493.png)
 
 ---
 
@@ -344,3 +346,55 @@ We resolved the latency benchmarking startup lag and fixed the correctness misma
 - **Node Scammer Engine**: Running `./scripts/local_smoke.sh node_scammer` verified the correctness pipeline. The platform successfully caught priority violations, resulting in a low correctness score of ~9.3% and a verdict of `Logic Violation (LV)`.
 - **Go E2E Suite**: Running `./scripts/run_e2e_tests.sh` successfully passed all DB consistency, static leaderboard, and database cleanup tests.
 - **Development Environment**: Persistent developer microservices were successfully restarted using `scripts/start_dev_services.sh` to allow real-time dashboard testing.
+
+---
+
+## 14. Phase 10: 50K-Scale Overhaul & Prometheus/Grafana Observability
+
+We completed a comprehensive scalability and observability overhaul to support 50,000+ total submissions and handle massive transaction-per-second loads reliably.
+
+### Key Enhancements:
+1. **Shared Prometheus Telemetry Registry**:
+   - Implemented a unified Prometheus registry in `services/common/metrics.go` defining 14 distinct system, DB, queue, and bot fleet gauges/counters.
+   - Configured dedicated metrics scrapers: Gateway on `:9090`, Compiler on `:9091`, and Pretest on `:9092`.
+
+2. **Parallel K=3 Evaluation Performance**:
+   - Re-engineered the Pretest worker's main loop to execute the K=3 evaluation runs in parallel using `golang.org/x/sync/errgroup`.
+   - Spins up dynamically-tagged contestant container sandboxes simultaneously (`contestant-<subID>-run-0/1/2`), improving pretest evaluation throughput by 3x.
+
+3. **High-Performance Database Pool Limits**:
+   - Added `common.ConfigureDBPool(db)` to enforce production-safe connection pooling configurations across the Gateway, Compiler, and Pretest services (max 25 open, 10 idle connections, with lifetime caps).
+
+4. **Database Index Optimizations**:
+   - Created database index migration `migrations/00006_leaderboard_index.sql` to optimize high-scale dashboard query performance.
+
+5. **Integrated Prometheus + Grafana Orchestration**:
+   - Created `monitoring/prometheus.yml` and structured automatic datasource/dashboard provisioning config files under `monitoring/grafana/`.
+   - Created a customized premium JSON dashboard (`monitoring/grafana/dashboards/iicpc-overview.json`) displaying active jobs, queue depths, database pool status, HTTP requests, and bot fleet metrics.
+    - Added Grafana and Prometheus services to `docker-compose.yml` and verified their health during `./scripts/start_dev_services.sh` startup.
+    - Embedded direct navigation links to Grafana (`http://localhost:3001`) and Prometheus (`http://localhost:9090`) directly into the Developer Diagnostics Dashboard header.
+
+
+---
+
+## 15. Phase 11: Multi-Protocol (WebSocket, REST/SSE, FIX) Mock Engines & Documentation
+
+We integrated three new matching engine protocols: **WebSocket (WS)**, **HTTP REST + Server-Sent Events (REST)**, and **FIX 4.4 (FIX)**, and fully documented them.
+
+### Key Enhancements:
+1. **Multi-Protocol Mock Matching Engines (`test_payloads/`)**:
+   - `go_ws`: Upgrades connections to WebSockets at the root path, processes incoming JSON order requests, executes identical FIFO price-time priority matching rules, and writes JSON execution reports back to the connection.
+   - `go_rest`: Listens for REST requests (`POST /api/v1/orders`) and broadcasts execution reports over SSE (`GET /api/v1/events`). Implemented an explicit header flush immediately upon connection to prevent client socket blocks.
+   - `go_fix`: Handshakes using the standard FIX 4.4 logon sequence (`35=A`), decodes New Order Single (`35=D`) and Order Cancel (`35=F`) messages, and responds with Execution Reports (`35=8`) mapping latencies to custom tag `9000` and matches to custom tag `9001`.
+2. **Pretest Adapter Filtering (`services/pretest/runner.go`)**:
+   - Re-engineered the `RESTAdapter` to only forward execution reports to the pretest validator channel when `isOwn == true`. This aligns with other single-channel socket protocols and avoids logic violations caused by duplicating events across 20 concurrent bot threads.
+3. **Developer Deck Dropdown Integration**:
+   - Allowed the three new mock engines in the gateway validation list (`dashboard_handlers.go`).
+   - Added option tags to `#mock-engine-select` in the developer dashboard (`dashboard.go`) so developers can trigger WS, REST, and FIX mock runs on the fly.
+4. **Enhanced Specifications Views**:
+   - Refactored `frontend/js/views/protocol.js` and `Protocol.md` to introduce a modern tabbed layout detailing schemas, tags, message exchange patterns, and Dockerfile environment variables (`ENV ENGINE_PROTOCOL=WS|REST|FIX|TCP_PROTOBUF`) for each protocol.
+
+### Verification Results:
+- **WebSocket (go_ws)**: Submitting `go_ws` mock pretests successfully resolved to `Tail Latency Exceeded (TLE)` with a **100% Correctness Score** (0 priority violations, 0 phantom fills).
+- **REST/SSE (go_rest)**: Submitting `go_rest` mock pretests successfully resolved to `Tail Latency Exceeded (TLE)` with a **100% Correctness Score** (0 priority violations, 0 phantom fills).
+- **FIX 4.4 (go_fix)**: Submitting `go_fix` mock pretests successfully resolved to `Tail Latency Exceeded (TLE)` with a **100% Correctness Score** (0 priority violations, 0 phantom fills).
