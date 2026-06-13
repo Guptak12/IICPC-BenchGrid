@@ -26,10 +26,11 @@ import (
 )
 
 var (
-	rdb               *redis.Client
-	db                *sql.DB
-	s3Client          *minio.Client
-	HTTPRequestsCount uint64
+	rdb                 *redis.Client
+	db                  *sql.DB
+	s3Client            *minio.Client
+	HTTPRequestsCount   uint64
+	leaderboardJSONPath string
 )
 
 type ArenaSSEHub struct {
@@ -186,7 +187,7 @@ func main() {
 	app.Post("/api/v1/dashboard/actions/clean-db", handleCleanDB)
 
 	// Serve Leaderboard JSON
-	leaderboardJSONPath := os.Getenv("LEADERBOARD_JSON_PATH")
+	leaderboardJSONPath = os.Getenv("LEADERBOARD_JSON_PATH")
 	if leaderboardJSONPath == "" {
 		leaderboardJSONPath = "./frontend/leaderboard.json"
 	}
@@ -613,9 +614,8 @@ func broadcastActiveLeaderboards() {
 				gatewayLeaderboardHub.broadcast(arenaID, string(data))
 				if arenaID == "default" {
 					// Fallback file sync
-					cwd, _ := os.Getwd()
-					targetPath := filepath.Join(cwd, "frontend", "leaderboard.json")
-					_ = os.WriteFile(targetPath, data, 0644)
+					_ = os.MkdirAll(filepath.Dir(leaderboardJSONPath), 0755)
+					_ = os.WriteFile(leaderboardJSONPath, data, 0644)
 				}
 			}
 		}

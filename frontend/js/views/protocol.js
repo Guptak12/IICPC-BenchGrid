@@ -348,10 +348,10 @@ data: {"order_id": 200501, "status": "FILLED", "filled_qty": 100, "filled_price"
                         <strong style="color:var(--text-primary);">[+] Multi-threading:</strong> The matching engine must support concurrent TCP/HTTP/WebSocket connections as bots issue trades simultaneously.
                     </li>
                     <li>
-                        <strong style="color:var(--text-primary);">[+] Self-Crossing Prevention:</strong> To prevent wash trading, orders placed by the same bot must not cross. Skip crossing orders based on the bot identifier (e.g. `bot_id` or `Account`).
+                        <strong style="color:var(--text-primary);">[+] Self-Crossing Prevention:</strong> To prevent wash trading, orders placed by the same bot must not cross. Skip crossing orders based on the bot identifier (e.g. <code>bot_id</code> or <code>Account</code>).
                     </li>
                     <li>
-                        <strong style="color:var(--text-primary);">[+] Echoing Order IDs:</strong> Execution reports must match the order's unique client identifier (e.g., `order_id` or `ClOrdID`) exactly.
+                        <strong style="color:var(--text-primary);">[+] Echoing Order IDs:</strong> Execution reports must match the order's unique client identifier (e.g., <code>order_id</code> or <code>ClOrdID</code>) exactly.
                     </li>
                 </ul>
             </section>
