@@ -99,7 +99,7 @@ echo "=== 5. Compiling Microservices ==="
 mkdir -p bin
 go build -o bin/gateway services/gateway/*.go
 go build -o bin/compiler services/compiler/*.go
-go build -o bin/pretest services/pretest/*.go
+go build -o bin/testing services/testing/*.go
 go build -o bin/leaderboard services/leaderboard/*.go
 
 # Run services
@@ -109,7 +109,7 @@ PIDS+=($!)
 ./bin/compiler > /tmp/e2e_compiler.log 2>&1 &
 PIDS+=($!)
 
-./bin/pretest > /tmp/e2e_pretest.log 2>&1 &
+./bin/testing > /tmp/e2e_testing.log 2>&1 &
 PIDS+=($!)
 
 ./bin/leaderboard > /tmp/e2e_leaderboard.log 2>&1 &
@@ -136,7 +136,7 @@ else
   cat /tmp/e2e_gateway.log || true
   echo "--- Compiler Logs ---"
   cat /tmp/e2e_compiler.log || true
-  echo "--- Pretest Logs ---"
-  cat /tmp/e2e_pretest.log || true
+  echo "--- Testing Logs ---"
+  cat /tmp/e2e_testing.log || true
   exit "$TEST_EXIT_CODE"
 fi

@@ -2,7 +2,7 @@
    IICPC BenchGrid — main.js Entrypoint
    ======================================================================== */
 
-import { initRouter } from './router.js';
+import { initRouter } from './router.js?v=1.0.2';
 
 async function checkHealth() {
     const pgLed = document.getElementById('postgres-led');

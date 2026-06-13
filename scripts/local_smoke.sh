@@ -94,7 +94,7 @@ echo "=== 5. Compiling Microservices ==="
 mkdir -p bin
 go build -o bin/gateway services/gateway/*.go
 go build -o bin/compiler services/compiler/*.go
-go build -o bin/pretest services/pretest/*.go
+go build -o bin/testing services/testing/*.go
 go build -o bin/leaderboard services/leaderboard/*.go
 
 echo "=== 5. Starting Platform Microservices ==="
@@ -128,7 +128,7 @@ PIDS+=($!)
 ./bin/compiler > /tmp/compiler.log 2>&1 &
 PIDS+=($!)
 
-./bin/pretest > /tmp/pretest.log 2>&1 &
+./bin/testing > /tmp/testing.log 2>&1 &
 PIDS+=($!)
 
 ./bin/leaderboard > /tmp/leaderboard.log 2>&1 &

@@ -61,7 +61,7 @@ echo "=== 5. Compiling Microservices ==="
 mkdir -p bin
 go build -o bin/gateway services/gateway/*.go
 go build -o bin/compiler services/compiler/*.go
-go build -o bin/pretest services/pretest/*.go
+go build -o bin/testing services/testing/*.go
 
 echo "=== 6. Launching Platform Microservices in the Background ==="
 export REDIS_ADDR="127.0.0.1:6379"
@@ -77,19 +77,19 @@ export RUNTIME_IMAGE="iicpc-runtime-sandbox:v1"
 export SWEEPER_TIMEOUT_MINUTES="30"
 
 # Kill existing background instances of our services to avoid port binding conflicts
-killall gateway compiler pretest 2>/dev/null || true
+killall gateway compiler testing 2>/dev/null || true
 sleep 2
 
 ./bin/gateway > /tmp/gateway.log 2>&1 &
 GATEWAY_PID=$!
 ./bin/compiler > /tmp/compiler.log 2>&1 &
 COMPILER_PID=$!
-./bin/pretest > /tmp/pretest.log 2>&1 &
-PRETEST_PID=$!
+./bin/testing > /tmp/testing.log 2>&1 &
+TESTING_PID=$!
 
 echo "Gateway PID: $GATEWAY_PID"
 echo "Compiler PID: $COMPILER_PID"
-echo "Pretest PID: $PRETEST_PID"
+echo "Testing PID: $TESTING_PID"
 
 echo "=== 7. Platform Services started! ==="
 echo "Contestant UI / Dashboard: http://localhost:3000"
@@ -103,7 +103,7 @@ echo "Press Ctrl+C to stop the services."
 cleanup() {
   echo ""
   echo "=== Shutting down platform services ==="
-  kill $GATEWAY_PID $COMPILER_PID $PRETEST_PID 2>/dev/null || true
+  kill $GATEWAY_PID $COMPILER_PID $TESTING_PID 2>/dev/null || true
   exit 0
 }
 trap cleanup INT TERM

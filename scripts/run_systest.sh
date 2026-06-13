@@ -73,9 +73,9 @@ echo "=== 6. Compiling Microservices ==="
 mkdir -p bin
 go build -o bin/gateway services/gateway/*.go
 go build -o bin/compiler services/compiler/*.go
-go build -o bin/pretest services/pretest/*.go
+go build -o bin/testing services/testing/*.go
 
-echo "=== 6b. Starting Platform Microservices (Gateway + Compiler + Pretest) ==="
+echo "=== 6b. Starting Platform Microservices (Gateway + Compiler + Testing) ==="
 export REDIS_ADDR="127.0.0.1:6379"
 export DB_ADDR="postgres://iicpc:iicpc_secret@127.0.0.1:5432/iicpc_db?sslmode=disable"
 export SANDBOX_NET="sandbox-net"
@@ -97,7 +97,7 @@ trap cleanup EXIT
 PIDS+=($!)
 ./bin/compiler > /tmp/compiler_sys.log 2>&1 &
 PIDS+=($!)
-./bin/pretest > /tmp/pretest_sys.log 2>&1 &
+./bin/testing > /tmp/testing_sys.log 2>&1 &
 PIDS+=($!)
 
 # Wait for gateway to start

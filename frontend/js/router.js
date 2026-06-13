@@ -4,6 +4,8 @@
 
 import { API } from './api.js';
 
+const VERSION = '1.0.2';
+
 let currentStream = null;
 let currentUser = null;
 
@@ -59,35 +61,35 @@ export async function updateNavbar() {
 // Map of view renderers
 const routes = {
     '/': async () => {
-        const { renderLanding } = await import('./views/landing.js');
+        const { renderLanding } = await import(`./views/landing.js?v=${VERSION}`);
         return renderLanding();
     },
     '/login': async () => {
-        const { renderLogin } = await import('./views/auth.js');
+        const { renderLogin } = await import(`./views/auth.js?v=${VERSION}`);
         return renderLogin();
     },
     '/register': async () => {
-        const { renderRegister } = await import('./views/auth.js');
+        const { renderRegister } = await import(`./views/auth.js?v=${VERSION}`);
         return renderRegister();
     },
     '/arena': async () => {
-        const { renderArenaList } = await import('./views/arena.js');
+        const { renderArenaList } = await import(`./views/arena.js?v=${VERSION}`);
         return renderArenaList();
     },
     '/arena/:id': async (params) => {
-        const { renderArenaDetail } = await import('./views/arena.js');
+        const { renderArenaDetail } = await import(`./views/arena.js?v=${VERSION}`);
         return renderArenaDetail(params.id);
     },
     '/profile/:id': async (params) => {
-        const { renderProfile } = await import('./views/profile.js');
+        const { renderProfile } = await import(`./views/profile.js?v=${VERSION}`);
         return renderProfile(params.id);
     },
     '/admin': async () => {
-        const { renderAdmin } = await import('./views/admin.js');
+        const { renderAdmin } = await import(`./views/admin.js?v=${VERSION}`);
         return renderAdmin();
     },
     '/protocol': async () => {
-        const { renderProtocol } = await import('./views/protocol.js');
+        const { renderProtocol } = await import(`./views/protocol.js?v=${VERSION}`);
         return renderProtocol();
     }
 };
@@ -136,22 +138,22 @@ async function handleRoute() {
             const rootPath = pathParts[1] || '';
             
             if (rootPath === 'arena' && pathParts.length > 2) {
-                const { hydrateArenaDetail } = await import('./views/arena.js');
+                const { hydrateArenaDetail } = await import(`./views/arena.js?v=${VERSION}`);
                 hydrateArenaDetail(pathParts[2]);
             } else if (rootPath === 'login' || rootPath === 'register') {
-                const { hydrateAuth } = await import('./views/auth.js');
+                const { hydrateAuth } = await import(`./views/auth.js?v=${VERSION}`);
                 hydrateAuth(rootPath);
             } else if (rootPath === 'admin') {
-                const { hydrateAdmin } = await import('./views/admin.js');
+                const { hydrateAdmin } = await import(`./views/admin.js?v=${VERSION}`);
                 hydrateAdmin();
             } else if (rootPath === 'profile') {
-                const { hydrateProfile } = await import('./views/profile.js');
+                const { hydrateProfile } = await import(`./views/profile.js?v=${VERSION}`);
                 hydrateProfile(params.id);
             } else if (rootPath === 'arena') {
-                const { hydrateArenaList } = await import('./views/arena.js');
+                const { hydrateArenaList } = await import(`./views/arena.js?v=${VERSION}`);
                 hydrateArenaList();
             } else if (rootPath === 'protocol' || rootPath === '') {
-                const { hydrateProtocol } = await import('./views/protocol.js');
+                const { hydrateProtocol } = await import(`./views/protocol.js?v=${VERSION}`);
                 hydrateProtocol();
             }
         } catch (err) {
