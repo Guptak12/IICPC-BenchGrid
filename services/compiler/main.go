@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -27,13 +28,15 @@ var (
 )
 
 func main() {
-	// Connect to Docker
+	// Connect to Docker (optional/fallback for local dev)
 	var err error
-	dockerClient, err = client.NewClientWithOpts(client.FromEnv)
-	if err != nil {
-		log.Fatalf("Failed to initialize Docker client: %v", err)
+	if os.Getenv("KUBERNETES_SERVICE_HOST") == "" {
+		dockerClient, err = client.NewClientWithOpts(client.FromEnv)
+		if err != nil {
+			log.Fatalf("Failed to initialize Docker client: %v", err)
+		}
+		defer dockerClient.Close()
 	}
-	defer dockerClient.Close()
 
 	// Connect to Redis
 	rdb = common.GetRedisClient()
@@ -196,12 +199,16 @@ func processMessage(ctx context.Context, message redis.XMessage) {
 		queueErrStr = "system tests"
 	}
 
+	// Detect protocol from submission archive
+	protocol := DetectProtocol(ctx, s3Client, s3Path, githubURL)
+
 	err = rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: targetQueue,
 		Values: map[string]interface{}{
 			"submission_id": submissionID,
 			"image_tag":     imageTag,
 			"contestant_id": contestantID,
+			"protocol":      protocol,
 		},
 	}).Err()
 	if err != nil {

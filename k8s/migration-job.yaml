@@ -17,9 +17,9 @@ spec:
         - postgres
         - $(DB_ADDR)
         - up
-        env:
-        - name: DB_ADDR
-          value: "postgres://iicpc:iicpc_secret@postgres:5432/iicpc_db?sslmode=disable"
+        envFrom:
+        - configMapRef:
+            name: iicpc-config
         volumeMounts:
         - name: migration-volume
           mountPath: /migrations

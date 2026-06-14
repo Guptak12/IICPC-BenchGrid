@@ -26,6 +26,12 @@ import (
 	"github.com/moby/moby/client"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/sync/errgroup"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 var (
@@ -37,13 +43,15 @@ var (
 )
 
 func main() {
-	// Connect to Docker
+	// Connect to Docker (optional if running in Kubernetes)
 	var err error
-	dockerClient, err = client.NewClientWithOpts(client.FromEnv)
-	if err != nil {
-		log.Fatalf("Failed to initialize Docker client: %v", err)
+	if os.Getenv("KUBERNETES_SERVICE_HOST") == "" || os.Getenv("REGISTRY_URL") == "" {
+		dockerClient, err = client.NewClientWithOpts(client.FromEnv)
+		if err != nil {
+			log.Fatalf("Failed to initialize Docker client: %v", err)
+		}
+		defer dockerClient.Close()
 	}
-	defer dockerClient.Close()
 
 	// Connect to Redis
 	rdb = common.GetRedisClient()
@@ -95,8 +103,12 @@ func main() {
 	common.StartPELRecovery(shutdownCtx, rdb, common.PretestQueue, common.PretestGroup, consumerName, 2*time.Minute)
 	common.StartPELRecovery(shutdownCtx, rdb, common.SystestQueue, common.SystestGroup, consumerName, 2*time.Minute)
 
-	// Start background Docker container sweeper to garbage collect orphaned contestant containers
-	startDockerSweeper(shutdownCtx, dockerClient)
+	// Start background container sweeper
+	if os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
+		startK8sSweeper(shutdownCtx)
+	} else {
+		startDockerSweeper(shutdownCtx, dockerClient)
+	}
 
 	// Run pretest queue loop
 	go startWorkerLoop(shutdownCtx, common.PretestQueue, common.PretestGroup, consumerName, func(c context.Context, msg redis.XMessage) {
@@ -169,6 +181,7 @@ func processPretestMessage(ctx context.Context, message redis.XMessage, isSystes
 
 	submissionID, ok1 := message.Values["submission_id"].(string)
 	imageTag, ok2 := message.Values["image_tag"].(string)
+	protocolFromMsg, _ := message.Values["protocol"].(string)
 
 	if !ok1 || !ok2 {
 		log.Printf("Skipping invalid stream message: %v\n", message.ID)
@@ -245,14 +258,19 @@ func processPretestMessage(ctx context.Context, message redis.XMessage, isSystes
 				return fmt.Errorf("run %d sandbox failed: %w", run+1, err)
 			}
 
-			// Inspect the container config to retrieve the protocol
-			protocolStr := "TCP_PROTOBUF"
-			inspectInfo, inspectErr := dockerClient.ContainerInspect(gctx, containerID, client.ContainerInspectOptions{})
-			if inspectErr == nil && inspectInfo.Container.Config != nil {
-				for _, env := range inspectInfo.Container.Config.Env {
-					if strings.HasPrefix(env, "ENGINE_PROTOCOL=") {
-						protocolStr = strings.TrimPrefix(env, "ENGINE_PROTOCOL=")
-						break
+			// Determine protocol (prefer protocol from queue message, fallback to container config inspect)
+			protocolStr := protocolFromMsg
+			if protocolStr == "" {
+				protocolStr = "TCP_PROTOBUF"
+				if os.Getenv("KUBERNETES_SERVICE_HOST") == "" {
+					inspectInfo, inspectErr := dockerClient.ContainerInspect(gctx, containerID, client.ContainerInspectOptions{})
+					if inspectErr == nil && inspectInfo.Container.Config != nil {
+						for _, env := range inspectInfo.Container.Config.Env {
+							if strings.HasPrefix(env, "ENGINE_PROTOCOL=") {
+								protocolStr = strings.TrimPrefix(env, "ENGINE_PROTOCOL=")
+								break
+							}
+						}
 					}
 				}
 			}
@@ -265,16 +283,41 @@ func processPretestMessage(ctx context.Context, message redis.XMessage, isSystes
 			// Clean up container immediately after this run and extract logs
 			log.Printf("[submission:%s] Run %d: Cleaning up contestant sandbox...\n", submissionID[:8], run+1)
 			var runLogs string
-			reader, logErr := dockerClient.ContainerLogs(context.Background(), containerID, client.ContainerLogsOptions{ShowStdout: true, ShowStderr: true})
-			if logErr == nil {
-				logData, _ := io.ReadAll(reader)
-				runLogs = fmt.Sprintf("=== RUN %d LOGS ===\n%s\n", run+1, string(logData))
-				log.Printf("[submission:%s] Run %d Sandbox Logs:\n%s\n", submissionID[:8], run+1, string(logData))
-				reader.Close()
-			}
 
-			_, _ = dockerClient.ContainerStop(context.Background(), containerID, client.ContainerStopOptions{})
-			_, _ = dockerClient.ContainerRemove(context.Background(), containerID, client.ContainerRemoveOptions{Force: true})
+			if os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
+				config, err := rest.InClusterConfig()
+				if err == nil {
+					clientset, err := kubernetes.NewForConfig(config)
+					if err == nil {
+						sandboxNamespace := os.Getenv("SANDBOX_NAMESPACE")
+						if sandboxNamespace == "" {
+							sandboxNamespace = "iicpc-sandboxes"
+						}
+						req := clientset.CoreV1().Pods(sandboxNamespace).GetLogs(containerID, &corev1.PodLogOptions{})
+						podLogs, logErr := req.Stream(context.Background())
+						if logErr == nil {
+							logData, _ := io.ReadAll(podLogs)
+							runLogs = fmt.Sprintf("=== RUN %d LOGS ===\n%s\n", run+1, string(logData))
+							log.Printf("[submission:%s] Run %d Sandbox Pod Logs:\n%s\n", submissionID[:8], run+1, string(logData))
+							podLogs.Close()
+						}
+						deletePolicy := metav1.DeletePropagationBackground
+						_ = clientset.CoreV1().Pods(sandboxNamespace).Delete(context.Background(), containerID, metav1.DeleteOptions{
+							PropagationPolicy: &deletePolicy,
+						})
+					}
+				}
+			} else {
+				reader, logErr := dockerClient.ContainerLogs(context.Background(), containerID, client.ContainerLogsOptions{ShowStdout: true, ShowStderr: true})
+				if logErr == nil {
+					logData, _ := io.ReadAll(reader)
+					runLogs = fmt.Sprintf("=== RUN %d LOGS ===\n%s\n", run+1, string(logData))
+					log.Printf("[submission:%s] Run %d Sandbox Logs:\n%s\n", submissionID[:8], run+1, string(logData))
+					reader.Close()
+				}
+				_, _ = dockerClient.ContainerStop(context.Background(), containerID, client.ContainerStopOptions{})
+				_, _ = dockerClient.ContainerRemove(context.Background(), containerID, client.ContainerRemoveOptions{Force: true})
+			}
 
 			if fleetErr != nil {
 				log.Printf("[submission:%s] Run %d: Error during execution: %v\n", submissionID[:8], run+1, fleetErr)
@@ -444,6 +487,9 @@ func processPretestMessage(ctx context.Context, message redis.XMessage, isSystes
 }
 
 func startContestantSandbox(ctx context.Context, submissionID string, imageTag string) (string, string, error) {
+	if os.Getenv("KUBERNETES_SERVICE_HOST") != "" && os.Getenv("REGISTRY_URL") != "" {
+		return startContestantSandboxK8s(ctx, submissionID, imageTag)
+	}
 	log.Printf("[debug] startContestantSandbox: dynamic port mapping configuration initialized (Port 8000)")
 	containerName := "contestant-" + submissionID
 	pidsLimit := int64(128)
@@ -680,3 +726,183 @@ func startDockerSweeper(ctx context.Context, dockerClient *client.Client) {
 		}
 	}()
 }
+
+func startContestantSandboxK8s(ctx context.Context, runID string, imageTag string) (string, string, error) {
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		return "", "", fmt.Errorf("failed to get in-cluster config: %w", err)
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create client: %w", err)
+	}
+
+	sandboxNamespace := os.Getenv("SANDBOX_NAMESPACE")
+	if sandboxNamespace == "" {
+		sandboxNamespace = "iicpc-sandboxes"
+	}
+
+	podName := "contestant-" + runID
+
+	limits := corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse("2"),
+		corev1.ResourceMemory: resource.MustParse("512Mi"),
+	}
+	requests := corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse("1"),
+		corev1.ResourceMemory: resource.MustParse("256Mi"),
+	}
+
+	securityContext := &corev1.SecurityContext{
+		AllowPrivilegeEscalation: pointerBool(false),
+		RunAsNonRoot:             pointerBool(true),
+		RunAsUser:                pointerInt64(10001),
+		Capabilities: &corev1.Capabilities{
+			Drop: []corev1.Capability{"ALL"},
+		},
+	}
+
+	nodeSelector := map[string]string{
+		"eks.amazonaws.com/nodegroup": "sandbox-executions",
+	}
+
+	tolerations := []corev1.Toleration{
+		{
+			Key:      "sandbox-only",
+			Operator: corev1.TolerationOpEqual,
+			Value:    "true",
+			Effect:   corev1.TaintEffectNoSchedule,
+		},
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podName,
+			Namespace: sandboxNamespace,
+			Labels: map[string]string{
+				"app":           "contestant-sandbox",
+				"submission-id": runID,
+			},
+		},
+		Spec: corev1.PodSpec{
+			RestartPolicy: corev1.RestartPolicyNever,
+			NodeSelector:  nodeSelector,
+			Tolerations:   tolerations,
+			Containers: []corev1.Container{
+				{
+					Name:            "sandbox",
+					Image:           imageTag,
+					ImagePullPolicy: corev1.PullIfNotPresent,
+					Ports: []corev1.ContainerPort{
+						{
+							ContainerPort: 8000,
+						},
+					},
+					Resources: corev1.ResourceRequirements{
+						Limits:   limits,
+						Requests: requests,
+					},
+					SecurityContext: securityContext,
+				},
+			},
+		},
+	}
+
+	_, err = clientset.CoreV1().Pods(sandboxNamespace).Create(ctx, pod, metav1.CreateOptions{})
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create sandbox pod: %w", err)
+	}
+
+	var podIP string
+	for i := 0; i < 60; i++ {
+		currentPod, err := clientset.CoreV1().Pods(sandboxNamespace).Get(ctx, podName, metav1.GetOptions{})
+		if err != nil {
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+
+		if currentPod.Status.Phase == corev1.PodRunning && currentPod.Status.PodIP != "" {
+			podIP = currentPod.Status.PodIP
+			break
+		}
+
+		if currentPod.Status.Phase == corev1.PodFailed || currentPod.Status.Phase == corev1.PodUnknown {
+			return podName, "", fmt.Errorf("sandbox pod transitioned to failed phase")
+		}
+
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	if podIP == "" {
+		return podName, "", fmt.Errorf("timed out waiting for sandbox pod IP address")
+	}
+
+	endpoint := fmt.Sprintf("%s:8000", podIP)
+	log.Printf("[submission:%s] Sandbox pod %s running on EKS node at endpoint %s\n", runID[:8], podName, endpoint)
+
+	return podName, endpoint, nil
+}
+
+func startK8sSweeper(ctx context.Context) {
+	timeoutMin := 30
+	if val, err := strconv.Atoi(os.Getenv("SWEEPER_TIMEOUT_MINUTES")); err == nil && val > 0 {
+		timeoutMin = val
+	}
+	timeoutDur := time.Duration(timeoutMin) * time.Minute
+	log.Printf("[k8s-sweeper] Initialized with timeout: %v\n", timeoutDur)
+
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		log.Printf("[k8s-sweeper] Failed to get in-cluster config: %v\n", err)
+		return
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		log.Printf("[k8s-sweeper] Failed to create clientset: %v\n", err)
+		return
+	}
+
+	sandboxNamespace := os.Getenv("SANDBOX_NAMESPACE")
+	if sandboxNamespace == "" {
+		sandboxNamespace = "iicpc-sandboxes"
+	}
+
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				pods, err := clientset.CoreV1().Pods(sandboxNamespace).List(ctx, metav1.ListOptions{
+					LabelSelector: "app=contestant-sandbox",
+				})
+				if err != nil {
+					log.Printf("[k8s-sweeper] Error listing sandbox pods: %v\n", err)
+					continue
+				}
+				now := time.Now()
+				for _, p := range pods.Items {
+					createdTime := p.CreationTimestamp.Time
+					if now.Sub(createdTime) > timeoutDur {
+						log.Printf("[k8s-sweeper] Found orphaned sandbox pod %s (created %v ago). Cleaning up...\n", p.Name, now.Sub(createdTime))
+						deletePolicy := metav1.DeletePropagationBackground
+						_ = clientset.CoreV1().Pods(sandboxNamespace).Delete(ctx, p.Name, metav1.DeleteOptions{
+							PropagationPolicy: &deletePolicy,
+						})
+					}
+				}
+			}
+		}
+	}()
+}
+
+func pointerBool(b bool) *bool {
+	return &b
+}
+
+func pointerInt64(i int64) *int64 {
+	return &i
+}
+

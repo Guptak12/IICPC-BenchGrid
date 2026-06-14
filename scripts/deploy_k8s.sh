@@ -43,6 +43,8 @@ for svc in "${SERVICES[@]}"; do
   echo "Building iicpc-${svc}:latest..."
   docker build -f Dockerfile.services --build-arg SERVICE="$svc" -t "iicpc-${svc}:latest" .
 done
+echo "Building iicpc-init-db:latest..."
+docker build -f Dockerfile.init-db -t "iicpc-init-db:latest" .
 
 echo "=== 3. Loading Images into Kubernetes Cluster ==="
 if [ "$PROVIDER" = "kind" ]; then
@@ -50,6 +52,7 @@ if [ "$PROVIDER" = "kind" ]; then
   for svc in "${SERVICES[@]}"; do
     kind load docker-image "iicpc-${svc}:latest" --name "$CLUSTER_NAME"
   done
+  kind load docker-image "iicpc-init-db:latest" --name "$CLUSTER_NAME"
 
   # Deploy Calico CNI for NetworkPolicy support if not already installed
   if ! kubectl get daemonset -n kube-system calico-node >/dev/null 2>&1; then
@@ -61,11 +64,14 @@ elif [ "$PROVIDER" = "minikube" ]; then
   for svc in "${SERVICES[@]}"; do
     minikube image load "iicpc-${svc}:latest"
   done
+  minikube image load "iicpc-init-db:latest"
 else
   echo "Generic Kubernetes context. Assuming registry pushing or local node availability."
 fi
 
 echo "=== 4. Applying Core Volumes & Services ==="
+kubectl apply -f k8s/eks-rbac.yaml
+kubectl apply -f k8s/configmap.yaml
 kubectl apply -f k8s/volume.yaml
 kubectl apply -f k8s/postgres.yaml
 kubectl apply -f k8s/redis.yaml

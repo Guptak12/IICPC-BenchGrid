@@ -6,7 +6,7 @@ metadata:
   labels:
     app: submission-gateway
 spec:
-  replicas: 3
+  replicas: 2
   selector:
     matchLabels:
       app: submission-gateway
@@ -15,21 +15,19 @@ spec:
       labels:
         app: submission-gateway
     spec:
+      serviceAccountName: iicpc-gateway
       containers:
       - name: gateway
         image: iicpc-gateway:latest
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 3000
+        envFrom:
+        - configMapRef:
+            name: iicpc-config
         env:
-        - name: REDIS_ADDR
-          value: "redis:6379"
-        - name: DB_ADDR
-          value: "postgres://iicpc:iicpc_secret@postgres:5432/iicpc_db?sslmode=disable"
         - name: LEADERBOARD_JSON_PATH
           value: "/app/data/leaderboard.json"
-        - name: S3_ENDPOINT
-          value: "host.docker.internal:9000"
         volumeMounts:
         - name: public-html
           mountPath: /app/data
@@ -70,6 +68,29 @@ spec:
     app: submission-gateway
   type: ClusterIP
 ---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: submission-gateway-ingress
+  namespace: default
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+spec:
+  ingressClassName: alb
+  rules:
+  - http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: submission-gateway
+            port:
+              number: 3000
+
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -87,7 +108,7 @@ metadata:
   namespace: default
 subjects:
 - kind: ServiceAccount
-  name: default
+  name: iicpc-gateway
   namespace: default
 roleRef:
   kind: Role

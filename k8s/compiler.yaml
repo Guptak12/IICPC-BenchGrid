@@ -15,17 +15,14 @@ spec:
       labels:
         app: compilation-worker
     spec:
+      serviceAccountName: iicpc-compiler
       containers:
       - name: compiler
         image: iicpc-compiler:latest
         imagePullPolicy: IfNotPresent
-        env:
-        - name: REDIS_ADDR
-          value: "redis:6379"
-        - name: DB_ADDR
-          value: "postgres://iicpc:iicpc_secret@postgres:5432/iicpc_db?sslmode=disable"
-        - name: S3_ENDPOINT
-          value: "host.docker.internal:9000"
+        envFrom:
+        - configMapRef:
+            name: iicpc-config
         volumeMounts:
         - name: docker-socket
           mountPath: /var/run/docker.sock

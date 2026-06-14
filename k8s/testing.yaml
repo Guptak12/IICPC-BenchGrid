@@ -15,19 +15,15 @@ spec:
       labels:
         app: testing-worker
     spec:
+      serviceAccountName: iicpc-testing
       containers:
       - name: testing
         image: iicpc-testing:latest
         imagePullPolicy: IfNotPresent
+        envFrom:
+        - configMapRef:
+            name: iicpc-config
         env:
-        - name: REDIS_ADDR
-          value: "redis:6379"
-        - name: DB_ADDR
-          value: "postgres://iicpc:iicpc_secret@postgres:5432/iicpc_db?sslmode=disable"
-        - name: S3_ENDPOINT
-          value: "host.docker.internal:9000"
-        - name: SANDBOX_NET
-          value: "kind"
         - name: SWEEPER_TIMEOUT_MINUTES
           value: "30"
         volumeMounts:

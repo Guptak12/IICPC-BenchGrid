@@ -304,7 +304,7 @@ export async function renderArenaDetail(arenaId) {
                 <button id="drawer-close-btn" class="drawer__close">&times;</button>
             </div>
             
-            <div class="drawer__content">
+            <div class="drawer__body">
                 
                 <!-- Performance metrics row -->
                 <div class="perf-metric-grid">
