@@ -63,25 +63,26 @@ echo "  Testing Pod Role:    $TESTING_ROLE_ARN"
 echo "=== 3. Authenticating Docker with AWS ECR ==="
 aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$REGISTRY_URL"
 
-echo "=== 4. Compiling Microservices on Host ==="
+echo "=== 4. Compiling Microservices on Host (linux/amd64 for EKS nodes) ==="
 SERVICES=("gateway" "compiler" "testing")
 
 mkdir -p bin
 for svc in "${SERVICES[@]}"; do
   echo "Compiling iicpc-${svc}..."
-  CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o bin/${svc} ./services/${svc}
+  CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o bin/${svc} ./services/${svc}
 done
 
-echo "=== 5. Building & Pushing Docker Images ==="
+echo "=== 5. Building & Pushing Docker Images (linux/amd64 for EKS nodes) ==="
+# IMPORTANT: Apple Silicon builds arm64 by default. Must cross-compile for linux/amd64 (EKS node arch).
 for svc in "${SERVICES[@]}"; do
   echo "Building and pushing iicpc-${svc} to ECR..."
-  docker build -f Dockerfile.services --build-arg SERVICE="$svc" -t "${REGISTRY_URL}/iicpc-${svc}:latest" .
-  docker push "${REGISTRY_URL}/iicpc-${svc}:latest"
+  docker buildx build --platform linux/amd64 -f Dockerfile.services --build-arg SERVICE="$svc" \
+    -t "${REGISTRY_URL}/iicpc-${svc}:latest" --push .
 done
 
 echo "Building and pushing iicpc-init-db to ECR..."
-docker build -f Dockerfile.init-db -t "${REGISTRY_URL}/iicpc-init-db:latest" .
-docker push "${REGISTRY_URL}/iicpc-init-db:latest"
+docker buildx build --platform linux/amd64 -f Dockerfile.init-db \
+  -t "${REGISTRY_URL}/iicpc-init-db:latest" --push .
 
 echo "=== 6. Generating In-Cluster Manifests ==="
 BUILD_K8S_DIR="build_k8s"
@@ -89,9 +90,12 @@ rm -rf "$BUILD_K8S_DIR"
 mkdir -p "$BUILD_K8S_DIR"
 cp k8s/*.yaml "$BUILD_K8S_DIR"/
 
-# Dynamically replace ECR registry reference in all files
+# Dynamically replace ECR registry reference in all files.
+# Source k8s/*.yaml use ACCOUNT_ID.dkr.ecr.AWS_REGION.amazonaws.com as placeholder.
 for file in "$BUILD_K8S_DIR"/*.yaml; do
-  sed -i '' "s|123456789012.dkr.ecr.us-east-1.amazonaws.com|${REGISTRY_URL}|g" "$file"
+  sed -i '' "s|ACCOUNT_ID.dkr.ecr.AWS_REGION.amazonaws.com|${REGISTRY_URL}|g" "$file"
+  # Always force re-pull on :latest tag so nodes never use stale cached images
+  sed -i '' "s|imagePullPolicy: IfNotPresent|imagePullPolicy: Always|g" "$file"
 done
 
 # Replace IAM role ARNs in rbac configuration
@@ -100,7 +104,8 @@ sed -i '' "s|arn:aws:iam::123456789012:role/iicpc-benchgrid-compiler-pod-role|${
 sed -i '' "s|arn:aws:iam::123456789012:role/iicpc-benchgrid-testing-pod-role|${TESTING_ROLE_ARN}|g" "$BUILD_K8S_DIR"/eks-rbac.yaml
 
 # Replace variables in cluster ConfigMap
-sed -i '' "s|iicpc-benchgrid-cache.xxxxxx.0001.use1.cache.amazonaws.com:6379|${REDIS_ENDPOINT}|g" "$BUILD_K8S_DIR"/eks-configmap.yaml
+# NOTE: REDIS_ENDPOINT from Terraform is hostname-only; append :6379 for the Go redis client
+sed -i '' "s|iicpc-benchgrid-cache.xxxxxx.0001.use1.cache.amazonaws.com:6379|${REDIS_ENDPOINT}:6379|g" "$BUILD_K8S_DIR"/eks-configmap.yaml
 sed -i '' "s|iicpc-benchgrid-db.xxxxxx.us-east-1.rds.amazonaws.com:5432|${RDS_ENDPOINT}|g" "$BUILD_K8S_DIR"/eks-configmap.yaml
 sed -i '' "s|iicpc-benchgrid-submissions-bucket|${S3_BUCKET}|g" "$BUILD_K8S_DIR"/eks-configmap.yaml
 
@@ -128,8 +133,10 @@ kubectl apply -f "$BUILD_K8S_DIR"/sandbox-networkpolicy.yaml
 kubectl apply -f "$BUILD_K8S_DIR"/compiler.yaml
 kubectl apply -f "$BUILD_K8S_DIR"/testing.yaml
 kubectl apply -f "$BUILD_K8S_DIR"/gateway.yaml
-kubectl apply -f "$BUILD_K8S_DIR"/leaderboard.yaml
+# NOTE: leaderboard-generator is not yet deployed (no source code in services/leaderboard/)
+# Uncomment when the leaderboard service is implemented:
+# kubectl apply -f "$BUILD_K8S_DIR"/leaderboard.yaml
 
 echo "=== 11. Deployment Complete! Checking Status ==="
 kubectl get pods -o wide
-kubectl get ingress
+kubectl get ingress -o wide

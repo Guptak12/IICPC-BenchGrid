@@ -297,20 +297,27 @@ func handleMockSubmission(c fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).SendString("failed to package mock engine")
 	}
 
-	// 2. Upload to S3/MinIO
-	s3Path := fmt.Sprintf("submissions/%s/submission.zip", buildID)
-	_, err = s3Client.PutObject(ctx, common.S3Bucket, s3Path, bytes.NewReader(zipBytes), int64(len(zipBytes)), minio.PutObjectOptions{
-		ContentType: "application/zip",
+	// 2. Convert zip to tar.gz (Kaniko requires tar.gz for S3 build context)
+	tarGzBytes, err := normalizeZipToTarGz(zipBytes)
+	if err != nil {
+		log.Printf("[mock] Failed to convert zip to tar.gz %s: %v\n", dirPath, err)
+		return c.Status(fiber.StatusInternalServerError).SendString("failed to package mock engine as tar.gz")
+	}
+
+	// 3. Upload to S3 as tar.gz (Kaniko reads this as its build context)
+	s3Path := fmt.Sprintf("submissions/%s/submission.tar.gz", buildID)
+	_, err = s3Client.PutObject(ctx, common.S3Bucket, s3Path, bytes.NewReader(tarGzBytes), int64(len(tarGzBytes)), minio.PutObjectOptions{
+		ContentType: "application/gzip",
 	})
 	if err != nil {
 		log.Printf("[mock] Failed to upload mock to S3: %v\n", err)
 		return c.Status(fiber.StatusInternalServerError).SendString("failed to store mock submission ZIP")
 	}
 
-	// 3. Save to database
+	// 4. Save to database — arena_id is NULL for mock submissions
 	contestantID := fmt.Sprintf("mock-contestant-%d", rand.Intn(1000000))
 	_, err = db.ExecContext(ctx,
-		"INSERT INTO submissions (id, contestant_id, status, verdict, s3_path, arena_id) VALUES ($1, $2, $3, $4, $5, 'default')",
+		"INSERT INTO submissions (id, contestant_id, status, verdict, s3_path) VALUES ($1, $2, $3, $4, $5)",
 		buildID, contestantID, "queued", "Pending", s3Path,
 	)
 	if err != nil {

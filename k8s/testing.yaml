@@ -6,6 +6,8 @@ metadata:
   labels:
     app: testing-worker
 spec:
+  strategy:
+    type: Recreate
   replicas: 1
   selector:
     matchLabels:
@@ -18,26 +20,18 @@ spec:
       serviceAccountName: iicpc-testing
       containers:
       - name: testing
-        image: iicpc-testing:latest
-        imagePullPolicy: IfNotPresent
+        image: ACCOUNT_ID.dkr.ecr.AWS_REGION.amazonaws.com/iicpc-testing:latest
+        imagePullPolicy: Always
         envFrom:
         - configMapRef:
             name: iicpc-config
         env:
         - name: SWEEPER_TIMEOUT_MINUTES
           value: "30"
-        volumeMounts:
-        - name: docker-socket
-          mountPath: /var/run/docker.sock
         resources:
           limits:
-            cpu: "2"
+            cpu: "1"
             memory: 1Gi
           requests:
-            cpu: "500m"
-            memory: 512Mi
-      volumes:
-      - name: docker-socket
-        hostPath:
-          path: /var/run/docker.sock
-          type: Socket
+            cpu: "200m"
+            memory: 256Mi

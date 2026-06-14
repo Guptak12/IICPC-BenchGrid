@@ -1,31 +1,33 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: compilation-worker
+  name: testing-worker
   namespace: default
   labels:
-    app: compilation-worker
+    app: testing-worker
 spec:
-  # Recreate strategy avoids CPU surge on 1-replica deployments (kills old pod before new one starts)
   strategy:
     type: Recreate
   replicas: 1
   selector:
     matchLabels:
-      app: compilation-worker
+      app: testing-worker
   template:
     metadata:
       labels:
-        app: compilation-worker
+        app: testing-worker
     spec:
-      serviceAccountName: iicpc-compiler
+      serviceAccountName: iicpc-testing
       containers:
-      - name: compiler
-        image: ACCOUNT_ID.dkr.ecr.AWS_REGION.amazonaws.com/iicpc-compiler:latest
+      - name: testing
+        image: 445711599575.dkr.ecr.us-east-1.amazonaws.com/iicpc-testing:latest
         imagePullPolicy: Always
         envFrom:
         - configMapRef:
             name: iicpc-config
+        env:
+        - name: SWEEPER_TIMEOUT_MINUTES
+          value: "30"
         resources:
           limits:
             cpu: "1"

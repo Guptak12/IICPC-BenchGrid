@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: iicpc-config
+  namespace: default
+data:
+  REDIS_ADDR: "iicpc-benchgrid-cache.4ucoc5.ng.0001.use1.cache.amazonaws.com"
+  DB_ADDR: "postgres://iicpc:iicpc_secret_production@iicpc-benchgrid-db.cepaasao0lur.us-east-1.rds.amazonaws.com:5432/iicpc_db"
+  S3_ENDPOINT: "s3.amazonaws.com"
+  S3_BUCKET: "iicpc-benchgrid-submissions-bucket"
+  S3_USE_SSL: "true"
+  REGISTRY_URL: "445711599575.dkr.ecr.us-east-1.amazonaws.com"
+  SANDBOX_NAMESPACE: "iicpc-sandboxes"
+  KANIKO_SERVICE_ACCOUNT: "kaniko-sa"
+  POD_NAMESPACE: "default"
+  KAFKA_BROKERS: "redpanda:9092"

@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
       - name: leaderboard
-        image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/iicpc-leaderboard:latest
+        image: 445711599575.dkr.ecr.us-east-1.amazonaws.com/iicpc-leaderboard:latest
         imagePullPolicy: IfNotPresent
         env:
         - name: DB_ADDR

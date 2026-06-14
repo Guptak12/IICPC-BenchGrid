@@ -296,16 +296,24 @@ func handleSubmission(c fiber.Ctx) error {
 		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to read uploaded file"})
 		}
+		// Normalize the zip and convert to tar.gz.
+		// Kaniko requires tar.gz for S3 build context — a raw .zip gives
+		// "gzip: invalid header" and fails immediately.
+		tarGzBytes, err := normalizeZipToTarGz(srcBytes)
+		if err != nil {
+			log.Printf("Failed to normalize submission zip %s: %v\n", buildID, err)
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid zip archive: " + err.Error()})
+		}
 		sourceCode = "[ZIP Submission]"
 
-		// Upload ZIP to S3
-		s3Path = fmt.Sprintf("submissions/%s/submission.zip", buildID)
-		_, err = s3Client.PutObject(ctx, common.S3Bucket, s3Path, bytes.NewReader(srcBytes), int64(len(srcBytes)), minio.PutObjectOptions{
-			ContentType: "application/zip",
+		// Upload as tar.gz — Kaniko reads this directly as its S3 build context
+		s3Path = fmt.Sprintf("submissions/%s/submission.tar.gz", buildID)
+		_, err = s3Client.PutObject(ctx, common.S3Bucket, s3Path, bytes.NewReader(tarGzBytes), int64(len(tarGzBytes)), minio.PutObjectOptions{
+			ContentType: "application/gzip",
 		})
 		if err != nil {
 			log.Printf("Failed to upload submission %s to S3: %v\n", buildID, err)
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to store submission ZIP"})
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to store submission"})
 		}
 	}
 

@@ -1,0 +1,23 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: strict-sandbox-policy
+  namespace: iicpc-sandboxes
+spec:
+  podSelector:
+    matchLabels:
+      app: contestant-sandbox
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # Allow inbound HTTP/WebSocket/TCP traffic on port 8000 from default namespace pods (bot-fleet / testing-worker)
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: default
+    ports:
+    - protocol: TCP
+      port: 8000
+  # Block all egress traffic to prevent data exfiltration
+  egress: []

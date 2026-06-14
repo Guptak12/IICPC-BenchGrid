@@ -21,7 +21,7 @@ spec:
       serviceAccountName: iicpc-compiler
       containers:
       - name: compiler
-        image: ACCOUNT_ID.dkr.ecr.AWS_REGION.amazonaws.com/iicpc-compiler:latest
+        image: 445711599575.dkr.ecr.us-east-1.amazonaws.com/iicpc-compiler:latest
         imagePullPolicy: Always
         envFrom:
         - configMapRef:

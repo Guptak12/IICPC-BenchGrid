@@ -24,11 +24,21 @@ resource "aws_security_group" "db_sg" {
   vpc_id      = aws_vpc.main.id
 
   ingress {
-    description     = "Postgres access from EKS nodes"
+    description     = "Postgres access from Terraform-managed EKS nodes SG"
     from_port       = 5432
     to_port         = 5432
     protocol        = "tcp"
     security_groups = [aws_security_group.eks_nodes_sg.id]
+  }
+
+  # EKS node groups auto-create their own managed security group (separate from our custom SG).
+  # We must also allow that SG or pods can't reach RDS.
+  ingress {
+    description     = "Postgres access from EKS-managed node group SG"
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_eks_node_group.core.resources[0].remote_access_security_group_id == null ? "sg-034b63cd0710aac98" : aws_eks_node_group.core.resources[0].remote_access_security_group_id]
   }
 
   egress {
@@ -94,7 +104,7 @@ resource "aws_db_instance" "postgres" {
   allocated_storage      = 20
   max_allocated_storage  = 100
   engine                 = "postgres"
-  engine_version         = "15.4"
+  engine_version         = "16.4"
   instance_class         = "db.t3.micro"
   db_name                = "iicpc_db"
   username               = var.db_username

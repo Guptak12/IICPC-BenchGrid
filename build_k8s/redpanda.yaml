@@ -55,8 +55,8 @@ spec:
         - --mode=dev-container
         - --smp=1
         - --memory=1Gi
-        - --kafka-addr=PLAINTEXT://0.0.0.0:9092
-        - --advertise-kafka-addr=PLAINTEXT://redpanda:9092
+        - --kafka-addr=PLAINTEXT://0.0.0.0:9092,OUTSIDE://0.0.0.0:9092
+        - --advertise-kafka-addr=PLAINTEXT://redpanda:9092,OUTSIDE://redpanda:9092
         ports:
         - name: external
           containerPort: 9092

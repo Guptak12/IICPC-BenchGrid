@@ -131,22 +131,40 @@ resource "aws_eks_node_group" "sandbox" {
 }
 
 # EKS Addons - Enable Native NetworkPolicy enforcement in AWS VPC CNI
+# NOTE: No addon_version pinned - Terraform will use the default supported version for this cluster
 resource "aws_eks_addon" "vpc_cni" {
   cluster_name  = aws_eks_cluster.main.name
   addon_name    = "vpc-cni"
-  addon_version = "v1.18.0-eksbuild.1"
 
   configuration_values = jsonencode({
     enableNetworkPolicy = "true"
   })
+
+  depends_on = [
+    aws_eks_node_group.core
+  ]
+}
+
+# EBS CSI Driver addon - required for EBS PersistentVolume provisioning on Kubernetes 1.23+
+# The in-tree kubernetes.io/aws-ebs provisioner is deprecated; all EBS storage now goes through this CSI driver.
+resource "aws_eks_addon" "ebs_csi_driver" {
+  cluster_name             = aws_eks_cluster.main.name
+  addon_name               = "aws-ebs-csi-driver"
+  service_account_role_arn = aws_iam_role.ebs_csi_driver.arn
+
+  depends_on = [
+    aws_eks_node_group.core,
+    aws_iam_role_policy_attachment.ebs_csi_driver
+  ]
 }
 
 # Helm Provider configured for the newly created EKS Cluster
+# NOTE: Helm provider v3 uses argument syntax (kubernetes = {}) not block syntax (kubernetes {})
 provider "helm" {
-  kubernetes {
+  kubernetes = {
     host                   = aws_eks_cluster.main.endpoint
     cluster_ca_certificate = base64decode(aws_eks_cluster.main.certificate_authority[0].data)
-    exec {
+    exec = {
       api_version = "client.authentication.k8s.io/v1beta1"
       args        = ["eks", "get-token", "--cluster-name", aws_eks_cluster.main.name]
       command     = "aws"
@@ -155,35 +173,49 @@ provider "helm" {
 }
 
 # Helm release for AWS Load Balancer Controller
+# NOTE: Helm provider v3 uses set = [...] list syntax, not set {} blocks
 resource "helm_release" "aws_load_balancer_controller" {
-  name       = "aws-load-balancer-controller"
-  repository = "https://aws.github.io/eks-charts"
-  chart      = "aws-load-balancer-controller"
-  namespace  = "kube-system"
-  version    = "1.7.1"
+  name            = "aws-load-balancer-controller"
+  repository      = "https://aws.github.io/eks-charts"
+  chart           = "aws-load-balancer-controller"
+  namespace       = "kube-system"
+  version         = "1.7.1"
+  timeout         = 600  # 10 minutes - ALB controller needs time for image pull + webhook init
+  upgrade_install = true  # Use helm upgrade --install to handle leftover partial installs
+  take_ownership  = true  # Allow Terraform to adopt the existing release into state
 
-  set {
-    name  = "clusterName"
-    value = aws_eks_cluster.main.name
-  }
+  set = [
+    {
+      name  = "clusterName"
+      value = aws_eks_cluster.main.name
+    },
+    {
+      name  = "vpcId"
+      value = aws_vpc.main.id  # Explicit VPC ID avoids EC2 IMDS lookup (IMDSv2 401 crash)
+    },
+    {
+      name  = "serviceAccount.create"
+      value = "true"
+    },
+    {
+      name  = "serviceAccount.name"
+      value = "aws-load-balancer-controller"
+    },
+    {
+      name  = "serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn"
+      value = aws_iam_role.aws_load_balancer_controller.arn
+    },
+    {
+      name  = "region"
+      value = var.aws_region
+    }
+  ]
 
-  set {
-    name  = "serviceAccount.create"
-    value = "true"
-  }
-
-  set {
-    name  = "serviceAccount.name"
-    value = "aws-load-balancer-controller"
-  }
-
-  set {
-    name  = "serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn"
-    value = aws_iam_role.aws_load_balancer_controller.arn
-  }
+  wait = false  # Don't block on pod readiness - verify separately with kubectl
 
   depends_on = [
-    aws_eks_node_group.core
+    aws_eks_node_group.core,
+    aws_eks_addon.vpc_cni
   ]
 }
 

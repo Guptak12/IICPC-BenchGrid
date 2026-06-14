@@ -8,7 +8,7 @@ spec:
     spec:
       containers:
       - name: migration
-        image: ACCOUNT_ID.dkr.ecr.AWS_REGION.amazonaws.com/iicpc-init-db:latest
+        image: 445711599575.dkr.ecr.us-east-1.amazonaws.com/iicpc-init-db:latest
         imagePullPolicy: Always
         # Use sh -c so the shell expands $DB_ADDR at runtime.
         # Kubernetes's $(VAR) substitution in command[] only works for env: entries,

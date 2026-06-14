@@ -808,6 +808,26 @@ func startContestantSandboxK8s(ctx context.Context, runID string, imageTag strin
 		},
 	}
 
+	// Defensive cleanup: delete any existing pod with this name before creating.
+	// This handles the case where a pretest pod is still Terminating when the
+	// systest (or a retry) runs the same submission — causing "already exists".
+	existing, getErr := clientset.CoreV1().Pods(sandboxNamespace).Get(ctx, podName, metav1.GetOptions{})
+	if getErr == nil {
+		log.Printf("[sandbox] Pod %s already exists (phase=%s) — force-deleting before recreate\n", podName, existing.Status.Phase)
+		gracePeriod := int64(0)
+		_ = clientset.CoreV1().Pods(sandboxNamespace).Delete(ctx, podName, metav1.DeleteOptions{
+			GracePeriodSeconds: &gracePeriod,
+		})
+		// Wait up to 10s for the pod to be fully gone
+		for i := 0; i < 20; i++ {
+			time.Sleep(500 * time.Millisecond)
+			_, err := clientset.CoreV1().Pods(sandboxNamespace).Get(ctx, podName, metav1.GetOptions{})
+			if err != nil {
+				break // pod is gone
+			}
+		}
+	}
+
 	_, err = clientset.CoreV1().Pods(sandboxNamespace).Create(ctx, pod, metav1.CreateOptions{})
 	if err != nil {
 		return "", "", fmt.Errorf("failed to create sandbox pod: %w", err)
