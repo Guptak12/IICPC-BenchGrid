@@ -172,7 +172,7 @@ func processPretestMessage(ctx context.Context, message redis.XMessage, isSystes
 		if val, err := strconv.Atoi(os.Getenv("SYSTEST_NUM_BOTS")); err == nil && val > 0 {
 			numBots = val
 		}
-		ordersPerBot = 20000
+		ordersPerBot = 2000 // 500 bots × 2,000 = 1,000,000 total orders
 		if val, err := strconv.Atoi(os.Getenv("SYSTEST_ORDERS_PER_BOT")); err == nil && val > 0 {
 			ordersPerBot = val
 		}
