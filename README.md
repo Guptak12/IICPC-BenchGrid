@@ -648,6 +648,8 @@ kubectl get servicemonitor -n monitoring | grep iicpc
 | [`K8S_DESIGN.md`](K8S_DESIGN.md) | Every K8s manifest explained: Kaniko, sandbox pods, RBAC, IRSA, HPA, Calico |
 | [`OBSERVABILITY_DESIGN.md`](OBSERVABILITY_DESIGN.md) | Grafana panel-by-panel breakdown + contestant diagnostic drawer |
 | [`DESIGN_SECTIONS.md`](DESIGN_SECTIONS.md) | Deep-dives: sandboxing layers, fault tolerance, observability strategy, scalability roadmap |
+| [`DATABASE_SCHEMA_DESIGN.md`](DATABASE_SCHEMA_DESIGN.md) | Schema evolution, index strategy, migration runner, TOAST/JSONB decisions |
+| [`ACHIEVEMENTS_AND_ROADMAP.md`](ACHIEVEMENTS_AND_ROADMAP.md) | Full achievement inventory, current limitations, and 6-phase future roadmap |
 | [`walkthrough.md`](walkthrough.md) | End-to-end change walkthrough and validation results |
 
 ---
@@ -723,6 +725,83 @@ Sources: `common/pel_recovery.go`, `common/retry.go`, `services/testing/runner.g
 | **2** | Coordinator splits fleet into N Bot-Shard pods; Fleet-Aggregator merges additive HDR histograms | ~5 000 bots |
 | **3** | Redis Cluster + `compilation_queue_{0..N}` sharding by `hash(submission_id) % N` | ~50 000 submissions/day |
 | **4** | Replace leaderboard SQL scan with `ZADD`/`ZREVRANGE` Redis sorted set | `<100 ms` push latency |
+
+---
+
+### § E — Database Schema & Migrations
+
+> Full deep-dive: [`DATABASE_SCHEMA_DESIGN.md`](DATABASE_SCHEMA_DESIGN.md)
+
+**7 migrations, applied by a one-shot Kubernetes `Job` (Goose runner) on every deploy.**
+
+#### Table architecture
+
+| Table | Role | Key design choice |
+|---|---|---|
+| `submissions` | Hot table — leaderboard, queue status, scores | ~800-byte tuples; no large columns inline |
+| `submission_sources` | Cold TOAST table — contestant source code | Separated in `00003` to prevent heap bloat |
+| `users` | Auth — password or GitHub OAuth | `password_hash NULL` for OAuth; `github_id NULL` for password |
+| `arenas` | Contest lifecycle (`upcoming→active→system_test→ended`) | Status drives gateway accept/reject logic |
+| `arena_registrations` | Contestant enrollment | Composite PK prevents duplicates |
+
+**`diagnostics` JSONB** — full telemetry blob (trial results, anomaly counts, archetype) stored as JSONB rather than 15+ typed columns. Avoids `ALTER TABLE` churn as the scoring formula evolves. The hot leaderboard query never reads JSONB internals — it projects only numeric columns.
+
+**TOAST split (`00003`)**: Moving `source_code` (up to ~500KB) out of `submissions` reduced hot tuple width from ~520KB to ~800 bytes — making buffer-pool cache hits ~650× more efficient for leaderboard scans.
+
+#### Index evolution
+
+| Migration | Index version | Key change |
+|---|---|---|
+| 00001 | v1 `(contest_id, contestant_id, composite_score DESC)` | Initial leaderboard |
+| 00003 | v3 `... INCLUDE (all columns including diagnostics)` | Covering index — no heap fetch |
+| 00006 | `(arena_id, user_id, composite_score DESC)` CONCURRENTLY | Per-arena ranking; `CREATE INDEX CONCURRENTLY` avoids `AccessExclusiveLock` during live contest |
+| **00007** | **v4 — removed `diagnostics` from INCLUDE** | **Bug fix**: JSONB pushed btree row to 3752B > 2704B hard limit → index creation failed in production |
+
+`CREATE INDEX CONCURRENTLY` in `00006` requires `-- +goose NO TRANSACTION` because PostgreSQL forbids concurrent index builds inside a transaction block.
+
+---
+
+### § F — Achievements & Future Roadmap
+
+> Full inventory with per-feature status: [`ACHIEVEMENTS_AND_ROADMAP.md`](ACHIEVEMENTS_AND_ROADMAP.md)
+
+#### What is fully built and live in production
+
+| Area | Verified in production |
+|---|---|
+| End-to-end submission pipeline | 19 submissions processed; max composite score 90.00 |
+| 4-layer security sandbox | cgroup v2, seccomp, NetworkPolicy zero-egress, tainted nodegroup |
+| Kaniko daemonless builds | No privileged pods; ECR push via IRSA |
+| Bot fleet (500 bots, MMPP, K=3) | Fleet TPS spike to ~4 000 orders/min captured in Grafana |
+| Shadow validator (Red-Black tree) | Priority Violations, Phantom Fills, Trade Discrepancies |
+| Scoring + archetype classification | K=3 trials, composite formula, stability bonus, 4 archetypes |
+| Grafana (14 panels) + SSE leaderboard | HPA scale-out to 15 compiler replicas captured live |
+| PostgreSQL (7 migrations) + Goose runner | All migrations applied; 00007 prod bug fixed |
+| EKS + Terraform IaC (5 modules) | VPC, EKS, RDS, ElastiCache, S3, ECR, IRSA |
+| HPA (1→20 replicas) + Cluster Autoscaler | `least-waste` expander; 2-min scale-down delay |
+| PEL fault recovery + orphan sweeper | 30s XCLAIM reaper; 30-min sandbox TTL sweeper |
+| 8 reference engines (Go/C++/Python/Rust/Node) | All pass E2E suite across all 4 wire protocols |
+
+#### Known ceilings (current)
+
+| Bottleneck | Current limit | Requires |
+|---|---|---|
+| Bot fleet TPS | ~15K TPS (vs 500K Panic target) | Phase 2: distributed fleet shards |
+| HPA scaling trigger | CPU only | Phase 1: KEDA queue-depth metric |
+| Leaderboard query | O(N) scan, degrades at ~10K rows | Phase 4: Redis sorted set CQRS |
+| Redis throughput | ~100K ops/s single shard | Phase 3: Redis Cluster sharding |
+| Kernel sandbox | seccomp + CapDrop (no gVisor) | Phase 5: `runsc` DaemonSet on EKS nodes |
+
+#### 6-phase roadmap summary
+
+| Phase | Change | Target scale |
+|---|---|---|
+| **1** | `c6i.4xlarge` + KEDA queue-depth HPA | 20+ concurrent system tests |
+| **2** | Distributed gRPC bot shards + HDR histogram merge | 5 000 concurrent bots |
+| **3** | Redis Cluster + queue sharding by `hash(submission_id) % N` | 50 000 submissions/day |
+| **4** | `ZADD`/`ZREVRANGE` Redis sorted set leaderboard | <100ms push latency |
+| **5** | gVisor `runsc` DaemonSet on sandbox nodes | Kernel 0-day protection |
+| **6** | Public API, contestant SDK, multi-region EKS | General HFT benchmarking SaaS |
 
 ---
 
