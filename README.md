@@ -1,6 +1,10 @@
 # IICPC-2026-BenchGrid: Distributed Benchmarking and Hosting Platform
 
-An event-driven, microservice-based distributed evaluation platform designed to compile, isolate, benchmark, and score contestant-submitted matching engines under high concurrency. Built to scale to 100K concurrent viewers, 5K submitters, and 50K leaderboard contestants, the platform models a real-time trading competition environment with robust security controls and high-precision telemetry.
+An event-driven, microservice-based distributed evaluation platform designed to compile, isolate, benchmark, and score contestant-submitted matching engines under high concurrency. Built to scale to 100K concurrent viewers, 5K submitters, and 50K leaderboard contestants.
+
+**Key sub-systems:** Submission Gateway (rate-limited REST + SSE) → Kaniko in-cluster image build (no privileged pods) → K8s Sandbox Pod lifecycle in `iicpc-sandboxes` namespace → 500-goroutine MMPP bot fleet (3 trial runs) → Red-Black-tree shadow book validator → composite scoring formula → real-time SSE leaderboard + contestant diagnostic dashboard.
+
+**Design documents:** [`ARCHITECTURE_BLUEPRINT.md`](ARCHITECTURE_BLUEPRINT.md) · [`backend_system_design.md`](backend_system_design.md) · [`bot_fleet_shadow_validator_design.md`](bot_fleet_shadow_validator_design.md) · [`scoring_system_design.md`](scoring_system_design.md) · [`K8S_DESIGN.md`](K8S_DESIGN.md) · [`OBSERVABILITY_DESIGN.md`](OBSERVABILITY_DESIGN.md)
 
 ---
 
@@ -70,6 +74,8 @@ flowchart TD
 * **Compiler Service** (`services/compiler/`): Event loop polling `compilation_queue` stream, executing isolated Kaniko in-cluster builds from user-submitted `tar.gz` archives under strict timeouts. Pushes built images to AWS ECR.
 * **Testing Service** (`services/testing/`): Ephemeral sandbox runner instantiating contestant Kubernetes pods in the `iicpc-sandboxes` namespace (on dedicated `sandbox-executions` node group) in parallel ($K=3$ runs), executing trade-matching bots via raw TCP using little-endian length-prefixed Protobuf messages, and verifying correctness in real-time.
 * **Developer Diagnostics Console**: Accessible directly at `/dashboard` to inspect live container instances, view active queue depths, run automated mock pretest/systest submissions, and inspect contestant code/telemetry drawers.
+
+![IICPC BenchGrid — Frontend Landing Page](docs/screenshots/frontend_landing.png)
 
 ---
 
@@ -292,6 +298,8 @@ python3 verify_k8s.py
 | Prometheus | http://localhost:9090 | — |
 | MinIO Console | http://localhost:9001 | `minioadmin` / `minioadmin` |
 
+![IICPC Platform Diagnostics — Dev Dashboard](docs/screenshots/platform_diagnostics.png)
+
 #### Rebuild a single service (Kind)
 ```bash
 SERVICE=gateway  # or: compiler, testing
@@ -456,38 +464,269 @@ kubectl rollout status  deployment/submission-gateway --timeout=120s
 
 ---
 
-## 5. Observability & Monitoring
+## 5. Evaluation, Scoring & Verdict System
 
-### Grafana Dashboards
-**Live URL:** [`http://k8s-monitori-grafanai-267ec7424a-1315873619.us-east-1.elb.amazonaws.com`](http://k8s-monitori-grafanai-267ec7424a-1315873619.us-east-1.elb.amazonaws.com)
+> Full details: [`scoring_system_design.md`](scoring_system_design.md) · [`scoring_system_explanation.md`](scoring_system_explanation.md)
 
-| Dashboard | Description |
+Every submission runs **K = 3 independent trials** with different random seeds to filter out host noise. Metrics are averaged across trials before scoring.
+
+### Scoring Formula
+
+Three sub-scores, each 0–100:
+
+| Sub-score | Formula | Perfect threshold | Zero threshold |
+|---|---|---|---|
+| **Correctness** `C` | % orders matching price-time priority | 100% | any violation |
+| **Latency** `L` | `100 × (1 − (P99 − 500) / 4500)` | P99 ≤ 500 µs | P99 ≥ 5 000 µs |
+| **Throughput** `T` | `(1 − failRate) × 100` | 0 failed orders | — |
+
+**Composite score** (weighted):
+```
+Composite = 0.50 × C + 0.30 × L + 0.20 × T
+```
+
+**Stability bonus**: if trial-to-trial score StdDev < 2.0 %, `+5.0` bonus points are added.
+
+### Verdict Gates (evaluated in order)
+
+| Priority | Verdict | Condition |
+|---|---|---|
+| 1 | `Logic Violation` | Correctness < 100% |
+| 2 | `Tail Latency Exceeded` | avg P99 > 5 000 µs |
+| 3 | `Throughput Degradation` | fail rate > 10% OR TPS drop > 30% from start to end |
+| 4 | `Accepted` | all gates pass |
+
+### Engine Archetypes (auto-classified)
+
+| Archetype | Condition |
 |---|---|
-| **IICPC BenchGrid — Submission Pipeline** | TPS, p50/p90/p99 latency, fleet TPS/correctness, queue depths, HPA replicas, CPU%, DB pool |
-| **Kubernetes / Compute Resources / Cluster** | Cluster-wide CPU and memory utilization by namespace |
-| **Kubernetes / Compute Resources / Pod** | Per-pod resource usage for any deployment |
-| **Node Exporter / Nodes** | Raw EC2 node CPU, memory, disk, and network metrics |
-| **Kubernetes / Networking** | Pod and namespace network traffic |
+| `Latency-Optimized` | L ≥ 80, T ≥ 60 |
+| `Accuracy-Optimized` | C = 100, L < 60 |
+| `Balanced` | C = 100, L ≥ 60, T ≥ 70 |
+| `Low-Throughput` | T < 60 |
 
-### Prometheus Metrics Exposed
-Each service exposes Prometheus metrics on a dedicated port:
+---
+
+## 6. Bot Fleet & Shadow Validator
+
+> Full details: [`bot_fleet_shadow_validator_design.md`](bot_fleet_shadow_validator_design.md)
+
+The bot fleet and shadow validator run **in-process** inside the Testing Worker — no separate containers, no scheduling jitter.
+
+### MMPP Bot Strategies (3 regimes)
+
+| Regime | Arrival rate | Bot mix | Purpose |
+|---|---|---|---|
+| **Calm** | λ = 100 ord/s | 60% Market Maker, 30% Momentum, 10% Noise | Warm-up, baseline latency |
+| **Burst** | λ = 10 000 ord/s | 40% Market Maker, 40% Momentum, 20% Noise | Spike resilience |
+| **Panic** | λ = 100 000 ord/s | 20% Market Maker, 60% Momentum, 20% Noise | Peak TPS ceiling |
+
+**Pre-test**: 50 bots × 200 orders = 10 000 total orders (quick sanity gate)  
+**System test**: 500 bots × 2 000 orders = **1 000 000 total orders**
+
+### Shadow Validator
+
+A **Red-Black tree order book** runs alongside the bot fleet, independently replaying every order sent and constructing the expected fill sequence. It then diffs against the contestant's actual execution reports:
+
+- **Priority Violation**: contestant filled a lower-priority order before a higher-priority one
+- **Phantom Fill**: contestant reported a fill for an order it never accepted
+- **Trade Discrepancy**: bot sent an order that received no response (counted as `orders_failed`)
+
+Any non-zero count in these three categories reduces the Correctness score.
+
+### Wire Protocol
+
+Default: **little-endian length-prefixed Protobuf over raw TCP** on port 8000. The engine also supports `WS`, `REST`, and `FIX` adapters, auto-detected via the `ENGINE_PROTOCOL` environment variable inside the sandbox container.
+
+---
+
+## 7. Kubernetes Architecture
+
+> Full deep-dive: [`K8S_DESIGN.md`](K8S_DESIGN.md)
+
+### Cluster Environments
+
+| Mode | Cluster | Image delivery | Storage | CNI |
+|---|---|---|---|---|
+| Local dev | Kind | `kind load docker-image` | MinIO (host) | Calico (auto-installed) |
+| Production | AWS EKS | ECR via IRSA | S3 + RDS + ElastiCache | VPC CNI |
+
+### Namespace Isolation
+
+```
+default ns          →  gateway (×2), compiler, testing, redis, postgres, redpanda
+iicpc-sandboxes ns  →  contestant-{id} pods (created dynamically per evaluation)
+```
+
+The `iicpc-sandboxes` namespace enforces `NetworkPolicy`: **zero egress** + ingress only from `default` ns on TCP :8000. Sandbox pods are pinned to the `sandbox-executions` nodegroup via NodeSelector + `sandbox-only=true:NoSchedule` taint.
+
+### Kaniko (Daemonless Image Build)
+
+In production the compiler worker schedules a `batch/v1 Job` running `gcr.io/kaniko-project/executor` — no privileged pods, no Docker daemon. Kaniko reads the contestant ZIP from S3, builds the OCI image, and pushes to ECR using IRSA credentials. The job has `BackoffLimit: 0` and a 5-minute `ActiveDeadlineSeconds` hard limit.
+
+### Per-Service IRSA (Least-Privilege IAM)
+
+| ServiceAccount | IAM permissions |
+|---|---|
+| `iicpc-gateway` | S3 PutObject / GetObject |
+| `iicpc-compiler` / `kaniko-sa` | S3 GetObject + ECR PushImage |
+| `iicpc-testing` | ECR PullImage + K8s pod CRUD in `iicpc-sandboxes` |
+
+### HPA & Autoscaling
+
+| Deployment | Min→Max | CPU trigger | Strategy |
+|---|---|---|---|
+| `compilation-worker` | 1→20 | 60% | `Recreate` (avoids dual-pod CPU spike) |
+| `testing-worker` | 1→20 | 80% | `Recreate` (prevents split-fleet evaluation) |
+| Node groups (CA) | 1→8 / 1→5 | Pending pods | `least-waste` expander, 2 min scale-down |
+
+---
+
+## 8. Observability & Monitoring
+
+> Full deep-dive: [`OBSERVABILITY_DESIGN.md`](OBSERVABILITY_DESIGN.md)
+
+Two non-overlapping dashboards serve two audiences:
+
+### Grafana Admin Dashboard (operators)
+**Live URL:** [`http://k8s-monitori-grafanai-267ec7424a-1315873619.us-east-1.elb.amazonaws.com`](http://k8s-monitori-grafanai-267ec7424a-1315873619.us-east-1.elb.amazonaws.com) · Scrape interval: 2 s
+
+![Grafana — Stat Tiles & HPA Replica Graph](docs/screenshots/grafana_stat_tiles.png)
+
+![Grafana — Full Submission Pipeline Dashboard](docs/screenshots/grafana_dashboard_full.png)
+
+| Panel | Query | What it tells you |
+|---|---|---|
+| Total Submissions | `sum(iicpc_submissions_total)` | Cumulative volume; flat = no activity |
+| Active Jobs | `sum(iicpc_worker_active_jobs)` | 🟢 <5 / 🟠 ≥5 / 🔴 ≥15 in-flight |
+| Compilation Queue | `max(iicpc_queue_depth{queue="compilation_queue"})` | 🔴 ≥200 = compiler behind |
+| Fleet TPS | `max(iicpc_fleet_tps)` | Live orders/second across all bots |
+| Fleet P99 (µs) | `max(iicpc_fleet_p99_us)` | Tail latency; TPS drop + P99 rise = engine ceiling |
+| DB Pool | `sum by (service)(iicpc_db_pool_active_connections)` | Max 25 per service; near-25 = connection leak |
+| Gateway RPS | `rate(iicpc_http_requests_total[$__rate_interval])` | 429s = rate-limiter firing; 500s = DB issue |
+
+![Grafana — Bot Fleet TPS Chart (live system test)](docs/screenshots/grafana_tps_chart.png)
+
+### Contestant Developer Dashboard (`/dashboard`)
+Every leaderboard row opens a diagnostic drawer with:
+
+| Panel | What it shows |
+|---|---|
+| **Performance Triptych** | Correctness %, P99 µs, TPS — red if below threshold |
+| **Radar Chart** | Correctness / Latency / Throughput vs. SLA polygon |
+| **Latency Chart** | P50 / P90 / P99 vs. Top-10% benchmark and SLA limit |
+| **TPS Trend** | Start / Mid / End throughput — declining curve = connection leak |
+| **Anomaly Badges** | Phantom Fills, Priority Violations, Trade Discrepancies (PASS / FAIL) |
+| **Strategy Breakdown** | Per-strategy orders sent/failed/latency — pinpoints which bot type caused failures |
+| **Stability Score** | StdDev across K trials → +5 pts if < 2.0 |
+| **Sandbox Log** | Last error line from the contestant's container |
+
+### Prometheus Metrics
 
 | Service | Port | Key Metrics |
 |---|---|---|
-| `submission-gateway` | `:9093` | `iicpc_active_submissions`, `iicpc_http_requests_total`, `iicpc_http_request_duration_seconds` |
-| `compilation-worker` | `:9091` | `iicpc_queue_depth{queue=compilation_queue}`, `iicpc_db_pool_active_connections` |
-| `testing-worker` | `:9092` | `iicpc_pretest_run_duration_seconds`, `iicpc_fleet_tps`, `iicpc_fleet_p99_us`, `iicpc_fleet_correctness` |
+| `submission-gateway` | `:9093` | `iicpc_http_requests_total`, `iicpc_active_submissions` |
+| `compilation-worker` | `:9091` | `iicpc_queue_depth`, `iicpc_db_pool_active_connections` |
+| `testing-worker` | `:9092` | `iicpc_fleet_tps`, `iicpc_fleet_p99_us`, `iicpc_fleet_correctness` |
 
-### ServiceMonitors (automatic scraping)
 ```bash
 # Verify Prometheus is scraping IICPC targets
 kubectl get servicemonitor -n monitoring | grep iicpc
-# iicpc-gateway, iicpc-compiler, iicpc-testing
 ```
 
 ---
 
-## 6. Troubleshooting Manual
+## 9. Design Documents Index
+
+| Document | Covers |
+|---|---|
+| [`ARCHITECTURE_BLUEPRINT.md`](ARCHITECTURE_BLUEPRINT.md) | Full system blueprint: all components, protocols, IaC, testing strategy |
+| [`backend_system_design.md`](backend_system_design.md) | Component-by-component engineering decisions, queue strategy, BYOS pattern |
+| [`bot_fleet_shadow_validator_design.md`](bot_fleet_shadow_validator_design.md) | MMPP bot strategies, shadow validator algorithm, HDR histogram telemetry |
+| [`scoring_system_design.md`](scoring_system_design.md) | Scoring formula, verdict gates, archetype classification logic |
+| [`scoring_system_explanation.md`](scoring_system_explanation.md) | Plain-English walkthrough of the scoring math with examples |
+| [`K8S_DESIGN.md`](K8S_DESIGN.md) | Every K8s manifest explained: Kaniko, sandbox pods, RBAC, IRSA, HPA, Calico |
+| [`OBSERVABILITY_DESIGN.md`](OBSERVABILITY_DESIGN.md) | Grafana panel-by-panel breakdown + contestant diagnostic drawer |
+| [`DESIGN_SECTIONS.md`](DESIGN_SECTIONS.md) | Deep-dives: sandboxing layers, fault tolerance, observability strategy, scalability roadmap |
+| [`walkthrough.md`](walkthrough.md) | End-to-end change walkthrough and validation results |
+
+---
+
+## 10. Advanced Design Notes
+
+> Full deep-dives with code references: [`DESIGN_SECTIONS.md`](DESIGN_SECTIONS.md)
+
+### § A — Compute & Storage Sandboxing
+
+Defence-in-depth across **4 independent enforcement layers** — bypassing one does not defeat the others:
+
+| Layer | Mechanism | Limit / Guarantee |
+|---|---|---|
+| **cgroup v2 compute** | `NanoCPUs: 2×10⁹`, `Memory: 512 MiB`, `PidsLimit: 128` | Fork-bomb ceiling; OOM-kill beyond 512 MiB |
+| **Kernel hardening** | `CapDrop ALL` + custom seccomp profile | `fork`/`vfork` → `KILL_PROCESS`; `connect` → `ERRNO`; `clone` → `ALLOW` |
+| **Network isolation** | `NetworkPolicy` `egress: []` | Zero outbound; no exfiltration, no inter-sandbox communication |
+| **Node isolation** | `sandbox-executions` nodegroup `sandbox-only=true:NoSchedule` taint | Sandbox CPUs never shared with Gateway/Redis |
+
+**`fork` vs `clone`**: `fork()` from a contestant is definitively malicious (the protocol contract requires a single-process TCP server) — killed at the kernel level. `clone(CLONE_THREAD)` is permitted because C++ `std::thread`, Go goroutines, and JVM threads require it.
+
+**S3 over shared NFS**: 500 pods simultaneously reading from a `ReadWriteMany` NFS mount serialises startup (`O(N)` lock contention). S3 + ECR gives each pod an independent HTTP GET with per-node OCI layer caching — `O(1)` startup regardless of concurrency. Sources: `common/s3.go`, `services/testing/main.go:747`.
+
+---
+
+### § B — Fault Tolerance & Edge Cases
+
+**Strategy — at-least-once delivery with idempotent consumers**: workers `XACK` a Redis Streams message **only after** the final result is written to PostgreSQL. No submission can silently vanish.
+
+| Failure scenario | Recovery mechanism | RTO |
+|---|---|---|
+| Testing-worker OOM-killed mid-evaluation | `StartPELRecovery` goroutine fires every 30 s, `XCLAIM`s idle PEL entries | ≤ 30 s |
+| Contestant engine crashes on order #N | Each bot has an independent TCP socket; `io.EOF` on one causes `break` (not `g.Cancel()`); other 499 bots continue | 0 s (others unaffected) |
+| 3 consecutive worker failures | Message moved to `dead_letter_queue` stream for operator inspection | Manual |
+| Redis partition | `XReadGroup` 2 s blocking timeout; worker sleeps + retries; stream position retained | ≤ 2 s per retry |
+
+Sources: `common/pel_recovery.go`, `common/retry.go`, `services/testing/runner.go:418-512`.
+
+---
+
+### § C — Observability Architecture
+
+**Dual-pipeline design** — scoring and operational metrics are deliberately separated to avoid write amplification:
+
+| Pipeline | Medium | Cadence | Audience |
+|---|---|---|---|
+| Authoritative scores | PostgreSQL | Write-on-complete | Leaderboard, judges |
+| Operational metrics | Prometheus pull | 15 s scrape / 200 ms gauge update | Admins, Grafana |
+
+500 bots at 50 orders/s = **25 000 writes/second** — this would saturate PostgreSQL. Prometheus pull + in-memory gauges (`iicpc_fleet_tps`, `iicpc_fleet_p99_us`, `iicpc_fleet_correctness`) absorb the high-frequency stream instead.
+
+**SSE Leaderboard**: one persistent `text/event-stream` connection per browser tab. The `ArenaSSEHub.broadcast()` uses a non-blocking channel send (`select { default: }`) — a stalled client is skipped, never blocks healthy subscribers. Reconnect is handled by the browser's native `EventSource` API. Source: `services/gateway/main.go:36-74`.
+
+---
+
+### § D — Scalability Limits & Roadmap
+
+**Current ceiling** (single `c6i.large` testing-worker, 2 vCPU):
+
+| Bottleneck | Root cause | Current ceiling |
+|---|---|---|
+| Testing-worker CPU | 500 goroutines on 2 vCPU | ~10 000–15 000 TPS at zero error |
+| Leaderboard query | `ORDER BY composite_score DESC` full-table scan every 5 s | Degrades at ~10 000 submissions |
+| Redis single-shard | All queues on one instance | ~100 K ops/s before latency degrades |
+
+**MMPP Panic regime target** (500 K aggregate TPS) requires distributed fleet execution — the single-worker ceiling is ~15 K TPS.
+
+**Phased roadmap:**
+
+| Phase | Change | Target scale |
+|---|---|---|
+| **1** | `c6i.4xlarge` (16 vCPU) + HPA on `iicpc_queue_depth` | ~2 000 bots |
+| **2** | Coordinator splits fleet into N Bot-Shard pods; Fleet-Aggregator merges additive HDR histograms | ~5 000 bots |
+| **3** | Redis Cluster + `compilation_queue_{0..N}` sharding by `hash(submission_id) % N` | ~50 000 submissions/day |
+| **4** | Replace leaderboard SQL scan with `ZADD`/`ZREVRANGE` Redis sorted set | `<100 ms` push latency |
+
+---
+
+## 11. Troubleshooting Manual
 
 ### 1. Port already in use
 ```bash
@@ -561,7 +800,7 @@ kubectl rollout restart deployment/submission-gateway
 
 ---
 
-## 7. Key File Reference
+## 12. Key File Reference
 
 | Path | Purpose |
 |---|---|
