@@ -12,6 +12,7 @@ An event-driven, microservice-based distributed evaluation platform designed to 
 
 | Service | URL | Credentials |
 |---|---|---|
+| **Contestant Arena** | [`http://k8s-default-submissi-f6910ca3a8-2090885288.us-east-1.elb.amazonaws.com/`](http://k8s-default-submissi-f6910ca3a8-2090885288.us-east-1.elb.amazonaws.com/) | - |
 | **Dev Console / Dashboard** | [`http://k8s-default-submissi-f6910ca3a8-2090885288.us-east-1.elb.amazonaws.com/dashboard`](http://k8s-default-submissi-f6910ca3a8-2090885288.us-east-1.elb.amazonaws.com/dashboard) | `admin` / `Admin123!` |
 | **Grafana Observability** | [`http://k8s-monitori-grafanai-267ec7424a-1315873619.us-east-1.elb.amazonaws.com`](http://k8s-monitori-grafanai-267ec7424a-1315873619.us-east-1.elb.amazonaws.com) | `admin` / `iicpc-admin-2026` |
 | **API Base URL** | [`http://k8s-default-submissi-f6910ca3a8-2090885288.us-east-1.elb.amazonaws.com/api/v1/`](http://k8s-default-submissi-f6910ca3a8-2090885288.us-east-1.elb.amazonaws.com/api/v1/) | — |
