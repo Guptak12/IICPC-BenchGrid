@@ -8,34 +8,9 @@ An event-driven, microservice-based distributed evaluation platform designed to 
 ### 📄 Main Design Document
 * [`BenchGrid Design Doc`](https://drive.google.com/file/d/1J6rFMCi4E_wOdYV4FTm9J39K3ziaL2ke/view?usp=drive_link)
 
-### 📚 Component Design Documents
-* [`ARCHITECTURE_BLUEPRINT.md`](ARCHITECTURE_BLUEPRINT.md)
-* [`backend_system_design.md`](backend_system_design.md)
-* [`bot_fleet_shadow_validator_design.md`](bot_fleet_shadow_validator_design.md)
-* [`scoring_system_design.md`](scoring_system_design.md)
-* [`K8S_DESIGN.md`](K8S_DESIGN.md)
-* [`OBSERVABILITY_DESIGN.md`](OBSERVABILITY_DESIGN.md)
-
 ### 🎥 Demo Video
 Check out the BenchGrid platform in action:
 [**Watch the Demo Video on YouTube**](https://youtu.be/peZjdJ6IMDk)
-
----
-
-## 🔗 Live Deployment (Production) (Now taken down)
-
-| Service | URL | Credentials |
-|---|---|---|
-| **Contestant Arena** | [`http://k8s-default-submissi-f6910ca3a8-2090885288.us-east-1.elb.amazonaws.com/`](http://k8s-default-submissi-f6910ca3a8-2090885288.us-east-1.elb.amazonaws.com/) | - |
-| **Dev Console / Dashboard** | [`http://k8s-default-submissi-f6910ca3a8-2090885288.us-east-1.elb.amazonaws.com/dashboard`](http://k8s-default-submissi-f6910ca3a8-2090885288.us-east-1.elb.amazonaws.com/dashboard) | `admin` / `Admin123!` |
-| **Grafana Observability** | [`http://k8s-monitori-grafanai-267ec7424a-1315873619.us-east-1.elb.amazonaws.com`](http://k8s-monitori-grafanai-267ec7424a-1315873619.us-east-1.elb.amazonaws.com) | `admin` / `iicpc-admin-2026` |
-| **API Base URL** | [`http://k8s-default-submissi-f6910ca3a8-2090885288.us-east-1.elb.amazonaws.com/api/v1/`](http://k8s-default-submissi-f6910ca3a8-2090885288.us-east-1.elb.amazonaws.com/api/v1/) | — |
-
-### Admin Credentials
-| Role | Username | Email | Password |
-|---|---|---|---|
-| Admin | `admin` | `admin@iicpc.dev` | `Admin123!` |
-| Grafana Admin | `admin` | — | `iicpc-admin-2026` |
 
 ---
 
@@ -958,3 +933,25 @@ docker buildx build --platform linux/amd64 -f Dockerfile.services \
 kubectl rollout restart deployment/submission-gateway   # adjust name
 kubectl rollout status  deployment/submission-gateway --timeout=120s
 ```
+
+
+---
+
+## 🔗 Live Deployment (Production) (Now taken down)
+
+| Service | URL | Credentials |
+|---|---|---|
+| **Contestant Arena** | [`http://k8s-default-submissi-f6910ca3a8-2090885288.us-east-1.elb.amazonaws.com/`](http://k8s-default-submissi-f6910ca3a8-2090885288.us-east-1.elb.amazonaws.com/) | - |
+| **Dev Console / Dashboard** | [`http://k8s-default-submissi-f6910ca3a8-2090885288.us-east-1.elb.amazonaws.com/dashboard`](http://k8s-default-submissi-f6910ca3a8-2090885288.us-east-1.elb.amazonaws.com/dashboard) | `admin` / `Admin123!` |
+| **Grafana Observability** | [`http://k8s-monitori-grafanai-267ec7424a-1315873619.us-east-1.elb.amazonaws.com`](http://k8s-monitori-grafanai-267ec7424a-1315873619.us-east-1.elb.amazonaws.com) | `admin` / `iicpc-admin-2026` |
+| **API Base URL** | [`http://k8s-default-submissi-f6910ca3a8-2090885288.us-east-1.elb.amazonaws.com/api/v1/`](http://k8s-default-submissi-f6910ca3a8-2090885288.us-east-1.elb.amazonaws.com/api/v1/) | — |
+
+### Admin Credentials
+| Role | Username | Email | Password |
+|---|---|---|---|
+| Admin | `admin` | `admin@iicpc.dev` | `Admin123!` |
+| Grafana Admin | `admin` | — | `iicpc-admin-2026` |
+
+---
+
+Made with ❣️ Guptak12
