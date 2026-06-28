@@ -5,18 +5,24 @@ An event-driven, microservice-based distributed evaluation platform designed to 
 **Key sub-systems:** Submission Gateway (rate-limited REST + SSE) → Kaniko in-cluster image build (no privileged pods) → K8s Sandbox Pod lifecycle in `iicpc-sandboxes` namespace → 500-goroutine MMPP bot fleet (3 trial runs) → Red-Black-tree shadow book validator → composite scoring formula → real-time SSE leaderboard + contestant diagnostic dashboard.
 
 
-· [`benchgrid_design_doc`](https://drive.google.com/file/d/1J6rFMCi4E_wOdYV4FTm9J39K3ziaL2ke/view?usp=drive_link)
+### 📄 Main Design Document
+* [`BenchGrid Design Doc`](https://drive.google.com/file/d/1J6rFMCi4E_wOdYV4FTm9J39K3ziaL2ke/view?usp=drive_link)
 
-## 🎥 Demo Video
-Check out the BenchGrid platform in action: 
+### 📚 Component Design Documents
+* [`ARCHITECTURE_BLUEPRINT.md`](ARCHITECTURE_BLUEPRINT.md)
+* [`backend_system_design.md`](backend_system_design.md)
+* [`bot_fleet_shadow_validator_design.md`](bot_fleet_shadow_validator_design.md)
+* [`scoring_system_design.md`](scoring_system_design.md)
+* [`K8S_DESIGN.md`](K8S_DESIGN.md)
+* [`OBSERVABILITY_DESIGN.md`](OBSERVABILITY_DESIGN.md)
+
+### 🎥 Demo Video
+Check out the BenchGrid platform in action:
 [**Watch the Demo Video on YouTube**](https://youtu.be/peZjdJ6IMDk)
-
-
-**Design documents:** [`ARCHITECTURE_BLUEPRINT.md`](ARCHITECTURE_BLUEPRINT.md) · [`backend_system_design.md`](backend_system_design.md) · [`bot_fleet_shadow_validator_design.md`](bot_fleet_shadow_validator_design.md) · [`scoring_system_design.md`](scoring_system_design.md) · [`K8S_DESIGN.md`](K8S_DESIGN.md) · [`OBSERVABILITY_DESIGN.md`](OBSERVABILITY_DESIGN.md)
 
 ---
 
-## 🔗 Live Deployment (Production) (Now taken down
+## 🔗 Live Deployment (Production) (Now taken down)
 
 | Service | URL | Credentials |
 |---|---|---|
